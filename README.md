@@ -1,6 +1,6 @@
 # grepplus
 
-**Standard `grep`, plus a few commands your coding agent can use to navigate code — `who-calls`, `impact`, `context`, `brief`. ~2× faster and cheaper agentic code search, in one native Rust binary.**
+**Standard `grep`, plus a few commands your coding agent can use to navigate code — `who-calls`, `impact`, `context`, `brief`. Agents finish code-navigation tasks ~2× faster and ~3–4× cheaper. One native Rust binary.**
 
 You install it as `grep`, and everything works exactly as before — same flags, same output, same exit code. The same binary just *also* answers the questions an agent normally burns rounds on: *who calls this function, what breaks if I change it, where is the code that does X.* One line in your agent's config (below) tells it the extra commands exist, and it stops looping.
 
@@ -56,8 +56,11 @@ these over grep+read loops:
 - grep context "plain-English description"   # find code by meaning, not keyword
 - grep brief SYM                             # definition + callers + callees, one call
 Be efficient: one impact/context/who-calls call beats many greps. Stop as soon
-as you can answer.
+as you can answer. If a command replies "no index for this repo", run
+`grep index .` once (it takes a few seconds), then retry the command.
 ```
+
+> **On indexing:** the code commands read a small on-disk index built by `grep index .` (step 1 above builds it once; plain grep never needs it). If the repo drifts, grepplus re-indexes the changed files automatically on the next command. A repo that was never indexed returns the `no index` message above rather than blocking — the prompt line tells the agent to run `grep index .` and continue.
 
 That prompt is the whole integration. **Bonus:** even without it, an exploratory `grep` over an indexed repo appends one self-describing context file (definition, callers, suggested next reads, and the command list), so a capable agent can discover the commands from grep's own output.
 
@@ -65,7 +68,9 @@ That prompt is the whole integration. **Bonus:** even without it, an exploratory
 
 ## What it saves
 
-What an agent actually pays for is **billed tokens** and **wall-clock time.** Medians across the benchmark (MiniMax-M3; an agent using grepplus vs. a plain grep agent; the fixed system prompt is warmup and excluded from every ratio):
+What an agent actually pays for is **billed tokens** and **wall-clock time.**
+
+The benchmark: a real coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers **94 code questions** — *who-calls*, impact/blast-radius, call-chain traces, and vocabulary-gap "find the code that does X" — across **four real pinned repositories** (Rust `serde`, Python `flask`, Java `gson`, TypeScript `zod`). The same agent runs each task twice: once with plain `grep`, once with grepplus. The fixed system prompt is warmup and is excluded from every ratio. The harness is in [`bench/agent_efficiency/`](bench/agent_efficiency/) and is reproducible. Medians:
 
 | What you actually pay | Median | |
 |---|---:|---|
