@@ -1,53 +1,64 @@
-<svg viewBox="0 0 960 660" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-labelledby="title desc">
-  <title id="title">An agent guessing with plain grep versus an agent that knows grep's code commands</title>
-  <desc id="desc">On benchmark task r047, an uncoached agent using plain grep runs 33 tool calls and reads 13,542 search-context tokens; an agent whose system prompt names grep's code commands runs 2 tool calls and reads 300 tokens. Both reach the same correct answer. That is 16x fewer rounds and 45x less search context on this task; the benchmark median is about 4x fewer rounds.</desc>
-  <rect width="960" height="660" fill="#ffffff"/>
+<svg viewBox="0 0 960 636" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-labelledby="title desc">
+  <title id="title">An agent using grep versus an agent using grepplus on one real benchmark task</title>
+  <desc id="desc">On benchmark task r047, an agent using plain grep runs 26 rounds using 320,662 billed input tokens, 2,772 output tokens and 124.8 seconds; an agent using grepplus runs 3 rounds using 9,238 input tokens, 371 output tokens and 14.3 seconds — about 35x fewer input tokens, 7.5x fewer output tokens and 8.7x faster. Both reach the same correct answer. The benchmark median is about 3.7x fewer input tokens, 2.9x fewer output tokens and 2x faster.</desc>
+  <rect width="960" height="636" fill="#ffffff"/>
 
-  <text x="36" y="40" font-size="21" font-weight="700" fill="#0f172a">Same task, same agent, same answer — one just knows grep's code commands</text>
-  <text x="36" y="63" font-size="13" fill="#64748b">Benchmark task r047 · Flask · MiniMax-M3 · a question whose words are not in the code</text>
+  <text x="36" y="38" font-size="21" font-weight="700" fill="#0f172a">Same task — an agent using grep vs an agent using grepplus</text>
+  <text x="36" y="60" font-size="12.5" fill="#64748b">Benchmark task r047 · Flask · MiniMax-M3 · both reach the same answer (<tspan font-family="ui-monospace,Menlo,monospace">_split_blueprint_path</tspan>)</text>
 
-  <rect x="36" y="78" width="888" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
-  <text x="52" y="100" font-size="13" fill="#334155"><tspan font-weight="600">Question:</tspan> “Which routine expands a dotted nesting name into all of its ancestor prefixes?”  →  answer: <tspan font-family="ui-monospace,Menlo,monospace" fill="#64748b">_split_blueprint_path</tspan></text>
-  <text x="52" y="117" font-size="11.5" fill="#94a3b8">One backward-compatible <tspan font-family="ui-monospace,Menlo,monospace">grep</tspan>. The right-hand agent was told in its system prompt that this grep also has <tspan font-family="ui-monospace,Menlo,monospace">context</tspan>/<tspan font-family="ui-monospace,Menlo,monospace">brief</tspan> commands.</text>
+  <rect x="36" y="74" width="888" height="46" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="52" y="96" font-size="13" fill="#334155"><tspan font-weight="600">Question:</tspan> “Which routine expands a dotted nesting name into all of its ancestor prefixes?” — no word of it is in the code.</text>
+  <text x="52" y="113" font-size="11.5" fill="#94a3b8">grepplus is a backward-compatible <tspan font-family="ui-monospace,Menlo,monospace">grep</tspan>; the right-hand agent was told in its system prompt that it also has <tspan font-family="ui-monospace,Menlo,monospace">context</tspan>/<tspan font-family="ui-monospace,Menlo,monospace">brief</tspan> commands.</text>
 
-  <!-- LEFT: plain-grep agent -->
-  <text x="36" y="150" font-size="13.5" font-weight="700" fill="#b91c1c">Agent using grep <tspan font-weight="400" font-size="11.5" fill="#9ca3af">— guesses the vocabulary</tspan></text>
+  <!-- column headers -->
+  <text x="36" y="146" font-size="13.5" font-weight="700" fill="#b91c1c">Agent using grep <tspan font-weight="400" font-size="11.5" fill="#9ca3af">— guesses the vocabulary</tspan></text>
+  <text x="494" y="146" font-size="13.5" font-weight="700" fill="#15803d">Agent using grepplus <tspan font-weight="400" font-size="11.5" fill="#9ca3af">— asks by meaning</tspan></text>
+
+  <!-- LEFT: guessing blocks -->
   <g font-family="ui-monospace,Menlo,monospace" font-size="10.5" fill="#991b1b">
-    <rect x="36" y="160" width="430" height="30" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="179">grep -rn "ancestor" --include=*.py .</text>
-    <rect x="36" y="196" width="430" height="30" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="215">grep -rn "split.*'\.'" --include=*.py .</text>
-    <rect x="36" y="232" width="430" height="30" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="251">grep -rEn "def \w*(name|nest|prefix|split)" .</text>
-    <rect x="36" y="268" width="430" height="30" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="287">grep … ./src/flask/sansio/  +  read candidate files</text>
-    <rect x="36" y="304" width="430" height="30" rx="6" fill="#fee2e2" stroke="#fecaca" stroke-dasharray="4 4"/><text x="50" y="323" font-family="-apple-system" fill="#b91c1c">… + 29 more rounds of guess-grep and read</text>
+    <rect x="36" y="156" width="430" height="28" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="174">grep -rn "ancestor" --include=*.py .</text>
+    <rect x="36" y="190" width="430" height="28" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="208">grep -rn "split.*'\.'" --include=*.py .</text>
+    <rect x="36" y="224" width="430" height="28" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="242">grep -rEn "def \w*(name|nest|prefix|split)" .</text>
+    <rect x="36" y="258" width="430" height="28" rx="6" fill="#fef2f2" stroke="#fecaca"/><text x="50" y="276">grep … ./src/flask/sansio/  +  read files</text>
+    <rect x="36" y="292" width="430" height="28" rx="6" fill="#fee2e2" stroke="#fecaca" stroke-dasharray="4 4"/><text x="50" y="310" font-family="-apple-system" fill="#b91c1c">… + more rounds of guess-grep and read</text>
   </g>
-  <rect x="36" y="344" width="430" height="34" rx="7" fill="#fee2e2"/>
-  <text x="50" y="366" font-size="12" font-weight="700" fill="#7f1d1d">33 tool calls · 13,542 search-context tokens</text>
 
-  <!-- RIGHT: equipped agent -->
-  <text x="494" y="150" font-size="13.5" font-weight="700" fill="#15803d">Agent using grepplus <tspan font-weight="400" font-size="11.5" fill="#9ca3af">— asks by meaning</tspan></text>
+  <!-- RIGHT: two commands -->
   <g font-family="ui-monospace,Menlo,monospace" font-size="10.5" fill="#166534">
-    <rect x="494" y="160" width="430" height="44" rx="6" fill="#f0fdf4" stroke="#bbf7d0"/>
-    <text x="508" y="178">grep context "expand a dotted nesting</text>
-    <text x="508" y="192">  name into ancestor prefixes"</text>
-    <rect x="494" y="210" width="430" height="44" rx="6" fill="#f0fdf4" stroke="#bbf7d0"/>
-    <text x="508" y="228">grep brief _split_blueprint_path</text>
-    <text x="508" y="242" font-family="-apple-system" font-size="10" fill="#15803d">→ definition + callers + callees → done</text>
-    <rect x="494" y="260" width="430" height="74" rx="6" fill="#f6fef9" stroke="#bbf7d0" stroke-dasharray="5 5"/>
-    <text x="709" y="293" font-family="-apple-system" font-size="12" font-weight="600" fill="#16a34a" text-anchor="middle">answered on the 2nd call.</text>
-    <text x="709" y="311" font-family="-apple-system" font-size="10.5" fill="#4ade80" text-anchor="middle">the semantic match found it despite no shared word.</text>
-  </g>
-  <rect x="494" y="344" width="430" height="34" rx="7" fill="#dcfce7"/>
-  <text x="508" y="366" font-size="12" font-weight="700" fill="#14532d">2 tool calls · 300 search-context tokens</text>
-
-  <!-- factor bar -->
-  <rect x="36" y="398" width="888" height="52" rx="10" fill="#0f172a"/>
-  <g font-size="17" font-weight="800" fill="#ffffff" font-family="-apple-system">
-    <text x="150" y="431" text-anchor="middle">16× fewer rounds</text>
-    <text x="430" y="431" text-anchor="middle">45× less search context</text>
-    <text x="720" y="431" text-anchor="middle">7.5× less output</text>
+    <rect x="494" y="156" width="430" height="42" rx="6" fill="#f0fdf4" stroke="#bbf7d0"/>
+    <text x="508" y="173">grep context "expand a dotted nesting</text>
+    <text x="508" y="187">  name into ancestor prefixes"</text>
+    <rect x="494" y="204" width="430" height="42" rx="6" fill="#f0fdf4" stroke="#bbf7d0"/>
+    <text x="508" y="221">grep brief _split_blueprint_path</text>
+    <text x="508" y="235" font-family="-apple-system" font-size="10" fill="#15803d">→ definition + callers + callees → done</text>
+    <rect x="494" y="252" width="430" height="68" rx="6" fill="#f6fef9" stroke="#bbf7d0" stroke-dasharray="5 5"/>
+    <text x="709" y="283" font-family="-apple-system" font-size="12" font-weight="600" fill="#16a34a" text-anchor="middle">answered on the 2nd call.</text>
+    <text x="709" y="301" font-family="-apple-system" font-size="10.5" fill="#4ade80" text-anchor="middle">semantic match found it despite no shared word.</text>
   </g>
 
-  <!-- honest footnote -->
-  <text x="36" y="478" font-size="11" fill="#64748b"><tspan font-weight="700" fill="#334155">This is one favorable task, shown for illustration.</tspan> The honest median across the whole benchmark (agent that knows grep's commands vs. an uncoached</text>
-  <text x="36" y="494" font-size="11" fill="#64748b">grep agent, system prompt excluded as warmup) is <tspan font-weight="700" fill="#334155">~4× fewer model rounds, ~2× faster end-to-end, and ~3–4× fewer billed tokens</tspan> —</text>
-  <text x="36" y="510" font-size="11" fill="#64748b">the win is largest on structural / vocabulary-gap questions like this one, and ~1× on a plain literal search, where grep is already optimal.</text>
+  <!-- raw totals per column -->
+  <rect x="36" y="330" width="430" height="30" rx="7" fill="#fee2e2"/>
+  <text x="50" y="349" font-size="11" font-weight="600" fill="#7f1d1d">26 rounds · 320,662 input tok · 2,772 output · 124.8 s</text>
+  <rect x="494" y="330" width="430" height="30" rx="7" fill="#dcfce7"/>
+  <text x="508" y="349" font-size="11" font-weight="600" fill="#14532d">3 rounds · 9,238 input tok · 371 output · 14.3 s</text>
+
+  <!-- gains — under grepplus only -->
+  <text x="466" y="404" font-size="12" fill="#94a3b8" text-anchor="end">what grepplus saved on this task →</text>
+  <rect x="494" y="378" width="430" height="86" rx="10" fill="#0f172a"/>
+  <g fill="#ffffff" text-anchor="middle">
+    <text x="580" y="410" font-size="22" font-weight="800">35×</text>
+    <text x="709" y="410" font-size="22" font-weight="800">7.5×</text>
+    <text x="838" y="410" font-size="22" font-weight="800">8.7×</text>
+  </g>
+  <g fill="#94a3b8" font-size="10.5" text-anchor="middle">
+    <text x="580" y="430">fewer input tokens</text>
+    <text x="709" y="430">fewer output tokens</text>
+    <text x="838" y="430">faster</text>
+  </g>
+  <text x="709" y="452" font-size="10" fill="#64748b" text-anchor="middle">same correct answer · these are r047's own numbers, one favorable task</text>
+
+  <!-- honest median footnote -->
+  <text x="36" y="500" font-size="11" fill="#64748b"><tspan font-weight="700" fill="#334155">Median across the whole benchmark</tspan> (agent using grepplus vs. an uncoached grep agent; the fixed system prompt is warmup, excluded):</text>
+  <text x="36" y="516" font-size="11" fill="#334155" font-weight="700">~3.7× fewer input tokens · ~2.9× fewer output tokens · ~2× faster.<tspan font-weight="400" fill="#64748b"> The win is largest on structural / vocabulary-gap questions,</tspan></text>
+  <text x="36" y="532" font-size="11" fill="#64748b">and ~1× on a plain literal search, where grep is already optimal.</text>
 </svg>
