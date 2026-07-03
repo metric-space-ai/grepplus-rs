@@ -79,14 +79,7 @@ The benchmark: a real coding agent (MiniMax-M3, driven by [Pi Code](https://pi.d
 | **Wall-clock time** | **~2.0×** | faster |
 | **Tool-call rounds** | **~4.0×** | fewer |
 
-It all comes from one thing: **fewer model round-trips.** The gain is largest where `grep` structurally loops and ~1× on a plain literal search, where grep is already the right tool:
-
-| Task class | search-context median | Why |
-|---|---:|---|
-| structural graph queries (who-calls / callees / impact) | ~19× | one resolved graph call instead of grep+read per caller |
-| research / multi-hop trace | ~13× | one `impact`/`path` call replaces a manual graph walk |
-| vocabulary-gap discovery (semantic) | ~2.4× | vector search finds what keywords miss |
-| literal definition search | ~1× | grep's home turf — it passes straight through |
+It all comes from one thing: **fewer model round-trips.** The win is largest on structural questions (`who-calls`/`impact`) and vocabulary-gap searches (`context`), and ~1× on a plain literal search, where `grep` is already the right tool.
 
 ---
 
