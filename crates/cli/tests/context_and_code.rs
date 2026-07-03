@@ -414,7 +414,7 @@ fn context_serves_labeled_stale_spans_when_auto_reindex_disabled() {
         "labeled-stale context must serve spans; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grepplus index'"),
+        err.contains("index may be stale") && err.contains("run 'grep index'"),
         "labeled-stale context must warn on stderr; stderr={err:?}"
     );
     assert!(
@@ -707,7 +707,7 @@ fn plus_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         "labeled-stale plus must serve indexed hits; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grepplus index'"),
+        err.contains("index may be stale") && err.contains("run 'grep index'"),
         "labeled-stale plus must warn on stderr; stderr={err:?}"
     );
     assert!(

@@ -1,178 +1,108 @@
 # grepplus
 
-**A drop-in replacement for `grep` that also answers code questions — so LLM agents stop looping.**
-**~2× faster and cheaper agentic code discovery, in one native Rust binary.**
+**A fully backward-compatible `grep` — plus code-navigation commands that make coding agents ~2× faster and ~3–4× cheaper. One native Rust binary.**
 
-`grepplus` **is** `grep`. Run it with any grep arguments and you get grep — same flags, same output, same exit code. That is the default. It just *also* understands your codebase.
+Install it as `grep` and nothing changes: every normal grep command works byte-for-byte. But the same binary *also* answers the questions a coding agent normally burns rounds on — *who calls this function, what breaks if I change it, where is the code that does X* — in a single call. Tell your agent about them with one line in its system prompt (below), and it stops looping.
 
 ```bash
-# Default behaviour: it's grep. Every grep call works, unchanged.
-grepplus -rn "TODO" src/
-grepplus -i "connection refused" server.log
-alias grep=grepplus          # install it as grep — existing tools & scripts don't notice
+# Backward-compatible: it IS grep. Every grep command works, unchanged.
+grep -rn "TODO" src/
+grep -i "connection refused" server.log
 
-# The "plus": extra commands on the same binary — for an agent, or for you.
-grepplus who-calls parse_config                 # who calls this function
-grepplus impact User --direction incoming       # what breaks if I change User
-grepplus context "restrict a value to a range"  # find code by meaning, not keyword
-grepplus brief _split_blueprint_path            # definition + callers + callees, one call
+# Plus — the same `grep`, extra commands for code navigation:
+grep who-calls parse_config                 # who calls this function
+grep impact User --direction incoming       # what breaks if I change User
+grep context "restrict a value to a range"  # find code by meaning, not keyword
+grep brief _split_blueprint_path            # definition + callers + callees, one call
 ```
-
-An LLM coding agent armed only with `grep` finds things by *looping* — grep → read → grep → read, guessing vocabulary and stitching call graphs together by hand. Each loop is another model round-trip, and billed tokens grow super-linearly with the number of rounds. grepplus answers those same questions from a **precomputed code graph** and **native semantic search**, so the agent reaches the answer in far fewer rounds.
 
 ![A grep agent vs a grepplus agent on one real benchmark task](assets/grep-vs-grepplus.svg)
 
-> **Status:** early and in active development — an in-progress Rust port of a larger C code-intelligence engine (~40% of the upstream engine, ~18 languages wired for cross-file `CALLS`/`IMPORTS`; Rust additionally resolves `TYPE_REF`/`USES`). Not production-ready. The numbers below are real, reproducible medians from an agent benchmark (MiniMax-M3, 94 tasks, 4 real repositories) — not marketing figures. See [Status & scope](#status--scope).
+> **Honest status:** early, in active development — a Rust port of a larger C code-intelligence engine (~40% ported, ~18 languages for cross-file `CALLS`/`IMPORTS`, Rust adds `TYPE_REF`/`USES`). Not production-ready. It is **not** a zero-config 1:1 drop-in: an agent uses the extra commands only when its system prompt mentions them (one line, below) — that is the intended, supported setup. The numbers are real, reproducible medians from an agent benchmark (MiniMax-M3, real repos), with the fixed system prompt excluded as warmup.
 
 ---
 
-## What it is
+## Give it to your coding agent (the one line that matters)
 
-- **One binary, native Rust inference.** The embedding engine is [candle](https://github.com/huggingface/candle) (pure Rust) — no llama.cpp, no Python, no HTTP, no external inference runtime. At runtime the binary links only system libraries (`otool -L` → `libSystem`, `libiconv`). Parsers (tree-sitter) and the store (SQLite) are standard C libraries **compiled in statically** — nothing to install.
-- **Grep-compatible by default.** Any invocation that isn't a grepplus subcommand is forwarded to the real `grep`, returning its stdout/stderr and exit code **verbatim** — even for non-UTF-8 patterns. Scripts and tools that call `grep` don't notice the swap. The extra commands live on the same binary; you opt into them by name.
-- **The "plus":** a cross-file code graph, token-lean structural answers, and local semantic search that finds code by *meaning* when the query and the code share no words.
-
----
-
-## How it works — the "plus"
-
-grepplus removes agent round-trips with a handful of composable techniques. Every claim below is backed by the code, not aspiration.
-
-**1. Drop-in `grep` passthrough (byte-exact).** Any invocation whose first token isn't a known subcommand is forwarded to the real `grep` verbatim; grepplus returns grep's exit code and, on a *miss*, returns immediately with grep's output untouched. Zero adoption cost, zero risk — the agent never spends a round learning a new tool for the common literal-search path.
-
-**2. A precomputed code graph for structural questions.** An indexed, typed symbol graph (`CALLS`, `USES`, `TYPE_REF`, `IMPORTS`) answers `who-calls` / `callees` / `find-usages` / `impact` / `path` / `trace` / `fan-in` / `fan-out` directly. `grep` finds *textual name occurrences*; the graph returns *resolved call relationships* (with `file:line`) in a single call, collapsing several read+grep rounds — and it doesn't confuse definitions, comments, and same-named symbols.
-
-**3. Token-lean locators with exact-count stop signals.** Structural results are compact `qualified_name file:line` pointer rows, capped to a sane default, followed by an honest completeness footer stating the true total (`— 3 callers`, or `N+` when the count is a genuine floor, or `… and N more` with an `--all` escape hatch). The exact count is a definitive *stop signal*, so the agent doesn't loop with `--all`/grep to re-confirm what it already has.
-
-**4. Native semantic vector search for the vocabulary gap.** When a natural-language query shares no literal words with the target (`"restrict a value to a range"` won't match a function named `clamp`), grepplus embeds the query with Google's **EmbeddingGemma** — pure-Rust candle GGUF inference, mean-pooled and L2-normalized — and does exact cosine nearest-neighbour search over code-span embeddings computed at index time. Bare identifiers never touch the model; only genuine natural-language queries do.
-
-**5. One-shot aggregate briefings.** `brief SYM` returns a symbol's definition (with source), its direct callers, and its direct callees in **one** call; `impact SYM` returns the full *transitive* blast-radius set with hop distances in one call (optionally scoped to a git diff). A grep-only agent would run `context` + `who-calls` + `callees` separately and iterate `who-calls` to build the transitive set — grepplus folds that into a single round.
-
-**6. Freshness-gated incremental index.** An on-demand freshness check (a workspace fingerprint compared on every query) decides whether cached answers are trustworthy; when stale it refuses or clearly labels the answer rather than handing the agent a confidently-wrong stale result. Re-indexing reparses only changed files and produces a graph byte-identical to a full reindex.
-
-**7. `plus` — hybrid ranked search.** One grep-shaped command fuses literal/full-text, symbol, an algorithmic semantic ranker, graph-neighbour proximity, and (optionally) native vectors, ranking the genuinely relevant hits first — while every row stays a plain `file:line score snippet`, search output, not a generated answer.
-
-The through-line: **the dominant cost of an agent is the number of model rounds, not search latency.** Each technique above trades one precomputed structural answer for several speculative grep-and-read rounds.
-
----
-
-## Install (drop-in)
-
-There is no system installer — "install" means build the binary and put it on your `PATH`.
-
-```bash
-# 1. Build (default binary; loads the embedding model from the HF cache on demand)
-cargo build --release --bin grepplus
-
-# 1b. OR a true single file with the quantized weights baked in (no external model file)
-cargo build --release --features embed-weights --bin grepplus
-
-# 2. Put it on your PATH
-install -m 0755 target/release/grepplus /usr/local/bin/grepplus
-
-# 3. (optional) use it as a grep replacement — every plain grep call still works
-echo 'alias grep=grepplus' >> ~/.zshrc
-
-# 4. Index a repository once (a setup cost, not part of the agent loop)
-grepplus index /path/to/repo
-#   for the semantic vector path (default binary only):
-#   grepplus index /path/to/repo --embeddings \
-#     --embedding-gguf <embeddinggemma-300M-Q4_K.gguf> \
-#     --embedding-tokenizer <tokenizer.json>
-```
-
-## Uninstall
-
-```bash
-rm -f /usr/local/bin/grepplus                                   # remove the binary
-sed -i '' '/alias grep=grepplus/d' ~/.zshrc                     # remove the alias, if set
-rm -rf "${GREPPLUS_STORE_DIR:-$HOME/Library/Caches/grepplus}"   # remove the index stores
-```
-
-The binary is self-contained — apart from the index store (path above), it writes nothing to your system.
-
----
-
-## Use it in your coding agent
-
-To make a coding agent (Claude Code, Cursor, Codex, …) use grepplus as its `grep` for **one project** — without touching your system `grep` — paste this to the agent:
+Paste this into your agent's system prompt / rules file (`CLAUDE.md`, `AGENTS.md`, `.cursor/rules`). It positions `grep` as backward-compatible **plus** the extra commands — no other integration:
 
 ```text
-Use grepplus as your grep for THIS repository only. Do not change my global/system
-grep, my shell config, or anything outside this project.
-
-One-time setup:
-1. Build it:        cargo build --release --bin grepplus
-2. Index the repo:  ./target/release/grepplus index .
-3. For this session only, put it first on PATH so you invoke it as `grepplus`:
-       export PATH="$PWD/target/release:$PATH"
-
-From now on, use `grepplus` instead of `grep` for every search — it is a byte-exact
-drop-in for grep. For code questions, prefer these over grep+read loops:
-- grepplus who-calls SYM / callees SYM / find-usages SYM   # callers / callees / uses
-- grepplus impact SYM --direction incoming                 # what breaks if SYM changes
-- grepplus path --from A --to B                             # the call chain from A to B
-- grepplus context "plain-English description of the code"  # find code by meaning
-- grepplus brief SYM                                        # def + callers + callees, one call
+This project's `grep` is a backward-compatible superset of grep: every normal
+grep command still works. It ALSO answers code-navigation questions — prefer
+these over grep+read loops:
+- grep who-calls SYM / grep callees SYM / grep find-usages SYM
+- grep impact SYM --direction incoming      # what breaks if SYM changes
+- grep path --from A --to B                  # the call chain from A to B
+- grep context "plain-English description"   # find code by meaning, not keyword
+- grep brief SYM                             # definition + callers + callees, one call
+Be efficient: one impact/context/who-calls call beats many greps. Stop as soon
+as you can answer.
 ```
 
-This is **project-scoped**: the `export PATH` only affects the agent's own session, so your system `grep` and other tools are untouched. For a persistent setup, drop the same instructions into the agent's rules file (`CLAUDE.md`, `AGENTS.md`, or `.cursor/rules`) — it then applies every session, still only inside this project.
+That prompt is the *whole* integration. Everything else — searching, reading — the agent already knows. **Bonus:** even without the prompt, an exploratory `grep` over an indexed repo appends one self-describing context file (definition, callers, suggested next reads, and the command list), so a capable agent can discover the commands from grep's own output.
 
 ---
 
 ## What it saves
 
-What you actually pay for is **billed tokens** and **wall-clock time**. Those are the numbers that matter — real medians from the agent benchmark (MiniMax-M3; 82 discovery tasks vs. an uncoached agent baseline; the fixed system prompt is warmup and factored out of every ratio):
+Real medians from the agent benchmark (MiniMax-M3; grepplus-equipped agent vs. an uncoached grep agent; the fixed system prompt is warmup and factored out of every ratio):
 
 | What you actually pay | Median | |
 |---|---:|---|
-| **Billed input tokens** (prompt-neutral) | **3.7×** | cheaper |
-| **Output tokens** | **2.9×** | fewer |
-| **Wall-clock time** (session, no setup) | **2.0×** | faster |
-| **Tool-call rounds** (model calls) | **4.0×** | fewer |
+| **Billed input tokens** (prompt-neutral) | **~3.7×** | cheaper |
+| **Output tokens** | **~2.9×** | fewer |
+| **Wall-clock time** (session, no setup) | **~2.0×** | faster |
+| **Tool-call rounds** (model calls) | **~4.0×** | fewer |
 
-All of it comes from one thing: **fewer model round-trips**. (A diagnostic that isolates only the *discovery* sub-cost — bytes read to **find** the answer — is 11.9×, but the practical bottom line is the ~2× faster / ~3–4× cheaper above.)
+All of it comes from one thing: **fewer model round-trips.** The savings concentrate where `grep` structurally loops and vanish where it is already optimal:
 
-The savings concentrate where `grep` structurally loops, and disappear where it's already optimal:
-
-| Task class | factor | Why |
+| Task class | search-context median | Why |
 |---|---:|---|
 | structural graph queries (who-calls / callees / impact) | ~19× | one resolved graph call instead of grep+read per caller |
-| research / multi-hop trace | 13.5× | one `impact`/`path` call replaces a manual graph walk |
-| vocabulary-gap discovery (semantic) | 2.4× | vector search finds what keywords miss; capped by the small Q4 model |
-| literal definition search | ~1× | grep's home turf — grepplus passes straight through |
+| research / multi-hop trace | ~13× | one `impact`/`path` call replaces a manual graph walk |
+| vocabulary-gap discovery (semantic) | ~2.4× | vector search finds what keywords miss; capped by the small Q4 model |
+| literal definition search | ~1× | grep's home turf — it passes straight through |
+
+---
+
+## How it works
+
+- **Backward-compatible grep.** Any invocation that isn't one of the extra subcommands is forwarded to the real `grep`, returning its stdout/stderr and exit code **verbatim** — even for non-UTF-8 patterns. Scripts don't notice.
+- **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USES`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`find-usages`/`impact`/`path` directly — resolved relationships with `file:line`, not textual name matches — collapsing several grep+read rounds into one call.
+- **Native semantic search.** For a natural-language query that shares no words with the code, it embeds the query with Google's **EmbeddingGemma** (pure-Rust [candle](https://github.com/huggingface/candle) — no llama.cpp, no Python, no HTTP) and does exact cosine nearest-neighbour search over code-span embeddings.
+- **One-shot briefings.** `brief SYM` returns definition + callers + callees in one call; `impact SYM` returns the whole transitive blast-radius in one call.
+- **Freshness-gated incremental index** so a stale graph never hands the agent a confidently-wrong answer; re-indexing reparses only changed files.
+- **One native Rust binary.** At runtime it links only system libraries; tree-sitter parsers and SQLite are compiled in statically.
+
+---
+
+## Install
+
+```bash
+cargo build --release --bin grepplus            # one binary
+install -m 0755 target/release/grepplus /usr/local/bin/grep   # install it AS grep (or symlink)
+grepplus index /path/to/repo                    # index once (setup cost, not per-query)
+#   semantic path: grepplus index /path/to/repo --embeddings \
+#     --embedding-gguf <embeddinggemma-300M-Q4_K.gguf> --embedding-tokenizer <tokenizer.json>
+```
+
+Ready-made binaries for macOS (arm64/x86_64), Linux and Windows are attached to each [GitHub Release](../../releases) (built by `.github/workflows/release.yml`).
+
+Uninstall: remove the binary/symlink and `rm -rf "${GREPPLUS_STORE_DIR:-$HOME/Library/Caches/grepplus}"`.
 
 ---
 
 ## Status & scope
 
-grepplus is an honest work-in-progress, not a finished product.
-
-- **~40%** of the upstream C code-intelligence engine is ported.
-- **~18 languages** are wired for cross-file `CALLS` and `IMPORTS`; Rust additionally resolves `TYPE_REF` and `USES`. Richer edge classes (`WRITES`/`READS`/`IMPLEMENTS`/`OVERRIDE`) and full non-Rust edge parity are **not** ported yet.
-- The drop-in is **byte-exact** on a miss and for any scripted/piped grep; on a *match over a fresh index* it may append exactly one clearly-labelled non-canonical pointer line. For scripts that require byte-identical grep output in every case, don't alias `grep`.
-- Not production-ready. Use it as a fast code-navigation aid for agents and humans, not as a system of record.
-
----
+- **~40%** of the upstream C engine ported; **~18 languages** for cross-file `CALLS`/`IMPORTS` (Rust adds `TYPE_REF`/`USES`).
+- The extra commands are activated by the agent's system prompt (above). Today the passthrough intercepts **`grep`**; interception of `ripgrep` (`rg`), which many agents prefer, is in progress.
+- The passthrough is **byte-exact** on a miss and for scripted/piped grep; on a match over a fresh index it may append one clearly-labelled non-canonical context line.
+- Not production-ready. Use it as a fast code-navigation aid, not a system of record.
 
 ## Reproducing the numbers
 
-The numbers above come from the harness in [`bench/agent_efficiency/`](bench/agent_efficiency/) — the exact one used to produce them, included so the claims are auditable.
-
-```bash
-# deterministic, no API key: byte-level search-context measurement
-python3 bench/agent_efficiency/context_cost.py
-
-# full agent benchmark (grepplus agent vs uncoached grep agent, MiniMax-M3 via Pi Code)
-export MINIMAX_API_KEY=sk-...
-python3 bench/agent_efficiency/real_corpus.py            # fetch the pinned real-repo corpus
-python3 bench/agent_efficiency/run_bench.py --tasks bench/agent_efficiency/tasks_v2.json
-```
-
-See [`bench/agent_efficiency/README.md`](bench/agent_efficiency/README.md) for the methodology (baseline definitions, why the fixed system prompt is excluded as warmup, and the corpus manifest).
-
----
+The exact harness is under [`bench/agent_efficiency/`](bench/agent_efficiency/) (see its README for baseline definitions and why the fixed system prompt is excluded as warmup).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Vendored assets and replaced dependencies: [THIRD_PARTY.md](THIRD_PARTY.md).
+MIT — see [LICENSE](LICENSE). Third-party notices: [THIRD_PARTY.md](THIRD_PARTY.md).

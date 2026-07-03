@@ -464,7 +464,7 @@ fn graph_commands_serve_labeled_rows_on_large_stale_drift() {
             "labeled-stale {command} must warn on stderr; stderr={err:?}"
         );
         assert!(
-            err.contains("run 'grepplus index'"),
+            err.contains("run 'grep index'"),
             "stale warning must tell the agent the fix; stderr={err:?}"
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {

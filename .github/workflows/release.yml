@@ -1,0 +1,83 @@
+name: release
+
+# Build ready-to-run binaries for macOS (arm64 + x86_64), Linux (x86_64) and
+# Windows (x86_64) and attach them to a GitHub Release.
+#
+# Triggers:
+#   * push a tag `v*`   -> builds and publishes a Release with the assets
+#   * manual dispatch   -> builds the assets and uploads them as workflow
+#                          artifacts (no Release is created)
+#
+# Each job builds NATIVELY on its own runner (no cross-compilation), so the
+# bundled C deps (tree-sitter grammars, SQLite) and the pure-Rust candle
+# engine compile with the platform's own toolchain. The Rust version is the
+# one pinned by rust-toolchain.toml.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create/attach the Release on tag builds
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+            asset: grepplus-macos-arm64.tar.gz
+          - name: macos-x86_64
+            os: macos-13
+            asset: grepplus-macos-x86_64.tar.gz
+          - name: linux-x86_64
+            os: ubuntu-latest
+            asset: grepplus-linux-x86_64.tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            asset: grepplus-windows-x86_64.zip
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (pinned by rust-toolchain.toml)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release --bin grepplus
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/release/grepplus dist/grep          # ship it under the name it runs as
+          cp target/release/grepplus dist/grepplus       # and its own name
+          cp README.md LICENSE dist/ 2>/dev/null || true
+          tar -C dist -czf "${{ matrix.asset }}" .
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/grepplus.exe dist/grepplus.exe
+          Copy-Item README.md,LICENSE dist/ -ErrorAction SilentlyContinue
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
+
+      - name: Upload workflow artifact (manual runs)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+      - name: Attach to Release (tag runs)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}
+          fail_on_unmatched_files: true

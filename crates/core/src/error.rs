@@ -33,7 +33,7 @@ pub enum Error {
     NotImplemented { feature: String, reason: String },
 
     /// A feature is explicitly out of scope for the project.
-    #[error("out of scope for grepplus-rs: {feature}")]
+    #[error("out of scope: {feature}")]
     OutOfScope { feature: String },
 
     /// A request was malformed.
@@ -107,7 +107,7 @@ mod tests {
         );
         assert_eq!(
             Error::out_of_scope("install").to_string(),
-            "out of scope for grepplus-rs: install"
+            "out of scope: install"
         );
         assert_eq!(
             Error::io("open file", std::io::Error::other("boom")).to_string(),

@@ -161,11 +161,11 @@ fn assert_byte_exact_no_plus(
         "{label}: stale/strict path must keep stderr byte-exact"
     );
     assert!(
-        !String::from_utf8_lossy(&actual.stdout).contains("GREPPLUS_NON_CANONICAL_HIT"),
+        !String::from_utf8_lossy(&actual.stdout).contains("NON_CANONICAL_CODE_HINT"),
         "{label}: must not print a visible synthetic hit"
     );
     assert!(
-        !String::from_utf8_lossy(&actual.stderr).contains("GREPPLUS_NON_CANONICAL_HIT"),
+        !String::from_utf8_lossy(&actual.stderr).contains("NON_CANONICAL_CODE_HINT"),
         "{label}: must not print a synthetic hit on stderr"
     );
 }
@@ -189,7 +189,7 @@ fn r002_real_grep_miss_is_byte_exact_empty_with_no_synthetic_line() {
         .filter(|p| {
             p.file_name()
                 .and_then(|s| s.to_str())
-                .map(|s| s.contains("GREPPLUS_SEMANTIC_NONCANONICAL.md"))
+                .map(|s| s.contains("CODE_CONTEXT_NONCANONICAL.md"))
                 .unwrap_or(false)
         })
         .collect();
@@ -226,7 +226,7 @@ fn r002_real_grep_error_rc2_emits_no_synthetic_output() {
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        !stderr.contains("GREPPLUS_NON_CANONICAL_HIT"),
+        !stderr.contains("NON_CANONICAL_CODE_HINT"),
         "stderr must not contain synthetic sentinel on rc=2 path: {stderr}"
     );
     let _ = std::fs::remove_dir_all(&tmp);
@@ -479,7 +479,7 @@ fn sidecar_count(root: &Path) -> usize {
         .filter(|p| {
             p.file_name()
                 .and_then(|s| s.to_str())
-                .map(|s| s.contains("GREPPLUS_SEMANTIC_NONCANONICAL.md"))
+                .map(|s| s.contains("CODE_CONTEXT_NONCANONICAL.md"))
                 .unwrap_or(false)
         })
         .count()

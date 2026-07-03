@@ -22,15 +22,44 @@ pub fn render_sidecar(
 ) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "<!-- GREPPLUS_NON_CANONICAL_HIT: {} -->\n\n",
+        "<!-- NON_CANONICAL_CODE_HINT: {} -->\n\n",
         query
     ));
-    out.push_str("# GrepPlus semantic context for `");
+    out.push_str("# Code context for `");
     out.push_str(query);
     out.push_str("`\n\n");
     out.push_str("This file is generated helper context.\n");
     out.push_str("It is not part of the repository.\n");
     out.push_str("It is not a canonical source-code match.\n\n");
+
+    // Self-discovery (the drop-in's whole point): the agent knows only `grep`.
+    // Right here — inside the grep output it is already reading — tell it that
+    // this `grep` is grepplus and can answer structural/semantic questions with
+    // the SAME command name, so it learns the extra capabilities without any
+    // system-prompt change or skill. The example uses the queried term when it
+    // is a plain identifier, else a generic placeholder.
+    let example = if !query.is_empty() && query.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        query
+    } else {
+        "<symbol>"
+    };
+    out.push_str("## This `grep` also answers code-structure questions\n");
+    out.push_str("Call these the same way you just called grep (same command name, no setup):\n");
+    out.push_str(&format!(
+        "- `grep brief {example}` — {example}'s definition + its callers + its callees, in ONE call\n"
+    ));
+    out.push_str(&format!(
+        "- `grep who-calls {example}` — every function that calls {example}\n"
+    ));
+    out.push_str(&format!(
+        "- `grep callees {example}` — every function {example} calls\n"
+    ));
+    out.push_str(&format!(
+        "- `grep impact {example}` — everything that breaks if you change {example}\n"
+    ));
+    out.push_str(
+        "- `grep context \"<describe the code in plain English>\"` — find code by meaning when a keyword search fails\n\n",
+    );
 
     out.push_str("## Original grep command\n```\n");
     out.push_str(original_command);
@@ -212,7 +241,7 @@ pub fn cleanup_expired(workspace_root: &Path, ttl_secs: u64) -> std::io::Result<
             Some(n) => n,
             None => continue,
         };
-        if !name.ends_with("__GREPPLUS_SEMANTIC_NONCANONICAL.md") {
+        if !name.ends_with("__CODE_CONTEXT_NONCANONICAL.md") {
             continue;
         }
         let modified = match entry.metadata().and_then(|m| m.modified()) {
@@ -267,7 +296,7 @@ mod tests {
             42,
             &[fake_hit("processOrder")],
         );
-        assert!(s.starts_with("<!-- GREPPLUS_NON_CANONICAL_HIT: processOrder -->"));
+        assert!(s.starts_with("<!-- NON_CANONICAL_CODE_HINT: processOrder -->"));
         assert!(s.contains("graph_generation=42"));
         assert!(s.contains("p::Function::processOrder"));
     }

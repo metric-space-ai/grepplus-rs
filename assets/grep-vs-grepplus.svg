@@ -1,10 +1,10 @@
 <svg viewBox="0 0 960 690" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" role="img" aria-labelledby="title desc">
-  <title id="title">A grep agent versus a grepplus agent on one real benchmark task</title>
-  <desc id="desc">On task r047, the grep agent runs 5 tool calls reading 2761 bytes; the grepplus agent runs 2 tool calls reading 1202 bytes. Both reach the same correct answer, _split_blueprint_path in src/flask/helpers.py.</desc>
+  <title id="title">A plain-grep agent versus a grep-with-code-commands agent on one real benchmark task</title>
+  <desc id="desc">On task r047, the plain-grep agent runs 5 tool calls reading 2761 bytes; the agent that knows grep's code commands runs 2 tool calls reading 1202 bytes. Both reach the same correct answer, _split_blueprint_path in src/flask/helpers.py.</desc>
   <rect width="960" height="690" fill="#ffffff"/>
 
   <!-- header -->
-  <text x="36" y="42" font-size="22" font-weight="700" fill="#0f172a">One real task — a grep agent vs a grepplus agent</text>
+  <text x="36" y="42" font-size="22" font-weight="700" fill="#0f172a">One real task — plain grep vs grep that knows code commands</text>
   <text x="36" y="66" font-size="13" fill="#64748b">Benchmark task r047 · Flask · the same MiniMax-M3 coding agent · both reach the correct answer</text>
 
   <!-- question -->
@@ -14,14 +14,14 @@
 
   <!-- drop-in banner -->
   <rect x="36" y="146" width="888" height="44" rx="8" fill="#eef2ff" stroke="#c7d2fe"/>
-  <text x="52" y="166" font-size="12.5" fill="#4338ca"><tspan font-weight="700">grepplus is a drop-in for grep</tspan> — you install it as <tspan font-family="ui-monospace,Menlo,monospace">grep</tspan>. Every plain grep call still works byte-for-byte;</text>
-  <text x="52" y="183" font-size="12.5" fill="#4338ca">the agent simply gains <tspan font-family="ui-monospace,Menlo,monospace">context</tspan> / <tspan font-family="ui-monospace,Menlo,monospace">brief</tspan> / <tspan font-family="ui-monospace,Menlo,monospace">who-calls</tspan> from the very same binary.</text>
+  <text x="52" y="166" font-size="12.5" fill="#4338ca"><tspan font-weight="700">One backward-compatible</tspan> <tspan font-family="ui-monospace,Menlo,monospace">grep</tspan> — every normal grep call works byte-for-byte. The agent on the right was told, in its</text>
+  <text x="52" y="183" font-size="12.5" fill="#4338ca">system prompt, that this <tspan font-family="ui-monospace,Menlo,monospace">grep</tspan> also has <tspan font-family="ui-monospace,Menlo,monospace">context</tspan> / <tspan font-family="ui-monospace,Menlo,monospace">brief</tspan> / <tspan font-family="ui-monospace,Menlo,monospace">who-calls</tspan> commands.</text>
 
   <!-- column headers -->
   <text x="36" y="216" font-size="14" font-weight="700" fill="#b91c1c">AGENT USING grep</text>
   <text x="36" y="233" font-size="11.5" fill="#9ca3af">matches text → keeps guessing the vocabulary</text>
-  <text x="494" y="216" font-size="14" font-weight="700" fill="#15803d">AGENT USING grepplus</text>
-  <text x="494" y="233" font-size="11.5" fill="#9ca3af">matches meaning → one semantic query</text>
+  <text x="494" y="216" font-size="14" font-weight="700" fill="#15803d">AGENT USING grep + code commands</text>
+  <text x="494" y="233" font-size="11.5" fill="#9ca3af">knows grep can answer by meaning → one query</text>
 
   <!-- ================= LEFT: grep chain (5 blocks) ================= -->
   <g font-family="ui-monospace,Menlo,monospace">
@@ -59,18 +59,18 @@
   <rect x="36" y="554" width="430" height="30" rx="7" fill="#fee2e2"/>
   <text x="52" y="573" font-size="11.5" font-weight="600" fill="#7f1d1d">5 tool calls · 2,761 bytes read — answer on the 5th</text>
 
-  <!-- ================= RIGHT: grepplus chain (2 blocks) ================= -->
+  <!-- ================= RIGHT: equipped-agent chain (2 blocks) ================= -->
   <g font-family="ui-monospace,Menlo,monospace">
     <!-- block 1 -->
     <rect x="494" y="242" width="430" height="54" rx="7" fill="#f0fdf4" stroke="#bbf7d0"/>
     <circle cx="516" cy="269" r="12" fill="#86efac"/><text x="516" y="273" font-size="12" font-weight="700" fill="#14532d" text-anchor="middle">1</text>
-    <text x="538" y="265" font-size="10.5" fill="#14532d">grepplus context "expand a dotted nesting name…"</text>
+    <text x="538" y="265" font-size="10.5" fill="#14532d">grep context "expand a dotted nesting name…"</text>
     <text x="538" y="284" font-size="10" font-family="-apple-system" fill="#15803d">semantic match → _split_blueprint_path (no shared word)</text>
     <rect x="862" y="256" width="52" height="18" rx="9" fill="#dcfce7"/><text x="888" y="269" font-size="10" fill="#166534" text-anchor="middle" font-family="-apple-system">545 B</text>
     <!-- block 2 -->
     <rect x="494" y="304" width="430" height="54" rx="7" fill="#f0fdf4" stroke="#bbf7d0"/>
     <circle cx="516" cy="331" r="12" fill="#86efac"/><text x="516" y="335" font-size="12" font-weight="700" fill="#14532d" text-anchor="middle">2</text>
-    <text x="538" y="327" font-size="10.5" fill="#14532d">grepplus brief _split_blueprint_path</text>
+    <text x="538" y="327" font-size="10.5" fill="#14532d">grep brief _split_blueprint_path</text>
     <text x="538" y="346" font-size="10" font-family="-apple-system" fill="#15803d">definition + callers + callees in one call → done</text>
     <rect x="862" y="318" width="52" height="18" rx="9" fill="#dcfce7"/><text x="888" y="331" font-size="10" fill="#166534" text-anchor="middle" font-family="-apple-system">657 B</text>
   </g>
@@ -91,5 +91,5 @@
 
   <!-- honest footnote -->
   <text x="36" y="668" font-size="10.5" fill="#94a3b8">One illustrative task. Median across the benchmark: ~3–4× fewer billed tokens and ~2× faster end-to-end. Against an uncoached agent that</text>
-  <text x="36" y="682" font-size="10.5" fill="#94a3b8">reads freely (no discipline), the same r047 task took 33 tool calls — 16× more model rounds than grepplus. Its lead grows the less careful the agent is.</text>
+  <text x="36" y="682" font-size="10.5" fill="#94a3b8">reads freely (no discipline), the same r047 task took 33 tool calls — 16× more model rounds than the equipped agent. The lead grows the less careful the agent is.</text>
 </svg>

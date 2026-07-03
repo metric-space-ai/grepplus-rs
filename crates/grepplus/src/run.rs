@@ -188,7 +188,7 @@ fn run_augment(
             let sidecar_path =
                 sidecar::write_sidecar(workspace_root, query, &original_cmd, generation, &hits)?;
             println!(
-                "{}:1:<!-- GREPPLUS_NON_CANONICAL_HIT: {} -->",
+                "{}:1:<!-- NON_CANONICAL_CODE_HINT: {} -->",
                 sidecar_path.display(),
                 query
             );

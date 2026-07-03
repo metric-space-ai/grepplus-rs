@@ -44,7 +44,7 @@ fn main() -> ExitCode {
     let real = match grepplus_grep::discover_grep() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("grepplus-grep: {e}");
+            eprintln!("grep: {e}");
             return ExitCode::from(3);
         }
     };
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     let exit = match run::run_with_optional_augment_os(&real, &argv, &args) {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("grepplus-grep: {e}");
+            eprintln!("grep: {e}");
             return ExitCode::from(2);
         }
     };

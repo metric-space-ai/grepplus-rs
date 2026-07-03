@@ -105,7 +105,7 @@ mod unix {
         assert!(out.status.success(), "--help should exit 0");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.contains("drop-in grep wrapper"),
+            stdout.contains("drop-in grep"),
             "help must show the honest about string; got: {stdout}"
         );
     }

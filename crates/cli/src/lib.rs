@@ -120,9 +120,10 @@ enum EmbeddingModelSource {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "grepplus",
+    name = "grep",
+    bin_name = "grep",
     version,
-    about = "drop-in grep wrapper + multi-language codebase graph/search (18 languages: cross-file CALLS/IMPORTS; Rust adds TYPE_REF/USES) + precision-first grep-plus search; in-progress port (~40% of the upstream engine)",
+    about = "A drop-in grep that also answers code-structure questions over an indexed codebase (who-calls / callees / impact / context).",
     long_about = None,
     allow_external_subcommands = true,
     disable_help_subcommand = true,
@@ -136,8 +137,8 @@ pub struct Cli {
     /// identity on this path instead of detecting the repo root by
     /// walking up from the current directory. `global = true` lets it be
     /// passed either before or after the subcommand:
-    ///   grepplus --root /repo search-code foo
-    ///   grepplus search-code --root /repo foo
+    ///   grep --root /repo search-code foo
+    ///   grep search-code --root /repo foo
     #[arg(long, global = true)]
     pub root: Option<String>,
 
@@ -253,7 +254,7 @@ pub enum Command {
     Brief { symbol: Option<String> },
     /// Print deterministic graph statistics for the workspace project:
     /// file count, node counts by label, edge counts by type, and the
-    /// node/edge totals. Backed by `grepplus_store::Store::stats`.
+    /// node/edge totals.
     Stats,
     /// Store/index diagnostics: schema health, integrity check, workspace
     /// state, graph stats and provider completeness.
@@ -417,7 +418,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// grep-plus search: combine literal/full-text, symbol, fuzzy semantic,
+    /// Fused search: combine literal/full-text, symbol, fuzzy semantic,
     /// and graph-neighbour signals into grep-like ranked hits.
     /// This is search output, not a generated answer: each row stays
     /// `file:line score signals symbol snippet`.
@@ -528,22 +529,22 @@ pub enum Command {
         #[arg(long)]
         embedding_max_length: Option<usize>,
     },
-    /// Agent installer — out of scope for grepplus-rs.
+    /// Agent installer — out of scope.
     Install {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Agent uninstaller — out of scope for grepplus-rs.
+    /// Agent uninstaller — out of scope.
     Uninstall {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Agent updater — out of scope for grepplus-rs.
+    /// Agent updater — out of scope.
     Update {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Runtime config — out of scope for grepplus-rs.
+    /// Runtime config — out of scope.
     Config { subcmd: Option<String> },
 }
 
@@ -711,7 +712,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             } else {
                 if json {
                     return Err(Error::Invalid(
-                        "index --json is only supported for `grepplus index status --json`".into(),
+                        "index --json is only supported for `grep index status --json`".into(),
                     ));
                 }
                 dispatch_index(
@@ -914,10 +915,10 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             },
             root,
         ),
-        Command::Install { .. } => Err(Error::out_of_scope("grepplus install")),
-        Command::Uninstall { .. } => Err(Error::out_of_scope("grepplus uninstall")),
-        Command::Update { .. } => Err(Error::out_of_scope("grepplus update")),
-        Command::Config { .. } => Err(Error::out_of_scope("grepplus config")),
+        Command::Install { .. } => Err(Error::out_of_scope("grep install")),
+        Command::Uninstall { .. } => Err(Error::out_of_scope("grep uninstall")),
+        Command::Update { .. } => Err(Error::out_of_scope("grep update")),
+        Command::Config { .. } => Err(Error::out_of_scope("grep config")),
     }
 }
 
@@ -2670,7 +2671,7 @@ fn warn_serving_stale(
         None => "extent unknown".to_string(),
     };
     eprintln!(
-        "grepplus: index may be stale ({drift}); results from generation {generation} — run 'grepplus index'"
+        "grep: index may be stale ({drift}); results from generation {generation} — run 'grep index'"
     );
 }
 
@@ -3782,7 +3783,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "incomplete_provider_count": null,
             "skip_counts_by_reason": [],
             "dirty_overlay": dirty_overlay.to_json(),
-            "message": "no active index; run grepplus index first",
+            "message": "no active index; run grep index first",
         });
         if json {
             println!(
@@ -3795,7 +3796,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             println!("root: {}", effective_root.display());
             println!("store: {}", store_path.display());
             println!(
-                "message: run `grepplus index {}` first",
+                "message: run `grep index {}` first",
                 root.unwrap_or(".")
             );
             if dirty_overlay.git_available && !dirty_overlay.clean {
@@ -6236,7 +6237,7 @@ fn dispatch_plus(
         } else {
             eprintln!("{}", plus_stale_skip_message(freshness));
             println!(
-                "(no usable index; run `grepplus index {}` before `grepplus plus`)",
+                "(no usable index; run `grep index {}` first)",
                 root.unwrap_or(".")
             );
         }
@@ -7045,7 +7046,7 @@ fn dispatch_semantic(
                 )?;
             } else {
                 println!(
-                    "(no vector embeddings for model {}; run `grepplus index --embeddings ...` first)",
+                    "(no vector embeddings for model {}; run `grep index --embeddings ...` first)",
                     cfg.model_id
                 );
             }
@@ -7170,7 +7171,7 @@ fn current_graph_generation(store: &grepplus_store::Store, root: Option<&str>) -
     let root_key = root_path.to_string_lossy().into_owned();
     let state = store.get_workspace_state(&root_key)?.ok_or_else(|| {
         Error::Invalid(format!(
-            "no workspace_state for {}; run `grepplus index {}` first",
+            "no workspace_state for {}; run `grep index {}` first",
             root_path.display(),
             root.unwrap_or(".")
         ))
@@ -7652,7 +7653,7 @@ fn context_vector_fallback(
     let total = grepplus_search::count_vector_search_scope(store, &scope)?;
     if total == 0 {
         eprintln!(
-            "context: no indexed vectors for model {} (run `grepplus index \
+            "context: no indexed vectors for model {} (run `grep index \
              --embeddings ...`); skipping vector fallback.",
             cfg.model_id
         );
@@ -8457,12 +8458,12 @@ fn open_default_store(root: Option<&str>) -> Result<grepplus_store::Store> {
     if !path.exists() {
         let shown_root = root.unwrap_or(".");
         eprintln!(
-            "grepplus: no index for {} — run `grepplus index {}` first",
+            "grep: no index for {} — run `grep index {}` first",
             effective_root.display(),
             shown_root
         );
         return Err(Error::Invalid(format!(
-            "no index for {}; run `grepplus index {}` first",
+            "no index for {}; run `grep index {}` first",
             effective_root.display(),
             shown_root
         )));
@@ -8554,7 +8555,7 @@ fn dispatch_index(
     let target = match path {
         Some(p) => absolutize_path(std::path::Path::new(p)),
         None => std::env::current_dir()
-            .map_err(|e| Error::io("read current_dir for `grepplus index` default", e))?,
+            .map_err(|e| Error::io("read current_dir for `grep index` default", e))?,
     };
     // RV-006 / RV-011: the store path and project identity are keyed on
     // the *resolved* repo root, not on the (possibly sub-directory) index
@@ -8597,14 +8598,14 @@ fn dispatch_index(
         ),
         Ok(LockOutcome::Contended) => {
             eprintln!(
-                "grepplus: another indexer is running against {}",
+                "grep: another indexer is running against {}",
                 store_path.display()
             );
             return Ok(EXIT_TEMPFAIL as i32);
         }
         Err(grepplus_freshness::LockError::Held { pid, age_secs, .. }) => {
             eprintln!(
-                "grepplus: lock held by another writer (pid {:?}, age {:?}s) on {}",
+                "grep: lock held by another writer (pid {:?}, age {:?}s) on {}",
                 pid,
                 age_secs,
                 store_path.display()
@@ -8776,7 +8777,7 @@ fn publish_store_snapshot(
         Err(e) if active_snapshot_is_recoverable(&e) && active_path.exists() => {
             let quarantine_path = quarantine_active_store(active_path)?;
             eprintln!(
-                "grepplus: active index {} failed validation before publish ({e}); quarantined to {}",
+                "grep: active index {} failed validation before publish ({e}); quarantined to {}",
                 active_path.display(),
                 quarantine_path.display()
             );
@@ -9214,7 +9215,7 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
     match dispatch(cli) {
         Ok(code) => code.clamp(0, 255) as u8,
         Err(e) => {
-            eprintln!("grepplus: {e}");
+            eprintln!("grep: {e}");
             let mut source = std::error::Error::source(&e);
             while let Some(cause) = source {
                 eprintln!("  caused by: {cause}");
@@ -9235,71 +9236,71 @@ fn print_help() {
     // of every subcommand so users (and agents) can see at a glance what
     // is implemented, what is pending, and what is intentionally out of
     // scope.
-    println!("grepplus — Rust port of codebase-memory-mcp core features (status: scaffold; see reviews/)");
+    println!("grep — a drop-in grep that also answers code-structure questions over an indexed codebase");
     println!();
     println!("Usage:");
-    println!("  grepplus grep [grep-args...]   Drop-in grep wrapper (real grep passthrough)");
-    println!("  grepplus index <path> [--embeddings --embedding-model-dir DIR | --embedding-gguf FILE --embedding-tokenizer FILE]");
+    println!("  grep grep [grep-args...]   Drop-in grep wrapper (real grep passthrough)");
+    println!("  grep index <path> [--embeddings --embedding-model-dir DIR | --embedding-gguf FILE --embedding-tokenizer FILE]");
     println!("                                 Index graph/content, optionally with EmbeddingGemma code-span vectors");
     println!(
         "                                 Scope via {ENV_DISCOVER_INCLUDE}/{ENV_DISCOVER_EXCLUDE} (semicolon/newline globs)"
     );
-    println!("  grepplus index status [--json]");
+    println!("  grep index status [--json]");
     println!("                                 Active index health, freshness and project stats");
-    println!("  grepplus stats                 Graph statistics (files, nodes by label, edges by type, totals)");
+    println!("  grep stats                 Graph statistics (files, nodes by label, edges by type, totals)");
     println!(
-        "  grepplus diagnostics [--json]  Store health, workspace state, provider completeness"
+        "  grep diagnostics [--json]  Store health, workspace state, provider completeness"
     );
-    println!("  grepplus doctor [--json]       Workspace health check for agent handoff");
+    println!("  grep doctor [--json]       Workspace health check for agent handoff");
     println!(
-        "  grepplus search-graph [--name N] [--json] Structured graph search with exact count metadata in --json"
+        "  grep search-graph [--name N] [--json] Structured graph search with exact count metadata in --json"
     );
-    println!("  grepplus trace --symbol S [--direction outgoing|incoming] [--edge CALLS|USES|TYPE_REF|IMPORTS] [--depth N] [--code|--json]");
+    println!("  grep trace --symbol S [--direction outgoing|incoming] [--edge CALLS|USES|TYPE_REF|IMPORTS] [--depth N] [--code|--json]");
     println!("                                 Call-graph trace with step metadata in --json");
-    println!("  grepplus who-calls S [--code|--json] [--all]  Incoming CALLS to S — callers with exact count metadata in --json");
-    println!("  grepplus callees S [--code|--json] [--all]     Outgoing CALLS from S — callees with exact count metadata in --json");
-    println!("  grepplus find-usages S [--code|--json] [--all] Incoming USAGE refs to S with exact count metadata in --json");
-    println!("  grepplus references S [--code|--json] [--all]  Incoming CALLS/USAGE/IMPORTS refs to S with exact count metadata in --json");
-    println!("  grepplus fan-in [--edge CALLS] [--limit N] [--json]  Top incoming-degree symbols with exact count metadata");
-    println!("  grepplus fan-out [--edge CALLS] [--limit N] [--json] Top outgoing-degree symbols with exact count metadata");
-    println!("  grepplus graph-locate <file:line> [--json]       Graph symbol at grep-style location (marks nearest fallback)");
-    println!("  grepplus graph-locate --file F --line N [--json] Same lookup with explicit file/line args");
-    println!("  grepplus impact S [--direction incoming|outgoing] [--depth N] [--json]");
-    println!("  grepplus impact [--since REV|--base REV] [--direction incoming|outgoing] [--depth N] [--json]");
+    println!("  grep who-calls S [--code|--json] [--all]  Incoming CALLS to S — callers with exact count metadata in --json");
+    println!("  grep callees S [--code|--json] [--all]     Outgoing CALLS from S — callees with exact count metadata in --json");
+    println!("  grep find-usages S [--code|--json] [--all] Incoming USAGE refs to S with exact count metadata in --json");
+    println!("  grep references S [--code|--json] [--all]  Incoming CALLS/USAGE/IMPORTS refs to S with exact count metadata in --json");
+    println!("  grep fan-in [--edge CALLS] [--limit N] [--json]  Top incoming-degree symbols with exact count metadata");
+    println!("  grep fan-out [--edge CALLS] [--limit N] [--json] Top outgoing-degree symbols with exact count metadata");
+    println!("  grep graph-locate <file:line> [--json]       Graph symbol at grep-style location (marks nearest fallback)");
+    println!("  grep graph-locate --file F --line N [--json] Same lookup with explicit file/line args");
+    println!("  grep impact S [--direction incoming|outgoing] [--depth N] [--json]");
+    println!("  grep impact [--since REV|--base REV] [--direction incoming|outgoing] [--depth N] [--json]");
     println!("                                 Transitive blast-radius; diff mode maps changed hunks to symbols first");
-    println!("  grepplus brief S               One-call briefing: S's definition (with source) + direct callers + direct callees");
-    println!("  grepplus path --from A --to B [--edge CALLS|USES|TYPE_REF|IMPORTS] [--json]");
+    println!("  grep brief S               One-call briefing: S's definition (with source) + direct callers + direct callees");
+    println!("  grep path --from A --to B [--edge CALLS|USES|TYPE_REF|IMPORTS] [--json]");
     println!("                                 Shortest path A→B over --edge edges, with exact step metadata in --json");
-    println!("  grepplus search-symbols Q [--json]");
+    println!("  grep search-symbols Q [--json]");
     println!("                                 Symbol search (label qualified_name file:line; JSON adds exact counts)");
-    println!("  grepplus search-code [--json] [--changed|--staged|--since REV|--base REV] Q");
+    println!("  grep search-code [--json] [--changed|--staged|--since REV|--base REV] Q");
     println!("                                 Code search; git scopes live-grep changed files, staged blobs or rev/base diffs");
-    println!("  grepplus plus Q [--k N] [--code] [--explain] [--json] [--vectors] [embedding model flags]");
+    println!("  grep plus Q [--k N] [--code] [--explain] [--json] [--vectors] [embedding model flags]");
     println!("                                 Grep-like fused text/symbol/fuzzy/graph hits; --vectors adds current-generation EmbeddingGemma code-span hits");
-    println!("  grepplus semantic Q [--json]   Algorithmic semantic query");
-    println!("  grepplus semantic --vectors Q [--json] [embedding model flags]");
+    println!("  grep semantic Q [--json]   Algorithmic semantic query");
+    println!("  grep semantic --vectors Q [--json] [embedding model flags]");
     println!("                                 EmbeddingGemma vector search over current-generation code-span vectors");
     println!(
         "                                 Exact backend guard: {ENV_VECTOR_EXACT_CANDIDATE_LIMIT}=0 disables the default {} candidate cap",
         grepplus_search::DEFAULT_EXACT_VECTOR_CANDIDATE_LIMIT
     );
-    println!("  grepplus context Q [--k N] [--lines] [--json]");
+    println!("  grep context Q [--k N] [--lines] [--json]");
     println!("                                 Resolve top-K definitions for Q and print actual source spans with JSON truncation metadata on request");
     println!(
-        "  grepplus install               Agent installer                           [out of scope]"
+        "  grep install               Agent installer                           [out of scope]"
     );
     println!(
-        "  grepplus uninstall             Agent uninstaller                         [out of scope]"
+        "  grep uninstall             Agent uninstaller                         [out of scope]"
     );
     println!(
-        "  grepplus update                Agent updater                             [out of scope]"
+        "  grep update                Agent updater                             [out of scope]"
     );
     println!(
-        "  grepplus config <subcmd>       Runtime config                            [out of scope]"
+        "  grep config <subcmd>       Runtime config                            [out of scope]"
     );
-    println!("  grepplus --root <path> …       Pin the repo root for index + all queries (else auto-detected)");
-    println!("  grepplus --version             Print version");
-    println!("  grepplus --help                Print this help");
+    println!("  grep --root <path> …       Pin the repo root for index + all queries (else auto-detected)");
+    println!("  grep --version             Print version");
+    println!("  grep --help                Print this help");
     println!();
     println!("Exit codes:");
     println!("  0       success (real-grep behaviour preserved)");
@@ -9919,7 +9920,7 @@ mod tests {
         let r = dispatch(cli);
         assert!(matches!(
             r,
-            Err(Error::OutOfScope { ref feature }) if feature == "grepplus install"
+            Err(Error::OutOfScope { ref feature }) if feature == "grep install"
         ));
     }
 

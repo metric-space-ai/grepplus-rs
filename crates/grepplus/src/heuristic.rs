@@ -205,7 +205,7 @@ pub fn classify(args: &GrepArgs, freshness: FreshnessGate) -> Mode {
 
 /// Path layout for the sidecar file.
 ///
-/// `<store_dir>/<query>__<random>__GREPPLUS_SEMANTIC_NONCANONICAL.md`
+/// `<store_dir>/<query>__<random>__CODE_CONTEXT_NONCANONICAL.md`
 ///
 /// R-019 / WP-R006 (operational hardening): the path includes a
 /// per-invocation random component so a co-located attacker on a
@@ -232,7 +232,7 @@ pub fn sidecar_path(workspace_root: &Path, query: &str) -> std::path::PathBuf {
     // of the same process) can't race the same filename even on
     // a single user.
     let nonce = nonce_component();
-    let filename = format!("{safe_query}__{nonce}__GREPPLUS_SEMANTIC_NONCANONICAL.md");
+    let filename = format!("{safe_query}__{nonce}__CODE_CONTEXT_NONCANONICAL.md");
     grepplus_core::workspace::store_dir(workspace_root).join(filename)
 }
 
@@ -356,7 +356,7 @@ mod tests {
         let p = sidecar_path(std::path::Path::new("/tmp/repo"), "Process Order");
         let name = p.file_name().unwrap().to_string_lossy();
         assert!(name.contains("Process_Order"));
-        assert!(name.ends_with("__GREPPLUS_SEMANTIC_NONCANONICAL.md"));
+        assert!(name.ends_with("__CODE_CONTEXT_NONCANONICAL.md"));
     }
 
     #[test]

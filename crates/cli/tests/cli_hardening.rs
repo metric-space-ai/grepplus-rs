@@ -366,7 +366,7 @@ fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         "labeled-stale search-code must serve the indexed rows; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grepplus index'"),
+        err.contains("index may be stale") && err.contains("run 'grep index'"),
         "labeled-stale search-code must warn on stderr; stderr={err:?}"
     );
     let v: serde_json::Value =
@@ -1128,7 +1128,7 @@ fn semantic_algorithmic_stale_index_serves_labeled_hits() {
         "labeled-stale semantic must serve the indexed hits; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grepplus index'"),
+        err.contains("index may be stale") && err.contains("run 'grep index'"),
         "labeled-stale semantic must warn on stderr; stderr={err:?}"
     );
     let v: serde_json::Value =

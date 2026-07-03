@@ -416,7 +416,7 @@ fn path_json_serves_labeled_stale_steps_when_auto_reindex_disabled() {
         "labeled-stale path must serve the indexed path; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grepplus index'"),
+        err.contains("index may be stale") && err.contains("run 'grep index'"),
         "labeled-stale path must warn on stderr; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
