@@ -16,7 +16,7 @@ grep context "restrict a value to a range"  # find code by meaning, not keyword
 grep brief _split_blueprint_path            # definition + callers + callees, one call
 ```
 
-![An agent using grep vs an agent using grepplus on one real benchmark task](assets/grep-vs-grepplus.svg)
+<video src="docs/assets/grepplus-pi-code-benchmark-demo.mp4" controls muted width="100%"></video>
 
 ---
 
