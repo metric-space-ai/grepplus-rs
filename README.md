@@ -111,7 +111,11 @@ So it is not a cost-for-accuracy trade: on structural questions greppy is **both
 
 **Where plain grep keeps up:** open-ended *"how does this subsystem work"* questions. Both tools reach the answer there (~98% correct either way), but greppy's precise locator makes the agent read more to explain the *mechanism*, so it costs a little **more**. greppy's edge is **pinpoint / structural** questions — the semantic path is being tuned to also lead the agent to the answer in one step.
 
-**The gain depends on the model.** Across the 14 models the structural token-saving ranged from ~parity (Opus 4.8, Gemini 3.1 Pro) to **~1.8×** (Sonnet 5, Fable 5, MiniMax-M3), and did **not** track a model's general agentic-benchmark score. Benchmark your own model — most come out ahead, and every model gets the correctness lift.
+**The gain depends on the model.** Priced at each model's real OpenRouter list rate, the **actual dollar cost** of the structural tasks drops with greppy for most models — a **median of ~16%** cheaper — but it swings widely (from **+54%** on MiMo to **−84%** on Grok 4.3, which spirals) and does **not** track a model's general agentic-benchmark score. Benchmark your own model — most come out ahead, and every model gets the correctness lift.
+
+<img src="docs/assets/gain-vs-agentic.svg" width="100%" alt="Real dollar saving per model on structural tasks vs Artificial Analysis Agentic Index — model-dependent, uncorrelated with agentic rank"/>
+
+<sub>Real cost = each model's OpenRouter list price × tokens, summed over the structural tasks. The scatter shows the efficiency gain is real for most models but genuinely model-dependent, not something a model's agentic rank predicts.</sub>
 
 ---
 
