@@ -1,0 +1,98 @@
+{
+  "note": "Repos cloned locally for benchmarking only; not redistributed. Licenses recorded per repo.",
+  "repos": {
+    "django": {
+      "commit": "318a316a4c86a65bede68144f9546a6056d91379",
+      "files": 7071,
+      "lang": "python",
+      "license": "BSD-3-Clause",
+      "path": "realcorpus/django",
+      "repo": "django",
+      "url": "https://github.com/django/django",
+      "usage_dropped": false
+    },
+    "elasticsearch": {
+      "commit": "fc85b9c0492265a20e90e18db4f496c5e2e4bf4a",
+      "files": 44774,
+      "lang": "java",
+      "license": "Elastic-2.0 / SSPL-1.0",
+      "path": "realcorpus/elasticsearch",
+      "repo": "elasticsearch",
+      "url": "https://github.com/elastic/elasticsearch"
+    },
+    "flask": {
+      "commit": "36e4a824f340fdee7ed50937ba8e7f6bc7d17f81",
+      "files": 236,
+      "lang": "python",
+      "license": "BSD-3-Clause",
+      "path": "realcorpus/flask",
+      "repo": "flask",
+      "url": "https://github.com/pallets/flask",
+      "usage_dropped": false
+    },
+    "gson": {
+      "commit": "c9f3fd55854a743b66f857ace3c7b268ea3e2ef7",
+      "files": 311,
+      "lang": "java",
+      "license": "Apache-2.0",
+      "oracle_reliability": "reliable",
+      "path": "realcorpus/gson",
+      "repo": "gson",
+      "surviving_targets": {
+        "CALLS": 185,
+        "IMPORTS": 0,
+        "USAGE": 0
+      },
+      "url": "https://github.com/google/gson",
+      "usage_drop_reason": "usage_survivors_0_below_15",
+      "usage_dropped": true
+    },
+    "hugo": {
+      "commit": "dfb35dcd7a9ab9a6d8b6c0829c312f2e4d5f8b0d",
+      "files": 2537,
+      "lang": "go",
+      "license": "Apache-2.0",
+      "path": "realcorpus/hugo",
+      "repo": "hugo",
+      "url": "https://github.com/gohugoio/hugo"
+    },
+    "serde": {
+      "commit": "1023d077510b4aef36a41ef56fdb7798568a2654",
+      "files": 361,
+      "lang": "rust",
+      "license": "MIT OR Apache-2.0",
+      "path": "realcorpus/serde",
+      "repo": "serde",
+      "url": "https://github.com/serde-rs/serde",
+      "usage_drop_reason": "usage_survivors_5_below_15",
+      "usage_dropped": true
+    },
+    "tokio": {
+      "commit": "c637f6e73d06f36d933cc3edaf45111c06b79c18",
+      "files": 864,
+      "lang": "rust",
+      "license": "MIT",
+      "path": "realcorpus/tokio",
+      "repo": "tokio",
+      "url": "https://github.com/tokio-rs/tokio",
+      "usage_dropped": false
+    },
+    "zod": {
+      "commit": "912f0f51b0ced654d0069741e7160834dca742ee",
+      "files": 583,
+      "lang": "ts",
+      "license": "MIT",
+      "oracle_reliability": "reliable",
+      "path": "realcorpus/zod",
+      "repo": "zod",
+      "surviving_targets": {
+        "CALLS": 152,
+        "IMPORTS": 0,
+        "USAGE": 0
+      },
+      "url": "https://github.com/colinhacks/zod",
+      "usage_drop_reason": "usage_survivors_0_below_15",
+      "usage_dropped": true
+    }
+  }
+}

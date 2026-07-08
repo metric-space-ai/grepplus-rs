@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="160" height="160" role="img" aria-label="greppy logo">
+  <rect x="8" y="8" width="184" height="184" rx="38" fill="#0f172a"/>
+  <text x="40" y="120" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="62" font-weight="700" fill="#22c55e">&#8250;</text>
+  <rect x="86" y="78" width="30" height="9" rx="2" fill="#22c55e"/>
+  <text x="100" y="170" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="33" font-weight="700" fill="#e2e8f0" text-anchor="middle">greppy</text>
+</svg>

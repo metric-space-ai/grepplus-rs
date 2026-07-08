@@ -1,0 +1,30 @@
+[package]
+name = "greppy-indexer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "greppy multi-pass indexer"
+
+[dependencies]
+greppy-core = { path = "../core" }
+greppy-discover = { path = "../discover" }
+greppy-embed-native = { path = "../embed-native" }
+greppy-freshness = { path = "../freshness" }
+greppy-parser = { path = "../parser" }
+greppy-resolver = { path = "../resolver" }
+greppy-store = { path = "../store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+rayon = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+
+[features]
+default = []
+# Passthrough accelerator features to the embedding backend so bench examples
+# (e.g. bench_embed_index --auto) can drive the GPU embedding path.
+metal = ["greppy-embed-native/metal"]
+cuda = ["greppy-embed-native/cuda"]
+accelerate = []

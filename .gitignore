@@ -1,0 +1,66 @@
+# --- Build artifacts ---
+/target/
+**/target/
+**/*.rs.bk
+
+# Cargo.lock is tracked on purpose — this workspace ships binaries.
+
+# --- IDE / OS ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# --- Local scratch / logs ---
+/scratch/
+/tmp/
+*.log
+
+# --- Dev-only working area (SINGLE repo, dev part kept out of the public release):
+#     internal plans, scratch, transitional oracle/bench tooling, notes. ---
+/dev/
+
+# --- Python caches / virtualenvs ---
+__pycache__/
+*.py[cod]
+.venv*/
+**/.venv*/
+
+# --- Agent / assistant working files (kept out of the public repo) ---
+CLAUDE.md
+AGENTS.md
+AGENT_PROJECT_ENTRYPOINT.md
+/docs/
+/reviews/
+/marketing/
+.claude/
+.codex/
+
+# --- greppy on-disk graph store / sidecars (never commit a binary SQLite
+#     store: it pollutes `grep -R .` and bloats the repo) ---
+**/.greppy/
+**/graph.db
+**/graph.db-shm
+**/graph.db-wal
+**/*.freshstamp
+**/*.prev
+
+# --- Bench fixture: keep the source, ignore generated index/state ---
+bench/fixtures/sample/.greppy/
+bench/fixtures/sample/.git/
+
+# --- Benchmark artifacts / results (the harness scripts are tracked; their
+#     run outputs, transcripts, downloaded corpus, and result dumps are not) ---
+bench/agent_efficiency/acceptance_runs/
+bench/agent_efficiency/*-store/
+bench/agent_efficiency/*.jsonl
+bench/agent_efficiency/RESULTS*.md
+bench/agent_efficiency/*_JOURNAL*.md
+# Pinned real-repo corpus is fetched on demand (see bench/agent_efficiency/README.md);
+# keep the manifest + candidate list, ignore the downloaded checkouts.
+bench/agent_efficiency/realcorpus/*/
+
+# --- candle golden minters (dev-only; candle removed from the product, goldens are committed static fixtures in crates/embed-native/testdata) ---
+/crates/embeddinggemma/
+*.log

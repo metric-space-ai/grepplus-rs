@@ -1,0 +1,20 @@
+<svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#0f1a30"/>
+      <stop offset="1" stop-color="#070c16"/>
+    </linearGradient>
+  </defs>
+  <rect width="1280" height="640" fill="url(#bg)"/>
+
+  <!-- grep+ wordmark, centered -->
+  <text x="392" y="330" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="150" font-weight="700" fill="#f1f5f9">grep</text>
+  <g fill="#22c55e">
+    <rect x="778" y="272" width="108" height="36" rx="18"/>
+    <rect x="814" y="236" width="36" height="108" rx="18"/>
+  </g>
+
+  <!-- tagline -->
+  <text x="640" y="440" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="35" font-weight="600" fill="#cbd5e1">Standard <tspan font-family="ui-monospace,Menlo,monospace" fill="#e2e8f0">grep</tspan>, plus a few commands your coding agent can use.</text>
+  <text x="640" y="486" text-anchor="middle" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif" font-size="24" fill="#64748b">who-calls · impact · context · brief — ~2× faster, ~3–4× cheaper code navigation</text>
+</svg>

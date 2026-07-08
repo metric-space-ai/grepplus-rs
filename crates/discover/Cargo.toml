@@ -1,0 +1,15 @@
+[package]
+name = "greppy-discover"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "greppy file discovery, ignore rules, language detection"
+
+[dependencies]
+greppy-core = { path = "../core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ignore = { workspace = true }
+walkdir = { workspace = true }

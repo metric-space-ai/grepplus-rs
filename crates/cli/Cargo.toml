@@ -1,0 +1,45 @@
+[package]
+name = "greppy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "greppy unified CLI (subcommand dispatcher for grep-plus tools)"
+
+[[bin]]
+name = "greppy"
+path = "src/main.rs"
+
+[dependencies]
+greppy-core = { path = "../core" }
+greppy-discover = { path = "../discover" }
+greppy-embed-native = { path = "../embed-native" }
+greppy-freshness = { path = "../freshness" }
+greppy-grep = { path = "../greppy" }
+greppy-indexer = { path = "../indexer" }
+greppy-search = { path = "../search" }
+greppy-store = { path = "../store" }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+# Owner rule: greppy works OUT OF THE BOX. The EmbeddingGemma model is baked
+# into every build by default (feature `embedded-model`, model files live in
+# `assets/embedded-model/` in this repo) — no download, no runtime flags, no
+# env. GPU is auto-detected at runtime (device default = `auto`).
+[features]
+default = ["embedded-model"]
+embedded-model = []
+# GPU inference for EmbeddingGemma. Selected per platform at BUILD time (the
+# per-platform release binaries enable it; the runtime auto-detects and uses
+# the GPU with no `--device` flag). On macOS per-invocation Metal init can cost
+# more than it saves for a single one-shot query, so it stays build-opt-in:
+# `cargo build --release --features metal` (Linux/Windows CUDA: `--features cuda`).
+metal = ["greppy-embed-native/metal", "greppy-indexer/metal"]
+accelerate = []
+cuda = ["greppy-embed-native/cuda", "greppy-indexer/cuda"]
+
+[build-dependencies]
+sha2 = "0.10"

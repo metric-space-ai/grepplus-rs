@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 420" font-family="system-ui,Segoe UI,Roboto,sans-serif">
+<rect width="720" height="420" fill="#ffffff"/>
+<line x1="60" y1="217" x2="700" y2="217" stroke="#c3c2b7" stroke-width="1"/>
+<line x1="60" y1="40" x2="60" y2="360" stroke="#c3c2b7" stroke-width="1"/>
+<text x="52" y="331" font-size="11" fill="#898781" text-anchor="end">-50%</text>
+<text x="52" y="276" font-size="11" fill="#898781" text-anchor="end">-25%</text>
+<text x="52" y="221" font-size="11" fill="#898781" text-anchor="end">0%</text>
+<text x="52" y="165" font-size="11" fill="#898781" text-anchor="end">+25%</text>
+<text x="52" y="110" font-size="11" fill="#898781" text-anchor="end">+50%</text>
+<text x="52" y="55" font-size="11" fill="#898781" text-anchor="end">+75%</text>
+<text x="380" y="402" font-size="12" fill="#898781" text-anchor="middle">Artificial Analysis Agentic Index →</text>
+<text x="18" y="200" font-size="12" fill="#898781" text-anchor="middle" transform="rotate(-90 18 200)">real $ saving per model</text>
+<circle cx="363" cy="139" r="6" fill="#1a9e75"/>
+<text x="372" y="142" font-size="10" fill="#898781" text-anchor="start">DeepSeek</text>
+<circle cx="649" cy="177" r="6" fill="#1a9e75"/>
+<text x="640" y="180" font-size="10" fill="#898781" text-anchor="end">Fable5</text>
+<circle cx="111" cy="296" r="6" fill="#e24b4a"/>
+<text x="120" y="299" font-size="10" fill="#898781" text-anchor="start">Gemini3.1Pro</text>
+<circle cx="380" cy="181" r="6" fill="#1a9e75"/>
+<text x="389" y="184" font-size="10" fill="#898781" text-anchor="start">Gemini3.5F</text>
+<circle cx="481" cy="314" r="6" fill="#e24b4a"/>
+<text x="472" y="317" font-size="10" fill="#898781" text-anchor="end">GLM-5.2</text>
+<circle cx="515" cy="161" r="6" fill="#1a9e75"/>
+<text x="506" y="164" font-size="10" fill="#898781" text-anchor="end">GPT-5.5</text>
+<circle cx="161" cy="261" r="6" fill="#e24b4a"/>
+<text x="170" y="264" font-size="10" fill="#898781" text-anchor="start">Grok4.3</text>
+<circle cx="262" cy="155" r="6" fill="#1a9e75"/>
+<text x="271" y="158" font-size="10" fill="#898781" text-anchor="start">Kimi</text>
+<circle cx="245" cy="157" r="6" fill="#1a9e75"/>
+<text x="254" y="160" font-size="10" fill="#898781" text-anchor="start">MiMo</text>
+<circle cx="346" cy="78" r="6" fill="#1a9e75"/>
+<text x="355" y="81" font-size="10" fill="#898781" text-anchor="start">MiniMax</text>
+<circle cx="548" cy="190" r="6" fill="#1a9e75"/>
+<text x="539" y="193" font-size="10" fill="#898781" text-anchor="end">Opus4.8</text>
+<circle cx="279" cy="183" r="6" fill="#1a9e75"/>
+<text x="288" y="186" font-size="10" fill="#898781" text-anchor="start">Qwen3.7</text>
+<circle cx="548" cy="250" r="6" fill="#e24b4a"/>
+<text x="539" y="253" font-size="10" fill="#898781" text-anchor="end">Sonnet5</text>
+<text x="60" y="26" font-size="13" fill="#0b0b0b">Efficiency gain is model-dependent — not predicted by agentic rank (r≈0)</text>
+</svg>

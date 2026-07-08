@@ -1,0 +1,18 @@
+[package]
+name = "greppy-freshness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "greppy workspace fingerprint and freshness tracking"
+
+[dependencies]
+greppy-core = { path = "../core" }
+greppy-discover = { path = "../discover" }
+greppy-parser = { path = "../parser" }
+greppy-store = { path = "../store" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sha2 = { workspace = true }
+rusqlite = { workspace = true }
