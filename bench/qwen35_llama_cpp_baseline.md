@@ -6,6 +6,26 @@ Model: `Qwen3.5-0.8B-Q4_K_M.gguf`
 
 SHA256: `f5b14da98939b60bbe1019a964eba656407e1e0b64f1fe3003ff6d650e93bfec`
 
+## Current Production Comparison
+
+All rows use a 512-token prompt and 128 generated tokens. CPU rows use the
+same thread count within each host. The native rows measure the production
+path; the numerically drifting experimental Metal batched-prefill path is not
+used here.
+
+| Platform | Device | Threads | llama.cpp input tok/s | Native input tok/s | Native/llama | llama.cpp output tok/s | Native output tok/s | Native/llama |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| CPU Apple Silicon | Apple M5 | 4 | 201.59 | 100.33 | 49.77% | 61.24 | 56.58 | 92.39% |
+| CPU x86 | Intel i5-13400F | 6 | 4878.71 | 61.45 | 1.26% | 79.40 | 25.98 | 32.72% |
+| Metal | Apple M5 | GPU | 2743.54 | 92.84 | 3.38% | 74.52 | 60.95 | 81.79% |
+| CUDA | RTX A4500, one GPU | GPU | 13959.69 | 397.50 | 2.85% | 351.18 | 301.15 | 85.75% |
+
+The x86 and CUDA llama.cpp rows were remeasured sequentially on `gpu3`, with
+CUDA pinned to physical GPU 2 and split mode disabled. Native CUDA used the
+same card through `CUDA_VISIBLE_DEVICES=2`. The current gaps are architectural:
+CPU x86 and CUDA still process prompt state without a competitive quantized
+batched GEMM, while production Metal still uses tokenwise prefill.
+
 Metal benchmark command shape:
 
 ```sh
@@ -28,7 +48,8 @@ llama-bench -m Qwen3.5-0.8B-Q4_K_M.gguf -dev CUDA0 -sm none -ngl 99 -p 512 -n 12
 |---|---|---|---:|---:|---:|
 | Mac | CPU | Apple M5, 4 threads, `n_gpu_layers=0` | 9060 `ad0922465` | 201.59 | 61.24 |
 | Mac | Metal | Apple M5 `MTL0`, `n_gpu_layers=99` | 9060 `ad0922465` | 2743.54 | 74.52 |
-| gpu3 | CUDA | NVIDIA RTX A4500 `CUDA0` | 1 `ef2d770` | 14103.67 | 386.51 |
+| gpu3 | CPU | Intel i5-13400F, 6 threads, `n_gpu_layers=0` | 1 `ef2d770` | 4878.71 | 79.40 |
+| gpu3 | CUDA | NVIDIA RTX A4500 `CUDA2` | 1 `ef2d770` | 13959.69 | 351.18 |
 
 The Mac CPU and Metal rows above were remeasured sequentially on 2026-07-09.
 The CPU row still initializes the Metal backend at process startup, but the JSON
@@ -65,6 +86,7 @@ cargo test --release -p greppy-qwen35-native --features cuda \
 | gpu3 | Native Rust CUDA, Qwen add-RMSNorm fusion + cache-only final prefill layer | NVIDIA RTX A4500 `CUDA0` | 511 | 398.06 | 128 | 307.54 |
 | gpu3 | Native Rust CUDA, Qwen add-RMSNorm fusion + cache-only final prefill layer | NVIDIA RTX A4500 `CUDA0` | 511 | 401.19 | 128 | 307.10 |
 | gpu3 | Native Rust CUDA, Qwen add-RMSNorm fusion rerun | NVIDIA RTX A4500 `CUDA0` | 511 | 401.40 | 128 | 306.46 |
+| gpu3 | Native Rust CUDA, current production path | NVIDIA RTX A4500 `CUDA2` | 511 | 397.50 | 128 | 301.15 |
 
 ## Native Rust CPU Snapshot
 
@@ -84,6 +106,8 @@ cargo test --release -p greppy-qwen35-native \
 | Host | Backend | Device | Input tokens | Input tok/s | Output tokens | Output tok/s |
 |---|---|---|---:|---:|---:|---:|
 | Mac | Native Rust CPU reference, no-logits prefill | Apple M5 | 511 | 6.38 | 128 | 4.04 |
+| Mac | Native Rust CPU SIMD, 4 Rayon threads | Apple M5 | 511 | 100.33 | 128 | 56.58 |
+| gpu3 | Native Rust CPU AVX2, 6 Rayon threads | Intel i5-13400F | 511 | 61.45 | 128 | 25.98 |
 
 ## Native Rust Metal Snapshot
 
@@ -104,6 +128,8 @@ cargo test --release -p greppy-qwen35-native --features metal \
 | Mac | Native Rust Metal, tokenwise forward + CPU logits argmax | Apple M5 `MTL0` | 511 | 119.84 | 128 | 87.60 |
 | Mac | Native Rust Metal, tokenwise forward + GPU greedy argmax | Apple M5 `MTL0` | 511 | 148.36 | 128 | 99.31 |
 | Mac | Native Rust Metal, experimental batched prefill + GPU greedy argmax | Apple M5 `MTL0` | 511 | 392.02 | 128 | 60.65 |
+| Mac | Native Rust Metal, current production tokenwise prefill | Apple M5 `MTL0` | 511 | 92.84 | 128 | 60.95 |
+| Mac | Native Rust Metal, current experimental batched prefill | Apple M5 `MTL0` | 511 | 306.04 | 128 | 63.57 |
 
 Evidence output:
 

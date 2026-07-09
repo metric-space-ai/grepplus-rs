@@ -2500,7 +2500,7 @@ fn is_greedy_device_sampling(params: GenerationParams) -> bool {
         && params.repetition_penalty == 1.0
 }
 
-fn metal_batch_prefill_enabled() -> bool {
+pub(crate) fn metal_batch_prefill_enabled() -> bool {
     std::env::var_os("QWEN35_NATIVE_METAL_BATCH_PREFILL")
         .as_deref()
         .is_some_and(|value| value == "1")

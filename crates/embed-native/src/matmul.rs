@@ -1319,6 +1319,17 @@ fn dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
         return dot_q5k_q8k_neon(xs, ys);
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if x86_kernel_kind() == X86KernelKind::Avx2 {
+        unsafe {
+            return dot_q5k_q8k_avx2(xs, ys);
+        }
+    }
+
+    dot_q5k_q8k_scalar(xs, ys)
+}
+
+fn dot_q5k_q8k_scalar(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
     let mut sum = 0.0f32;
     let mut values = [0.0f32; QK_K];
     for (x, y) in xs.iter().zip(ys) {
@@ -2494,6 +2505,57 @@ unsafe fn dot4_q4k_q8k_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
+unsafe fn dot_q5k_q8k_avx2(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
+    let low_nibble = _mm256_set1_epi8(0x0f);
+    let mut sum = 0.0f32;
+
+    for (x, y) in xs.iter().zip(ys) {
+        let (scales, mins) = decode_q4k_scales_mins(&x.scales);
+        let mut min_sum = 0i32;
+        for i in 0..8 {
+            min_sum += (y.bsums[2 * i] as i32 + y.bsums[2 * i + 1] as i32) * mins[i] as i32;
+        }
+
+        let hbits = _mm256_loadu_si256(x.qh.as_ptr() as *const __m256i);
+        let mut hmask = _mm256_set1_epi8(1);
+        let mut bit = 0i32;
+        let mut scaled_sum = 0i32;
+
+        for group in 0..QK_K / 64 {
+            let q5bits = _mm256_loadu_si256(x.qs.as_ptr().add(group * 32) as *const __m256i);
+
+            let q5_low = _mm256_and_si256(q5bits, low_nibble);
+            let q5_high = _mm256_slli_epi16::<4>(_mm256_srlv_epi32(
+                _mm256_and_si256(hbits, hmask),
+                _mm256_set1_epi32(bit),
+            ));
+            let q5_0 = _mm256_or_si256(q5_low, q5_high);
+            hmask = _mm256_slli_epi16::<1>(hmask);
+            bit += 1;
+
+            let q5_low = _mm256_and_si256(_mm256_srli_epi16::<4>(q5bits), low_nibble);
+            let q5_high = _mm256_slli_epi16::<4>(_mm256_srlv_epi32(
+                _mm256_and_si256(hbits, hmask),
+                _mm256_set1_epi32(bit),
+            ));
+            let q5_1 = _mm256_or_si256(q5_low, q5_high);
+            hmask = _mm256_slli_epi16::<1>(hmask);
+            bit += 1;
+
+            let q8_0 = _mm256_loadu_si256(y.qs.as_ptr().add(group * 64) as *const __m256i);
+            let q8_1 = _mm256_loadu_si256(y.qs.as_ptr().add(group * 64 + 32) as *const __m256i);
+            scaled_sum += dot_u8_i8_32_avx2(q5_0, q8_0) * scales[2 * group] as i32;
+            scaled_sum += dot_u8_i8_32_avx2(q5_1, q8_1) * scales[2 * group + 1] as i32;
+        }
+
+        sum += x.d.to_f32() * y.d * scaled_sum as f32 - x.dmin.to_f32() * y.d * min_sum as f32;
+    }
+
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
 unsafe fn dot_q6k_q8k_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
     let mut sum = 0.0f64;
     let mut aux8 = [0i8; QK_K];
@@ -2774,5 +2836,53 @@ fn validate_f16_scale(name: &str, block_idx: usize, value: f16) -> Result<()> {
         Err(Error::InvalidGguf(format!(
             "{name} is non-finite in block {block_idx}"
         )))
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod x86_tests {
+    use super::*;
+
+    #[test]
+    fn q5k_q8k_avx2_matches_scalar() {
+        if !is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        let weights = (0..3)
+            .map(|block| {
+                let mut scales = [0u8; 12];
+                let mut qh = [0u8; QK_K / 8];
+                let mut qs = [0u8; QK_K / 2];
+                for (i, value) in scales.iter_mut().enumerate() {
+                    *value = ((block * 17 + i * 23 + 11) & 0xff) as u8;
+                }
+                for (i, value) in qh.iter_mut().enumerate() {
+                    *value = ((block * 29 + i * 13 + 7) & 0xff) as u8;
+                }
+                for (i, value) in qs.iter_mut().enumerate() {
+                    *value = ((block * 31 + i * 19 + 5) & 0xff) as u8;
+                }
+                BlockQ5K {
+                    d: f16::from_f32(0.0075 + block as f32 * 0.001),
+                    dmin: f16::from_f32(0.0025 + block as f32 * 0.0005),
+                    scales,
+                    qh,
+                    qs,
+                }
+            })
+            .collect::<Vec<_>>();
+        let input = (0..weights.len() * QK_K)
+            .map(|i| ((i * 37 % 211) as f32 - 105.0) / 53.0)
+            .collect::<Vec<_>>();
+        let activations = quantize_q8k(&input);
+
+        let scalar = dot_q5k_q8k_scalar(&weights, &activations);
+        let simd = unsafe { dot_q5k_q8k_avx2(&weights, &activations) };
+        let tolerance = 2.0e-4 * scalar.abs().max(1.0);
+        assert!(
+            (simd - scalar).abs() <= tolerance,
+            "Q5_K AVX2 mismatch: scalar={scalar}, simd={simd}, tolerance={tolerance}"
+        );
     }
 }
