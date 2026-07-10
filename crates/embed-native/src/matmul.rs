@@ -29,6 +29,9 @@ const Q8_0_SIZE: usize = 2 + QK8_0;
 const Q4_K_SIZE: usize = 2 + 2 + 12 + QK_K / 2;
 const Q5_K_SIZE: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2;
 const Q6_K_SIZE: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2;
+// The expanded x8 layout wins on projection compute but loses to compact Q6_K
+// once a very large LM head becomes memory-bandwidth bound.
+const Q6K_X8_MATVEC_MAX_ROWS: usize = 16_384;
 
 pub fn cpu_simd_backend() -> &'static str {
     #[cfg(target_arch = "x86_64")]
@@ -486,7 +489,37 @@ impl QuantMatrix {
                         }
                     });
             }
-            QuantStorage::Q6K { blocks: rhs, .. } => {
+            QuantStorage::Q6K {
+                blocks: rhs,
+                #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+                x8,
+            } => {
+                #[cfg(target_arch = "aarch64")]
+                if self.rows <= Q6K_X8_MATVEC_MAX_ROWS {
+                    if let Some(x8) = x8 {
+                        if std::arch::is_aarch64_feature_detected!("i8mm") {
+                            return Ok(matvec_x8_prepared(
+                                x8,
+                                &input.repeated_x4,
+                                self.rows,
+                                self.cols,
+                                dot8x1_q6k_q8k_i8mm,
+                            ));
+                        }
+                    }
+                }
+                #[cfg(target_arch = "x86_64")]
+                if self.rows <= Q6K_X8_MATVEC_MAX_ROWS {
+                    if let Some(x8) = x8 {
+                        return Ok(matvec_x8_prepared(
+                            x8,
+                            &input.repeated_x4,
+                            self.rows,
+                            self.cols,
+                            dot8x1_q6k_q8k_avxvnni,
+                        ));
+                    }
+                }
                 out.par_chunks_mut(64)
                     .enumerate()
                     .for_each(|(chunk_idx, dst)| {
@@ -968,9 +1001,31 @@ impl QuantMatrix {
                     }
                 } else if lhs_rows == 1 {
                     #[cfg(target_arch = "x86_64")]
-                    let used_x8 = false;
+                    let used_x8 = if self.rows <= Q6K_X8_MATVEC_MAX_ROWS {
+                        if let Some(x8) = x8 {
+                            out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x1_q6k_q8k_avxvnni);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     #[cfg(target_arch = "aarch64")]
-                    let used_x8 = false;
+                    let used_x8 = if self.rows <= Q6K_X8_MATVEC_MAX_ROWS {
+                        if let Some(x8) = x8 {
+                            if std::arch::is_aarch64_feature_detected!("i8mm") {
+                                out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x1_q6k_q8k_i8mm);
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
                     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let used_x8 = false;
                     if !used_x8 {
