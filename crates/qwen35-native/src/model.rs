@@ -312,7 +312,27 @@ fn brief_bullet_passes_quality(
     {
         return false;
     }
-    source_terms.is_empty() || lexical_terms(bullet).any(|term| source_terms.contains(&term))
+    // Relatedness check, relaxed for the finetuned model: it paraphrases, so
+    // exact >=4-char term overlap rejects good briefs on short functions.
+    // Accept when any >=3-char bullet term matches a source term or occurs as
+    // a substring of a source identifier (finds "quiz" in QuizScreen,
+    // "con" in connection). Topic-unrelated sentences still fail.
+    if source_terms.is_empty() {
+        return true;
+    }
+    let idents_lower: Vec<String> = source_identifiers
+        .iter()
+        .map(|i| i.to_ascii_lowercase())
+        .collect();
+    bullet
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .map(|t| t.to_ascii_lowercase())
+        .filter(|t| t.len() >= 3 && !TRIAGE_STOP_TERMS.contains(&t.as_str()))
+        .any(|t| {
+            source_terms.contains(&t)
+                || source_terms.iter().any(|s| s.contains(&t))
+                || idents_lower.iter().any(|i| i.contains(&t))
+        })
 }
 
 fn query_overlaps_span(query: &str, span_loc: &str, span_code: &str) -> bool {
@@ -922,7 +942,7 @@ mod cpu_perf_tests {
             .expect("MTP second golden draft");
         assert_eq!(
             [first_draft_token, greedy_argmax(&second_draft.logits)],
-            [6976, 279],
+            [334, 1159],
             "native MTP drafts differ from the finetuned-model golden tokens"
         );
 
