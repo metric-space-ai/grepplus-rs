@@ -3641,8 +3641,8 @@ mod tests {
         let metal = MetalQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044)
             .expect("Metal Qwen MTP model");
         let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
-        let prompt = crate::prompt::non_thinking_chat_prompt(
-            "Summarize: What is this function for?\n\npub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
+        let prompt = crate::prompt::brief_chat_prompt(
+            "pub fn rename_by_rules(&mut self, rules: RenameAllRules) {\n    self.serialize.value = rules.serialize.apply_to_field(&self.serialize.value);\n    self.deserialize.value = rules.deserialize.apply_to_field(&self.deserialize.value);\n}",
         );
         let ids = tokenizer
             .encode(prompt, true)
@@ -3668,7 +3668,7 @@ mod tests {
             .expect("Metal MTP target final row");
         prompt_hidden.extend_from_slice(&target.hidden);
         let first = greedy_argmax(&target.logits);
-        assert_eq!(first, 1919, "unexpected Metal MTP target token");
+        assert_eq!(first, 10296, "unexpected Metal MTP target token");
 
         let hidden_size = inventory.hidden_size;
         let mut conditioning = vec![0.0f32; prompt_hidden.len()];
@@ -3729,8 +3729,8 @@ mod tests {
         );
         assert_eq!(
             [first_draft_token, greedy_argmax(&second_draft.logits)],
-            [709, 369],
-            "Metal MTP drafts differ from llama.cpp golden tokens"
+            [6976, 279],
+            "Metal MTP drafts differ from the finetuned-model golden tokens"
         );
     }
 
@@ -3747,8 +3747,8 @@ mod tests {
         let metal =
             MetalQwen35Model::from_gguf(&gguf, inventory, 248_044).expect("Metal Qwen MTP model");
         let tokenizer = Tokenizer::from_file(tokenizer_path).expect("load Qwen3.5 tokenizer");
-        let prompt = crate::prompt::non_thinking_chat_prompt(
-            "Summarize: What is this function for?\n\npub fn add_user(users: &mut Vec<String>, name: &str) -> usize {\n    users.push(name.trim().to_string());\n    users.len()\n}",
+        let prompt = crate::prompt::brief_chat_prompt(
+            "pub fn add_user(users: &mut Vec<String>, name: &str) -> usize {\n    users.push(name.trim().to_string());\n    users.len()\n}",
         );
         let params = GenerationParams {
             max_tokens: 32,

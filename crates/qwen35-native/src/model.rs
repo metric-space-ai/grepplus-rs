@@ -97,7 +97,7 @@ impl Qwen35Summarizer {
             return Ok(Vec::new());
         }
         let prompt = brief_prompt(source);
-        let model_prompt = non_thinking_chat_prompt(&prompt);
+        let model_prompt = crate::prompt::brief_chat_prompt(source);
         let raw = self.generate_raw(&model_prompt, BRIEF_GENERATION_PARAMS)?;
         let bullets = postprocess_brief_output(&raw, &prompt);
         log_summary_debug("primary", &raw, &bullets);
@@ -966,7 +966,7 @@ mod cpu_perf_tests {
         .expect("load CPU Qwen3.5 summarizer");
         let source = "pub fn add_user(users: &mut Vec<String>, name: &str) -> usize {\n    users.push(name.trim().to_string());\n    users.len()\n}\n";
         let prompt = crate::brief_prompt(source);
-        let model_prompt = crate::prompt::non_thinking_chat_prompt(&prompt);
+        let model_prompt = crate::prompt::brief_chat_prompt(source);
         let params = crate::GenerationParams {
             max_tokens: 12,
             ..crate::BRIEF_GENERATION_PARAMS
@@ -1216,7 +1216,7 @@ mod metal_perf_tests {
         let source =
             "fn add_user(users: &mut Vec<String>, name: String) {\n    users.push(name);\n}\n";
         let prompt = crate::brief_prompt(source);
-        let model_prompt = crate::prompt::non_thinking_chat_prompt(&prompt);
+        let model_prompt = crate::prompt::brief_chat_prompt(source);
         let raw = summarizer
             .generate_raw(&model_prompt, crate::BRIEF_GENERATION_PARAMS)
             .expect("generate raw Metal summary");
@@ -1443,7 +1443,10 @@ mod tests {
             .max_by(|(_, left), (_, right)| left.total_cmp(right))
             .map(|(index, _)| u32::try_from(index).expect("vocabulary index fits u32"))
             .expect("non-empty mixed CUDA golden logits");
-        assert_eq!(token, 1919, "mixed CUDA target differs from llama.cpp");
+        assert_eq!(
+            token, 10296,
+            "mixed CUDA target differs from the finetuned-model golden token"
+        );
     }
 
     #[test]
