@@ -2836,21 +2836,60 @@ unsafe fn dot4x4_q5k_q8k_neon(
     weights: [&[BlockQ5K]; 4],
     inputs: [&[BlockQ8K]; 4],
 ) -> [[f32; 4]; 4] {
+    let low_nibble = vdupq_n_u8(0x0f);
+    let high_low = vdupq_n_u8(1);
+    let high_high = vdupq_n_u8(2);
     let mut sums = [[0.0f32; 4]; 4];
-    let mut decoded = [[0u8; QK_K]; 4];
     for block in 0..weights[0].len() {
-        let scale_mins: [([u8; 8], [u8; 8]); 4] = std::array::from_fn(|output| {
-            decode_q5k_u8(&weights[output][block], &mut decoded[output]);
-            decode_q4k_scales_mins(&weights[output][block].scales)
-        });
+        let x: [&BlockQ5K; 4] = std::array::from_fn(|output| &weights[output][block]);
+        let y: [&BlockQ8K; 4] = std::array::from_fn(|input| &inputs[input][block]);
+        let scale_mins: [([u8; 8], [u8; 8]); 4] =
+            std::array::from_fn(|output| decode_q4k_scales_mins(&x[output].scales));
+        let mut min_sums = [[0i32; 4]; 4];
         for input in 0..4 {
             for output in 0..4 {
-                let x = &weights[output][block];
-                let y = &inputs[input][block];
-                let (scaled_sum, min_sum) =
-                    dot_q5k_u8_q8k_neon(&decoded[output], &scale_mins[output], y);
+                for group in 0..QK_K / 32 {
+                    min_sums[input][output] += (y[input].bsums[group * 2] as i32
+                        + y[input].bsums[group * 2 + 1] as i32)
+                        * scale_mins[output].1[group] as i32;
+                }
+            }
+        }
+
+        let mut integer_sums = [[0i32; 4]; 4];
+        let mut high_bits: [uint8x16x2_t; 4] =
+            std::array::from_fn(|output| vld1q_u8_x2(x[output].qh.as_ptr()));
+        for group in 0..QK_K / 64 {
+            let q8: [int8x16x4_t; 4] =
+                std::array::from_fn(|input| vld1q_s8_x4(y[input].qs.as_ptr().add(group * 64)));
+            for output in 0..4 {
+                let packed = vld1q_u8_x2(x[output].qs.as_ptr().add(group * 32));
+                let q5h0 = vshlq_n_u8(vandq_u8(high_low, high_bits[output].0), 4);
+                let q5h1 = vshlq_n_u8(vandq_u8(high_low, high_bits[output].1), 4);
+                let q5h2 = vshlq_n_u8(vandq_u8(high_high, high_bits[output].0), 3);
+                let q5h3 = vshlq_n_u8(vandq_u8(high_high, high_bits[output].1), 3);
+                high_bits[output].0 = vshrq_n_u8(high_bits[output].0, 2);
+                high_bits[output].1 = vshrq_n_u8(high_bits[output].1, 2);
+
+                let q50 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed.0, low_nibble), q5h0));
+                let q51 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(packed.1, low_nibble), q5h1));
+                let q52 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed.0, 4), q5h2));
+                let q53 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(packed.1, 4), q5h3));
+                for input in 0..4 {
+                    integer_sums[input][output] +=
+                        vaddvq_s32(neon_vdotq_s32_pair(q50, q8[input].0, q51, q8[input].1))
+                            * scale_mins[output].0[group * 2] as i32;
+                    integer_sums[input][output] +=
+                        vaddvq_s32(neon_vdotq_s32_pair(q52, q8[input].2, q53, q8[input].3))
+                            * scale_mins[output].0[group * 2 + 1] as i32;
+                }
+            }
+        }
+        for input in 0..4 {
+            for output in 0..4 {
                 sums[input][output] +=
-                    x.d.to_f32() * y.d * scaled_sum as f32 - x.dmin.to_f32() * y.d * min_sum as f32;
+                    x[output].d.to_f32() * y[input].d * integer_sums[input][output] as f32
+                        - x[output].dmin.to_f32() * y[input].d * min_sums[input][output] as f32;
             }
         }
     }
@@ -3362,21 +3401,75 @@ unsafe fn dot4x4_q5k_q8k_avxvnni(
     weights: [&[BlockQ5K]; 4],
     inputs: [&[BlockQ8K]; 4],
 ) -> [[f32; 4]; 4] {
+    let low_nibble = _mm256_set1_epi8(0x0f);
     let mut sums = [[0.0f32; 4]; 4];
-    let mut decoded = [[0u8; QK_K]; 4];
     for block in 0..weights[0].len() {
-        let scale_mins: [([u8; 8], [u8; 8]); 4] = std::array::from_fn(|output| {
-            decode_q5k_u8(&weights[output][block], &mut decoded[output]);
-            decode_q4k_scales_mins(&weights[output][block].scales)
-        });
+        let x: [&BlockQ5K; 4] = std::array::from_fn(|output| &weights[output][block]);
+        let y: [&BlockQ8K; 4] = std::array::from_fn(|input| &inputs[input][block]);
+        let scale_mins: [([u8; 8], [u8; 8]); 4] =
+            std::array::from_fn(|output| decode_q4k_scales_mins(&x[output].scales));
+        let mut min_sums = [[0i32; 4]; 4];
         for input in 0..4 {
             for output in 0..4 {
-                let x = &weights[output][block];
-                let y = &inputs[input][block];
-                let (scaled_sum, min_sum) =
-                    dot_q5k_u8_q8k_avxvnni(&decoded[output], &scale_mins[output], y);
-                sums[input][output] +=
-                    x.d.to_f32() * y.d * scaled_sum as f32 - x.dmin.to_f32() * y.d * min_sum as f32;
+                for group in 0..QK_K / 32 {
+                    min_sums[input][output] += (y[input].bsums[group * 2] as i32
+                        + y[input].bsums[group * 2 + 1] as i32)
+                        * scale_mins[output].1[group] as i32;
+                }
+            }
+        }
+
+        let mut integer_sums = [[_mm256_setzero_si256(); 4]; 4];
+        for group in 0..QK_K / 64 {
+            let q8_low: [__m256i; 4] = std::array::from_fn(|input| {
+                _mm256_loadu_si256(y[input].qs.as_ptr().add(group * 64) as *const __m256i)
+            });
+            let q8_high: [__m256i; 4] = std::array::from_fn(|input| {
+                _mm256_loadu_si256(y[input].qs.as_ptr().add(group * 64 + 32) as *const __m256i)
+            });
+            let low_bit = (group * 2) as i32;
+            let high_bit = low_bit + 1;
+            for output in 0..4 {
+                let packed =
+                    _mm256_loadu_si256(x[output].qs.as_ptr().add(group * 32) as *const __m256i);
+                let high_bits = _mm256_loadu_si256(x[output].qh.as_ptr() as *const __m256i);
+                let q5_low = _mm256_or_si256(
+                    _mm256_and_si256(packed, low_nibble),
+                    _mm256_slli_epi16::<4>(_mm256_srlv_epi32(
+                        _mm256_and_si256(high_bits, _mm256_set1_epi8((1u8 << low_bit) as i8)),
+                        _mm256_set1_epi32(low_bit),
+                    )),
+                );
+                let q5_high = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_srli_epi16::<4>(packed), low_nibble),
+                    _mm256_slli_epi16::<4>(_mm256_srlv_epi32(
+                        _mm256_and_si256(high_bits, _mm256_set1_epi8((1u8 << high_bit) as i8)),
+                        _mm256_set1_epi32(high_bit),
+                    )),
+                );
+                let low_scale = _mm256_set1_epi32(scale_mins[output].0[group * 2] as i32);
+                let high_scale = _mm256_set1_epi32(scale_mins[output].0[group * 2 + 1] as i32);
+                for input in 0..4 {
+                    let low_dot =
+                        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), q5_low, q8_low[input]);
+                    let high_dot =
+                        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), q5_high, q8_high[input]);
+                    integer_sums[input][output] = _mm256_add_epi32(
+                        integer_sums[input][output],
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(low_dot, low_scale),
+                            _mm256_mullo_epi32(high_dot, high_scale),
+                        ),
+                    );
+                }
+            }
+        }
+        for input in 0..4 {
+            for output in 0..4 {
+                sums[input][output] += x[output].d.to_f32()
+                    * y[input].d
+                    * hsum_i32x8_avx2(integer_sums[input][output]) as f32
+                    - x[output].dmin.to_f32() * y[input].d * min_sums[input][output] as f32;
             }
         }
     }
@@ -3453,14 +3546,10 @@ unsafe fn dot4x4_q6k_q8k_avxvnni(
     inputs: [&[BlockQ8K]; 4],
 ) -> [[f32; 4]; 4] {
     let mut sums = [[0.0f32; 4]; 4];
-    let mut decoded_i8 = [[0i8; QK_K]; 4];
     let mut decoded_u8 = [[0u8; QK_K]; 4];
     for block in 0..weights[0].len() {
         for output in 0..4 {
-            decode_q6k_i8(&weights[output][block], &mut decoded_i8[output]);
-            for idx in 0..QK_K {
-                decoded_u8[output][idx] = (decoded_i8[output][idx] as i32 + 32) as u8;
-            }
+            decode_q6k_u8(&weights[output][block], &mut decoded_u8[output]);
         }
         for input in 0..4 {
             for output in 0..4 {
@@ -3597,6 +3686,18 @@ fn decode_q6k_i8(x: &BlockQ6K, aux8: &mut [i8; QK_K]) {
             aux8[j + l + 96] = (((x.ql[j / 2 + l + 32] >> 4) | (((x.qh[j / 4 + l] >> 6) & 3) << 4))
                 as i32
                 - 32) as i8;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_q6k_u8(x: &BlockQ6K, out: &mut [u8; QK_K]) {
+    for j in (0..QK_K).step_by(128) {
+        for l in 0..32 {
+            out[j + l] = (x.ql[j / 2 + l] & 0x0f) | ((x.qh[j / 4 + l] & 3) << 4);
+            out[j + l + 32] = (x.ql[j / 2 + l + 32] & 0x0f) | (((x.qh[j / 4 + l] >> 2) & 3) << 4);
+            out[j + l + 64] = (x.ql[j / 2 + l] >> 4) | (((x.qh[j / 4 + l] >> 4) & 3) << 4);
+            out[j + l + 96] = (x.ql[j / 2 + l + 32] >> 4) | (((x.qh[j / 4 + l] >> 6) & 3) << 4);
         }
     }
 }
@@ -3879,6 +3980,88 @@ mod arm_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod x86_tests {
     use super::*;
+
+    #[test]
+    fn q5k_q8k_avxvnni_tile_matches_rowwise_avx2() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("avxvnni") {
+            return;
+        }
+
+        let row_blocks = 3;
+        let weights = (0..4)
+            .map(|row| {
+                (0..row_blocks)
+                    .map(|block| {
+                        let mut scales = [0u8; 12];
+                        let mut qh = [0u8; QK_K / 8];
+                        let mut qs = [0u8; QK_K / 2];
+                        for (idx, value) in scales.iter_mut().enumerate() {
+                            *value = ((row * 37 + block * 17 + idx * 23 + 11) & 0xff) as u8;
+                        }
+                        for (idx, value) in qh.iter_mut().enumerate() {
+                            *value = ((row * 19 + block * 29 + idx * 13 + 7) & 0xff) as u8;
+                        }
+                        for (idx, value) in qs.iter_mut().enumerate() {
+                            *value = ((row * 41 + block * 31 + idx * 19 + 5) & 0xff) as u8;
+                        }
+                        BlockQ5K {
+                            d: f16::from_f32(0.0075 + row as f32 * 0.0003),
+                            dmin: f16::from_f32(0.0025 + block as f32 * 0.0002),
+                            scales,
+                            qh,
+                            qs,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let inputs = (0..4)
+            .map(|row| {
+                let values = (0..row_blocks * QK_K)
+                    .map(|idx| ((row * 43 + idx * 37) % 211) as f32 / 53.0 - 2.0)
+                    .collect::<Vec<_>>();
+                quantize_q8k(&values)
+            })
+            .collect::<Vec<_>>();
+        let actual = unsafe {
+            dot4x4_q5k_q8k_avxvnni(
+                [&weights[0], &weights[1], &weights[2], &weights[3]],
+                [&inputs[0], &inputs[1], &inputs[2], &inputs[3]],
+            )
+        };
+        for input in 0..4 {
+            for output in 0..4 {
+                let expected = unsafe { dot_q5k_q8k_avx2(&weights[output], &inputs[input]) };
+                let mut decoded_expected = 0.0f32;
+                let mut decoded = [0u8; QK_K];
+                for block in 0..row_blocks {
+                    decode_q5k_u8(&weights[output][block], &mut decoded);
+                    let scale_mins = decode_q4k_scales_mins(&weights[output][block].scales);
+                    let (scaled_sum, min_sum) = unsafe {
+                        dot_q5k_u8_q8k_avxvnni(&decoded, &scale_mins, &inputs[input][block])
+                    };
+                    decoded_expected += weights[output][block].d.to_f32()
+                        * inputs[input][block].d
+                        * scaled_sum as f32
+                        - weights[output][block].dmin.to_f32()
+                            * inputs[input][block].d
+                            * min_sum as f32;
+                }
+                assert_eq!(
+                    actual[input][output].to_bits(),
+                    decoded_expected.to_bits(),
+                    "Q5_K packed/decoded VNNI mismatch input={input} output={output}: packed={} decoded={decoded_expected}",
+                    actual[input][output],
+                );
+                let tolerance = 2.0e-4 * expected.abs().max(1.0);
+                assert!(
+                    (actual[input][output] - expected).abs() <= tolerance,
+                    "Q5_K VNNI tile mismatch input={input} output={output}: actual={} expected={expected} tolerance={tolerance}",
+                    actual[input][output],
+                );
+            }
+        }
+    }
 
     #[test]
     fn q5k_q8k_avx2_matches_scalar() {
