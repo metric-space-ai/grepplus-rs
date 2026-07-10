@@ -821,10 +821,12 @@ mod cpu_perf_tests {
         };
         let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, rows + 1);
         let tokens = &prompt_ids[..rows.min(prompt_ids.len())];
-        let mut state = model.new_state(tokens.len() + 1);
-        model
-            .profile_prefill_tokens(tokens, &mut state)
-            .expect("CPU profile prefill");
+        model.on_performance_cores(|| {
+            let mut state = model.new_state(tokens.len() + 1);
+            model
+                .profile_prefill_tokens(tokens, &mut state)
+                .expect("CPU profile prefill");
+        });
     }
 
     #[test]
@@ -868,13 +870,15 @@ mod cpu_perf_tests {
             Backend::Cuda(_) => panic!("expected CPU backend"),
         };
         let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, position + 1);
-        let mut state = model.new_state(position + 2);
-        model
-            .prefill_tokens(&prompt_ids[..position], &mut state)
-            .expect("CPU decode profile prefill");
-        model
-            .profile_forward_token_logits(prompt_ids[position], &mut state)
-            .expect("CPU decode profile token");
+        model.on_performance_cores(|| {
+            let mut state = model.new_state(position + 2);
+            model
+                .prefill_tokens(&prompt_ids[..position], &mut state)
+                .expect("CPU decode profile prefill");
+            model
+                .profile_forward_token_logits(prompt_ids[position], &mut state)
+                .expect("CPU decode profile token");
+        });
     }
 
     fn perf_env_usize(name: &str, default: usize) -> usize {

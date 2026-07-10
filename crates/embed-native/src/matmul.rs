@@ -92,6 +92,9 @@ fn x86_kernel_kind() -> X86KernelKind {
     })
 }
 
+#[cfg(target_arch = "x86_64")]
+const X86_OUTPUT_CHUNK_ROWS: usize = 16;
+
 #[derive(Debug, Clone)]
 pub struct QuantMatrix {
     name: String,
@@ -1497,29 +1500,28 @@ fn matmul_q4kx8_batched_avxvnni(
         .map(|row| pack_q8kx4_repeated(row))
         .collect::<Vec<_>>();
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
-    let chunk_values = 64 * lhs_rows;
+    let output_chunk_rows = X86_OUTPUT_CHUNK_ROWS;
+    let chunk_values = output_chunk_rows * lhs_rows;
     transposed
         .par_chunks_mut(chunk_values)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
-            let first_group = chunk_idx * 8;
+            let first_group = chunk_idx * (output_chunk_rows / 8);
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                let tiled_groups = activation_tiles.len() & !3;
-                for input_tile in (0..tiled_groups).step_by(4) {
+                let tiled_groups = activation_tiles.len() & !1;
+                for input_tile in (0..tiled_groups).step_by(2) {
                     let values = unsafe {
-                        dot8x16_q4k_q8k_avxvnni(
+                        dot8x8_q4k_q8k_avxvnni(
                             weights,
                             [
                                 &activation_tiles[input_tile],
                                 &activation_tiles[input_tile + 1],
-                                &activation_tiles[input_tile + 2],
-                                &activation_tiles[input_tile + 3],
                             ],
                         )
                     };
-                    for tile in 0..4 {
+                    for tile in 0..2 {
                         for input_lane in 0..4 {
                             let input_row = (input_tile + tile) * 4 + input_lane;
                             for output_lane in 0..8 {
@@ -1557,34 +1559,30 @@ fn matmul_x8_batched_avxvnni_prepared<T: Sync>(
     input: &PreparedQ8KRows,
     matrix_rows: usize,
     kernel_x4: unsafe fn(&[T], &[BlockQ8Kx4]) -> [[f32; 8]; 4],
-    kernel_x16: unsafe fn(&[T], [&[BlockQ8Kx4]; 4]) -> [[[f32; 8]; 4]; 4],
+    kernel_x8: unsafe fn(&[T], [&[BlockQ8Kx4]; 2]) -> [[[f32; 8]; 4]; 2],
 ) -> Vec<f32> {
     let lhs_rows = input.rows;
     let row_blocks = input.cols / QK_K;
     let tiled_rows = lhs_rows & !3;
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let output_chunk_rows = X86_OUTPUT_CHUNK_ROWS;
     transposed
-        .par_chunks_mut(64 * lhs_rows)
+        .par_chunks_mut(output_chunk_rows * lhs_rows)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
-            let first_group = chunk_idx * 8;
+            let first_group = chunk_idx * (output_chunk_rows / 8);
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                let tiled_groups = input.tiles_x4.len() & !3;
-                for input_tile in (0..tiled_groups).step_by(4) {
+                let tiled_groups = input.tiles_x4.len() & !1;
+                for input_tile in (0..tiled_groups).step_by(2) {
                     let values = unsafe {
-                        kernel_x16(
+                        kernel_x8(
                             weights,
-                            [
-                                &input.tiles_x4[input_tile],
-                                &input.tiles_x4[input_tile + 1],
-                                &input.tiles_x4[input_tile + 2],
-                                &input.tiles_x4[input_tile + 3],
-                            ],
+                            [&input.tiles_x4[input_tile], &input.tiles_x4[input_tile + 1]],
                         )
                     };
-                    for tile in 0..4 {
+                    for tile in 0..2 {
                         for input_lane in 0..4 {
                             let input_row = (input_tile + tile) * 4 + input_lane;
                             for output_lane in 0..8 {
@@ -1627,7 +1625,7 @@ fn matmul_q4kx8_batched_avxvnni_prepared(
         input,
         matrix_rows,
         dot8x4_q4k_q8k_avxvnni,
-        dot8x16_q4k_q8k_avxvnni,
+        dot8x8_q4k_q8k_avxvnni,
     )
 }
 
@@ -1638,6 +1636,15 @@ unsafe fn dot8x4_q4k_q8k_avxvnni(
     inputs: &[BlockQ8Kx4],
 ) -> [[f32; 8]; 4] {
     dot8x4n_q4k_q8k_avxvnni(weights, [inputs])[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x8_q4k_q8k_avxvnni(
+    weights: &[BlockQ4Kx8Vnni],
+    inputs: [&[BlockQ8Kx4]; 2],
+) -> [[[f32; 8]; 4]; 2] {
+    dot8x4n_q4k_q8k_avxvnni(weights, inputs)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1852,28 +1859,27 @@ fn matmul_q5kx8_batched_avxvnni(
         .map(|row| pack_q8kx4_repeated(&row))
         .collect::<Vec<_>>();
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let output_chunk_rows = X86_OUTPUT_CHUNK_ROWS;
     transposed
-        .par_chunks_mut(64 * lhs_rows)
+        .par_chunks_mut(output_chunk_rows * lhs_rows)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
-            let first_group = chunk_idx * 8;
+            let first_group = chunk_idx * (output_chunk_rows / 8);
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                let tiled_groups = activation_tiles.len() & !3;
-                for input_tile in (0..tiled_groups).step_by(4) {
+                let tiled_groups = activation_tiles.len() & !1;
+                for input_tile in (0..tiled_groups).step_by(2) {
                     let values = unsafe {
-                        dot8x16_q5k_q8k_avxvnni(
+                        dot8x8_q5k_q8k_avxvnni(
                             weights,
                             [
                                 &activation_tiles[input_tile],
                                 &activation_tiles[input_tile + 1],
-                                &activation_tiles[input_tile + 2],
-                                &activation_tiles[input_tile + 3],
                             ],
                         )
                     };
-                    for tile in 0..4 {
+                    for tile in 0..2 {
                         for input_lane in 0..4 {
                             let input_row = (input_tile + tile) * 4 + input_lane;
                             for output_lane in 0..8 {
@@ -1916,7 +1922,7 @@ fn matmul_q5kx8_batched_avxvnni_prepared(
         input,
         matrix_rows,
         dot8x4_q5k_q8k_avxvnni,
-        dot8x16_q5k_q8k_avxvnni,
+        dot8x8_q5k_q8k_avxvnni,
     )
 }
 
@@ -1924,6 +1930,15 @@ fn matmul_q5kx8_batched_avxvnni_prepared(
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot8x4_q5k_q8k_avxvnni(weights: &[BlockQ5Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
     dot8x4n_q5k_q8k_avxvnni(weights, [inputs])[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x8_q5k_q8k_avxvnni(
+    weights: &[BlockQ5Kx8],
+    inputs: [&[BlockQ8Kx4]; 2],
+) -> [[[f32; 8]; 4]; 2] {
+    dot8x4n_q5k_q8k_avxvnni(weights, inputs)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2114,28 +2129,27 @@ fn matmul_q6kx8_batched_avxvnni(
         .map(|row| pack_q8kx4_repeated(&row))
         .collect::<Vec<_>>();
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let output_chunk_rows = X86_OUTPUT_CHUNK_ROWS;
     transposed
-        .par_chunks_mut(64 * lhs_rows)
+        .par_chunks_mut(output_chunk_rows * lhs_rows)
         .enumerate()
         .for_each(|(chunk_idx, chunk)| {
-            let first_group = chunk_idx * 8;
+            let first_group = chunk_idx * (output_chunk_rows / 8);
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                let tiled_groups = activation_tiles.len() & !3;
-                for input_tile in (0..tiled_groups).step_by(4) {
+                let tiled_groups = activation_tiles.len() & !1;
+                for input_tile in (0..tiled_groups).step_by(2) {
                     let values = unsafe {
-                        dot8x16_q6k_q8k_avxvnni(
+                        dot8x8_q6k_q8k_avxvnni(
                             weights,
                             [
                                 &activation_tiles[input_tile],
                                 &activation_tiles[input_tile + 1],
-                                &activation_tiles[input_tile + 2],
-                                &activation_tiles[input_tile + 3],
                             ],
                         )
                     };
-                    for tile in 0..4 {
+                    for tile in 0..2 {
                         for input_lane in 0..4 {
                             let input_row = (input_tile + tile) * 4 + input_lane;
                             for output_lane in 0..8 {
@@ -2178,7 +2192,7 @@ fn matmul_q6kx8_batched_avxvnni_prepared(
         input,
         matrix_rows,
         dot8x4_q6k_q8k_avxvnni,
-        dot8x16_q6k_q8k_avxvnni,
+        dot8x8_q6k_q8k_avxvnni,
     )
 }
 
@@ -2186,6 +2200,15 @@ fn matmul_q6kx8_batched_avxvnni_prepared(
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot8x4_q6k_q8k_avxvnni(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
     dot8x4n_q6k_q8k_avxvnni(weights, [inputs])[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x8_q6k_q8k_avxvnni(
+    weights: &[BlockQ6Kx8],
+    inputs: [&[BlockQ8Kx4]; 2],
+) -> [[[f32; 8]; 4]; 2] {
+    dot8x4n_q6k_q8k_avxvnni(weights, inputs)
 }
 
 #[cfg(target_arch = "x86_64")]
