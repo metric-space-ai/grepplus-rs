@@ -467,8 +467,12 @@ impl CpuQwen35Model {
     }
 
     fn ffn(&self, layer: &LayerWeights, hidden: &[f32]) -> Result<Vec<f32>> {
-        let mut gate = layer.ffn_gate.matmul(hidden, 1)?;
-        let up = layer.ffn_up.matmul(hidden, 1)?;
+        let (gate, up) = rayon::join(
+            || layer.ffn_gate.matmul(hidden, 1),
+            || layer.ffn_up.matmul(hidden, 1),
+        );
+        let mut gate = gate?;
+        let up = up?;
         swiglu_in_place(&mut gate, &up);
         layer.ffn_down.matmul(&gate, 1).map_err(Into::into)
     }
@@ -478,14 +482,14 @@ impl CpuQwen35Model {
         let profile = std::env::var_os("QWEN35_NATIVE_CPU_PROFILE_STAGES").is_some();
         #[cfg(test)]
         let stage_start = std::time::Instant::now();
-        let mut gate = layer.ffn_gate.matmul(hidden, rows)?;
+        let (gate, up) = rayon::join(
+            || layer.ffn_gate.matmul(hidden, rows),
+            || layer.ffn_up.matmul(hidden, rows),
+        );
+        let mut gate = gate?;
         #[cfg(test)]
-        let gate_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
-        #[cfg(test)]
-        let stage_start = std::time::Instant::now();
-        let up = layer.ffn_up.matmul(hidden, rows)?;
-        #[cfg(test)]
-        let up_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        let projections_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        let up = up?;
         #[cfg(test)]
         let stage_start = std::time::Instant::now();
         swiglu_in_place(&mut gate, &up);
@@ -497,7 +501,7 @@ impl CpuQwen35Model {
         #[cfg(test)]
         if profile {
             eprintln!(
-                "cpu_ffn_stage rows={rows} gate_ms={gate_ms:.3} up_ms={up_ms:.3} activation_ms={activation_ms:.3} down_ms={:.3}",
+                "cpu_ffn_stage rows={rows} projections_ms={projections_ms:.3} activation_ms={activation_ms:.3} down_ms={:.3}",
                 stage_start.elapsed().as_secs_f64() * 1.0e3,
             );
         }
