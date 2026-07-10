@@ -60,6 +60,9 @@ pub(crate) struct MetalForwardWorkspace {
     ffn_up: Buffer,
     logits: Buffer,
     scores: Buffer,
+    flash_pad: Buffer,
+    flash_blk: Buffer,
+    flash_tmp: Buffer,
 }
 
 pub(crate) struct MetalTargetForwardOutput {
@@ -521,6 +524,16 @@ impl MetalQwen35Model {
         &self,
         max_context: usize,
     ) -> Result<MetalForwardWorkspace> {
+        let kv_width = self.inventory.kv_heads * self.inventory.head_dim;
+        let flash_pad_bytes = kv_width
+            * std::mem::size_of::<f32>()
+            * ops::OP_FLASH_ATTN_EXT_VEC_NCPSG as usize
+            * self.inventory.kv_heads
+            * 2;
+        let flash_tmp_bytes = self.inventory.attention_heads
+            * 32
+            * (self.inventory.value_dim + 2)
+            * std::mem::size_of::<f32>();
         Ok(MetalForwardWorkspace {
             token_id: self.new_bytes(std::mem::size_of::<u32>())?,
             hidden: self.new_f32(self.inventory.hidden_size)?,
@@ -542,6 +555,9 @@ impl MetalQwen35Model {
             ffn_up: self.new_f32(self.inventory.feed_forward_size)?,
             logits: self.new_f32(self.inventory.vocab_size)?,
             scores: self.new_f32(self.inventory.attention_heads * max_context)?,
+            flash_pad: self.new_bytes(flash_pad_bytes)?,
+            flash_blk: self.new_bytes(4)?,
+            flash_tmp: self.new_bytes(flash_tmp_bytes)?,
         })
     }
 
@@ -2674,54 +2690,121 @@ impl MetalQwen35Model {
         )?;
         enc.memory_barrier_buffers();
         let scale = 1.0 / (self.inventory.head_dim as f32).sqrt();
-        ok(ops::op_qwen_attention_scores_decode_f32(
-            enc,
-            self.dev,
-            &ws.qkv,
-            k_cache,
-            &ws.scores,
-            checked_i32(position, "attention position")?,
-            checked_i32(self.inventory.attention_heads, "attention heads")?,
-            checked_i32(self.inventory.kv_heads, "kv heads")?,
-            checked_i32(self.inventory.head_dim, "attention head dim")?,
-            checked_i32(max_context, "attention context")?,
-            scale,
-        ))?;
-        enc.memory_barrier_buffers();
-        ok(ops::op_qwen_softmax_decode_f32(
-            enc,
-            self.dev,
-            &ws.scores,
-            checked_i32(position, "attention position")?,
-            checked_i32(self.inventory.attention_heads, "attention heads")?,
-            checked_i32(max_context, "attention context")?,
-        ))?;
-        enc.memory_barrier_buffers();
-        ok(ops::op_qwen_attention_values_decode_f32(
-            enc,
-            self.dev,
-            &ws.scores,
-            v_cache,
-            &ws.raw,
-            checked_i32(position, "attention position")?,
-            checked_i32(self.inventory.attention_heads, "attention heads")?,
-            checked_i32(self.inventory.kv_heads, "kv heads")?,
-            checked_i32(self.inventory.value_dim, "attention value dim")?,
-            checked_i32(max_context, "attention context")?,
-        ))?;
-        enc.memory_barrier_buffers();
-        ok(ops::op_qwen_apply_sigmoid_gate_f32(
-            enc,
-            self.dev,
-            &ws.raw,
-            0,
-            &ws.qkv,
-            q_dim * std::mem::size_of::<f32>(),
-            checked_i32(
-                self.inventory.attention_heads * self.inventory.value_dim,
-                "attention gate total",
-            )?,
-        ))?;
+        let flash_decode = self.inventory.attention_heads == 8
+            && self.inventory.kv_heads == 2
+            && self.inventory.head_dim == 256
+            && self.inventory.value_dim == 256;
+        if flash_decode {
+            let kv_width = self.inventory.kv_heads * self.inventory.head_dim;
+            ok(ops::op_flash_attn_ext(
+                enc,
+                self.dev,
+                OpType::F32,
+                &ws.qkv,
+                k_cache,
+                v_cache,
+                None,
+                None,
+                &ws.flash_pad,
+                &ws.flash_blk,
+                &ws.flash_tmp,
+                &ws.raw,
+                checked_i32(self.inventory.head_dim, "flash query dim")?,
+                1,
+                checked_i32(self.inventory.attention_heads, "flash query heads")?,
+                1,
+                (q_dim * 2 * std::mem::size_of::<f32>()) as u64,
+                (self.inventory.head_dim * std::mem::size_of::<f32>()) as u64,
+                (q_dim * 2 * std::mem::size_of::<f32>()) as u64,
+                checked_i32(position + 1, "flash context")?,
+                checked_i32(self.inventory.kv_heads, "flash kv heads")?,
+                1,
+                std::mem::size_of::<f32>() as u64,
+                (kv_width * std::mem::size_of::<f32>()) as u64,
+                (self.inventory.head_dim * std::mem::size_of::<f32>()) as u64,
+                (max_context * kv_width * std::mem::size_of::<f32>()) as u64,
+                checked_i32(self.inventory.value_dim, "flash value dim")?,
+                std::mem::size_of::<f32>() as u64,
+                (kv_width * std::mem::size_of::<f32>()) as u64,
+                (self.inventory.value_dim * std::mem::size_of::<f32>()) as u64,
+                (max_context * kv_width * std::mem::size_of::<f32>()) as u64,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                1,
+                checked_i32(self.inventory.attention_heads, "flash output heads")?,
+                1,
+                scale,
+                0.0,
+                0.0,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_apply_sigmoid_gate_f32(
+                enc,
+                self.dev,
+                &ws.raw,
+                0,
+                &ws.qkv,
+                q_dim * std::mem::size_of::<f32>(),
+                checked_i32(
+                    self.inventory.attention_heads * self.inventory.value_dim,
+                    "attention gate total",
+                )?,
+            ))?;
+        } else {
+            ok(ops::op_qwen_attention_scores_decode_f32(
+                enc,
+                self.dev,
+                &ws.qkv,
+                k_cache,
+                &ws.scores,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(self.inventory.kv_heads, "kv heads")?,
+                checked_i32(self.inventory.head_dim, "attention head dim")?,
+                checked_i32(max_context, "attention context")?,
+                scale,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_softmax_decode_f32(
+                enc,
+                self.dev,
+                &ws.scores,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(max_context, "attention context")?,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_attention_values_decode_f32(
+                enc,
+                self.dev,
+                &ws.scores,
+                v_cache,
+                &ws.raw,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(self.inventory.kv_heads, "kv heads")?,
+                checked_i32(self.inventory.value_dim, "attention value dim")?,
+                checked_i32(max_context, "attention context")?,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_apply_sigmoid_gate_f32(
+                enc,
+                self.dev,
+                &ws.raw,
+                0,
+                &ws.qkv,
+                q_dim * std::mem::size_of::<f32>(),
+                checked_i32(
+                    self.inventory.attention_heads * self.inventory.value_dim,
+                    "attention gate total",
+                )?,
+            ))?;
+        }
         enc.memory_barrier_buffers();
         self.encode_matvec_to(
             enc,
