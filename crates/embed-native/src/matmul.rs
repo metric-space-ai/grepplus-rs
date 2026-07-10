@@ -1078,10 +1078,33 @@ fn matmul_q4kx8_batched_avxvnni(
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                for (input_tile, xq) in activation_tiles.iter().enumerate() {
+                let tiled_groups = activation_tiles.len() & !3;
+                for input_tile in (0..tiled_groups).step_by(4) {
+                    let values = unsafe {
+                        dot8x16_q4k_q8k_avxvnni(
+                            weights,
+                            [
+                                &activation_tiles[input_tile],
+                                &activation_tiles[input_tile + 1],
+                                &activation_tiles[input_tile + 2],
+                                &activation_tiles[input_tile + 3],
+                            ],
+                        )
+                    };
+                    for tile in 0..4 {
+                        for input_lane in 0..4 {
+                            let input_row = (input_tile + tile) * 4 + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[tile][input_lane][output_lane];
+                            }
+                        }
+                    }
+                }
+                for (tail_tile, xq) in activation_tiles[tiled_groups..].iter().enumerate() {
                     let values = unsafe { dot8x4_q4k_q8k_avxvnni(weights, xq) };
                     for input_lane in 0..4 {
-                        let input_row = input_tile * 4 + input_lane;
+                        let input_row = (tiled_groups + tail_tile) * 4 + input_lane;
                         for output_lane in 0..8 {
                             group_dst[output_lane * lhs_rows + input_row] =
                                 values[input_lane][output_lane];
@@ -1106,19 +1129,38 @@ unsafe fn dot8x4_q4k_q8k_avxvnni(
     weights: &[BlockQ4Kx8Vnni],
     inputs: &[BlockQ8Kx4],
 ) -> [[f32; 8]; 4] {
+    dot8x4n_q4k_q8k_avxvnni(weights, [inputs])[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x16_q4k_q8k_avxvnni(
+    weights: &[BlockQ4Kx8Vnni],
+    inputs: [&[BlockQ8Kx4]; 4],
+) -> [[[f32; 8]; 4]; 4] {
+    dot8x4n_q4k_q8k_avxvnni(weights, inputs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x4n_q4k_q8k_avxvnni<const INPUT_TILES: usize>(
+    weights: &[BlockQ4Kx8Vnni],
+    inputs: [&[BlockQ8Kx4]; INPUT_TILES],
+) -> [[[f32; 8]; 4]; INPUT_TILES] {
     let low_nibble = _mm256_set1_epi8(0x0f);
     let weight_order = _mm256_setr_epi32(0, 2, 0, 2, 1, 3, 1, 3);
     let input_order = _mm256_setr_epi32(0, 0, 2, 2, 1, 1, 3, 3);
-    let mut output = [[0.0f32; 8]; 4];
+    let mut output = [[[0.0f32; 8]; 4]; INPUT_TILES];
 
-    for (q4, q8) in weights.iter().zip(inputs) {
-        let mut integer_sums = [[0i32; 8]; 4];
-        let mut bias_sums = [[0i32; 8]; 4];
+    for block in 0..weights.len() {
+        let q4 = &weights[block];
+        let mut integer_sums = [[[0i32; 8]; 4]; INPUT_TILES];
+        let mut bias_sums = [[[0i32; 8]; 4]; INPUT_TILES];
         for super_block in 0..4 {
             for half in 0..2 {
                 let quant_group = super_block * 2 + half;
                 for output_pair in 0..4 {
-                    let mut pair_acc = [_mm256_setzero_si256(); 2];
+                    let mut pair_acc = [[_mm256_setzero_si256(); 2]; INPUT_TILES];
                     for chunk in 0..4 {
                         let raw_weights = _mm_loadu_si128(
                             q4.qs
@@ -1135,61 +1177,73 @@ unsafe fn dot8x4_q4k_q8k_avxvnni(
                         } else {
                             _mm256_and_si256(_mm256_srli_epi16::<4>(packed_weights), low_nibble)
                         };
-                        for input_pair in 0..2 {
-                            let raw_inputs = _mm_loadu_si128(
-                                q8.qs.as_ptr().add(
+                        for input_tile in 0..INPUT_TILES {
+                            let q8 = &inputs[input_tile][block];
+                            for input_pair in 0..2 {
+                                let raw_inputs = _mm_loadu_si128(q8.qs.as_ptr().add(
                                     super_block * 256 + (chunk + half * 4) * 32 + input_pair * 16,
-                                ) as *const __m128i,
-                            );
-                            let quantized_inputs = _mm256_permutevar8x32_epi32(
-                                _mm256_broadcastsi128_si256(raw_inputs),
-                                input_order,
-                            );
-                            pair_acc[input_pair] = _mm256_dpbusd_avx_epi32(
-                                pair_acc[input_pair],
-                                quantized_weights,
-                                quantized_inputs,
-                            );
+                                )
+                                    as *const __m128i);
+                                let quantized_inputs = _mm256_permutevar8x32_epi32(
+                                    _mm256_broadcastsi128_si256(raw_inputs),
+                                    input_order,
+                                );
+                                pair_acc[input_tile][input_pair] = _mm256_dpbusd_avx_epi32(
+                                    pair_acc[input_tile][input_pair],
+                                    quantized_weights,
+                                    quantized_inputs,
+                                );
+                            }
                         }
                     }
-                    for input_pair in 0..2 {
-                        let mut partial = [0i32; 8];
-                        _mm256_storeu_si256(
-                            partial.as_mut_ptr() as *mut __m256i,
-                            pair_acc[input_pair],
-                        );
-                        let output0 = output_pair * 2;
-                        let output1 = output0 + 1;
-                        let input0 = input_pair * 2;
-                        let input1 = input0 + 1;
-                        integer_sums[input0][output0] +=
-                            (partial[0] + partial[4]) * q4.scales[quant_group][output0] as i32;
-                        integer_sums[input0][output1] +=
-                            (partial[1] + partial[5]) * q4.scales[quant_group][output1] as i32;
-                        integer_sums[input1][output0] +=
-                            (partial[2] + partial[6]) * q4.scales[quant_group][output0] as i32;
-                        integer_sums[input1][output1] +=
-                            (partial[3] + partial[7]) * q4.scales[quant_group][output1] as i32;
+                    for input_tile in 0..INPUT_TILES {
+                        for input_pair in 0..2 {
+                            let mut partial = [0i32; 8];
+                            _mm256_storeu_si256(
+                                partial.as_mut_ptr() as *mut __m256i,
+                                pair_acc[input_tile][input_pair],
+                            );
+                            let output0 = output_pair * 2;
+                            let output1 = output0 + 1;
+                            let input0 = input_pair * 2;
+                            let input1 = input0 + 1;
+                            integer_sums[input_tile][input0][output0] +=
+                                (partial[0] + partial[4]) * q4.scales[quant_group][output0] as i32;
+                            integer_sums[input_tile][input0][output1] +=
+                                (partial[1] + partial[5]) * q4.scales[quant_group][output1] as i32;
+                            integer_sums[input_tile][input1][output0] +=
+                                (partial[2] + partial[6]) * q4.scales[quant_group][output0] as i32;
+                            integer_sums[input_tile][input1][output1] +=
+                                (partial[3] + partial[7]) * q4.scales[quant_group][output1] as i32;
+                        }
                     }
                 }
                 let bsum_quarter = quant_group / 2;
                 let bsum_offset = (quant_group % 2) * 2;
-                for input_row in 0..4 {
-                    let base = bsum_quarter * 16 + input_row * 4 + bsum_offset;
-                    let bsum = q8.bsums[base] as i32 + q8.bsums[base + 1] as i32;
-                    for output_col in 0..8 {
-                        bias_sums[input_row][output_col] +=
-                            bsum * q4.mins[quant_group][output_col] as i32;
+                for input_tile in 0..INPUT_TILES {
+                    let q8 = &inputs[input_tile][block];
+                    for input_row in 0..4 {
+                        let base = bsum_quarter * 16 + input_row * 4 + bsum_offset;
+                        let bsum = q8.bsums[base] as i32 + q8.bsums[base + 1] as i32;
+                        for output_col in 0..8 {
+                            bias_sums[input_tile][input_row][output_col] +=
+                                bsum * q4.mins[quant_group][output_col] as i32;
+                        }
                     }
                 }
             }
         }
-        for input_row in 0..4 {
-            for output_col in 0..8 {
-                output[input_row][output_col] -=
-                    q4.dmin[output_col] * q8.d[input_row] * bias_sums[input_row][output_col] as f32;
-                output[input_row][output_col] +=
-                    q4.d[output_col] * q8.d[input_row] * integer_sums[input_row][output_col] as f32;
+        for input_tile in 0..INPUT_TILES {
+            let q8 = &inputs[input_tile][block];
+            for input_row in 0..4 {
+                for output_col in 0..8 {
+                    output[input_tile][input_row][output_col] -= q4.dmin[output_col]
+                        * q8.d[input_row]
+                        * bias_sums[input_tile][input_row][output_col] as f32;
+                    output[input_tile][input_row][output_col] += q4.d[output_col]
+                        * q8.d[input_row]
+                        * integer_sums[input_tile][input_row][output_col] as f32;
+                }
             }
         }
     }
@@ -1298,10 +1352,33 @@ fn matmul_q5kx8_batched_avxvnni(
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                for (input_tile, xq) in activation_tiles.iter().enumerate() {
+                let tiled_groups = activation_tiles.len() & !3;
+                for input_tile in (0..tiled_groups).step_by(4) {
+                    let values = unsafe {
+                        dot8x16_q5k_q8k_avxvnni(
+                            weights,
+                            [
+                                &activation_tiles[input_tile],
+                                &activation_tiles[input_tile + 1],
+                                &activation_tiles[input_tile + 2],
+                                &activation_tiles[input_tile + 3],
+                            ],
+                        )
+                    };
+                    for tile in 0..4 {
+                        for input_lane in 0..4 {
+                            let input_row = (input_tile + tile) * 4 + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[tile][input_lane][output_lane];
+                            }
+                        }
+                    }
+                }
+                for (tail_tile, xq) in activation_tiles[tiled_groups..].iter().enumerate() {
                     let values = unsafe { dot8x4_q5k_q8k_avxvnni(weights, xq) };
                     for input_lane in 0..4 {
-                        let input_row = input_tile * 4 + input_lane;
+                        let input_row = (tiled_groups + tail_tile) * 4 + input_lane;
                         for output_lane in 0..8 {
                             group_dst[output_lane * lhs_rows + input_row] =
                                 values[input_lane][output_lane];
@@ -1323,15 +1400,34 @@ fn matmul_q5kx8_batched_avxvnni(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot8x4_q5k_q8k_avxvnni(weights: &[BlockQ5Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
+    dot8x4n_q5k_q8k_avxvnni(weights, [inputs])[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x16_q5k_q8k_avxvnni(
+    weights: &[BlockQ5Kx8],
+    inputs: [&[BlockQ8Kx4]; 4],
+) -> [[[f32; 8]; 4]; 4] {
+    dot8x4n_q5k_q8k_avxvnni(weights, inputs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x4n_q5k_q8k_avxvnni<const INPUT_TILES: usize>(
+    weights: &[BlockQ5Kx8],
+    inputs: [&[BlockQ8Kx4]; INPUT_TILES],
+) -> [[[f32; 8]; 4]; INPUT_TILES] {
     let weight_order = _mm256_setr_epi32(0, 2, 0, 2, 1, 3, 1, 3);
     let input_order = _mm256_setr_epi32(0, 0, 2, 2, 1, 1, 3, 3);
-    let mut output = [[0.0f32; 8]; 4];
-    for (q5, q8) in weights.iter().zip(inputs) {
-        let mut integer_sums = [[0i32; 8]; 4];
-        let mut bias_sums = [[0i32; 8]; 4];
+    let mut output = [[[0.0f32; 8]; 4]; INPUT_TILES];
+    for block in 0..weights.len() {
+        let q5 = &weights[block];
+        let mut integer_sums = [[[0i32; 8]; 4]; INPUT_TILES];
+        let mut bias_sums = [[[0i32; 8]; 4]; INPUT_TILES];
         for quant_group in 0..8 {
             for output_pair in 0..4 {
-                let mut pair_acc = [_mm256_setzero_si256(); 2];
+                let mut pair_acc = [[_mm256_setzero_si256(); 2]; INPUT_TILES];
                 for chunk in 0..4 {
                     let raw_weights = _mm_loadu_si128(
                         q5.qs
@@ -1343,59 +1439,74 @@ unsafe fn dot8x4_q5k_q8k_avxvnni(weights: &[BlockQ5Kx8], inputs: &[BlockQ8Kx4]) 
                         _mm256_broadcastsi128_si256(raw_weights),
                         weight_order,
                     );
-                    for input_pair in 0..2 {
-                        let raw_inputs = _mm_loadu_si128(
-                            q8.qs
-                                .as_ptr()
-                                .add(quant_group * 128 + chunk * 32 + input_pair * 16)
-                                as *const __m128i,
-                        );
-                        let quantized_inputs = _mm256_permutevar8x32_epi32(
-                            _mm256_broadcastsi128_si256(raw_inputs),
-                            input_order,
-                        );
-                        pair_acc[input_pair] = _mm256_dpbusd_avx_epi32(
-                            pair_acc[input_pair],
-                            quantized_weights,
-                            quantized_inputs,
-                        );
+                    for input_tile in 0..INPUT_TILES {
+                        let q8 = &inputs[input_tile][block];
+                        for input_pair in 0..2 {
+                            let raw_inputs = _mm_loadu_si128(
+                                q8.qs
+                                    .as_ptr()
+                                    .add(quant_group * 128 + chunk * 32 + input_pair * 16)
+                                    as *const __m128i,
+                            );
+                            let quantized_inputs = _mm256_permutevar8x32_epi32(
+                                _mm256_broadcastsi128_si256(raw_inputs),
+                                input_order,
+                            );
+                            pair_acc[input_tile][input_pair] = _mm256_dpbusd_avx_epi32(
+                                pair_acc[input_tile][input_pair],
+                                quantized_weights,
+                                quantized_inputs,
+                            );
+                        }
                     }
                 }
-                for input_pair in 0..2 {
-                    let mut partial = [0i32; 8];
-                    _mm256_storeu_si256(partial.as_mut_ptr() as *mut __m256i, pair_acc[input_pair]);
-                    let output0 = output_pair * 2;
-                    let output1 = output0 + 1;
-                    let input0 = input_pair * 2;
-                    let input1 = input0 + 1;
-                    integer_sums[input0][output0] +=
-                        (partial[0] + partial[4]) * q5.scales[quant_group][output0] as i32;
-                    integer_sums[input0][output1] +=
-                        (partial[1] + partial[5]) * q5.scales[quant_group][output1] as i32;
-                    integer_sums[input1][output0] +=
-                        (partial[2] + partial[6]) * q5.scales[quant_group][output0] as i32;
-                    integer_sums[input1][output1] +=
-                        (partial[3] + partial[7]) * q5.scales[quant_group][output1] as i32;
+                for input_tile in 0..INPUT_TILES {
+                    for input_pair in 0..2 {
+                        let mut partial = [0i32; 8];
+                        _mm256_storeu_si256(
+                            partial.as_mut_ptr() as *mut __m256i,
+                            pair_acc[input_tile][input_pair],
+                        );
+                        let output0 = output_pair * 2;
+                        let output1 = output0 + 1;
+                        let input0 = input_pair * 2;
+                        let input1 = input0 + 1;
+                        integer_sums[input_tile][input0][output0] +=
+                            (partial[0] + partial[4]) * q5.scales[quant_group][output0] as i32;
+                        integer_sums[input_tile][input0][output1] +=
+                            (partial[1] + partial[5]) * q5.scales[quant_group][output1] as i32;
+                        integer_sums[input_tile][input1][output0] +=
+                            (partial[2] + partial[6]) * q5.scales[quant_group][output0] as i32;
+                        integer_sums[input_tile][input1][output1] +=
+                            (partial[3] + partial[7]) * q5.scales[quant_group][output1] as i32;
+                    }
                 }
             }
             let bsum_quarter = quant_group / 2;
             let bsum_offset = (quant_group % 2) * 2;
-            for input_row in 0..4 {
-                let base = bsum_quarter * 16 + input_row * 4 + bsum_offset;
-                let bsum = q8.bsums[base] as i32 + q8.bsums[base + 1] as i32;
-                for output_col in 0..8 {
-                    bias_sums[input_row][output_col] +=
-                        bsum * q5.mins[quant_group][output_col] as i32;
+            for input_tile in 0..INPUT_TILES {
+                let q8 = &inputs[input_tile][block];
+                for input_row in 0..4 {
+                    let base = bsum_quarter * 16 + input_row * 4 + bsum_offset;
+                    let bsum = q8.bsums[base] as i32 + q8.bsums[base + 1] as i32;
+                    for output_col in 0..8 {
+                        bias_sums[input_tile][input_row][output_col] +=
+                            bsum * q5.mins[quant_group][output_col] as i32;
+                    }
                 }
             }
         }
-        for input_row in 0..4 {
-            for output_col in 0..8 {
-                output[input_row][output_col] +=
-                    q5.d[output_col] * q8.d[input_row] * integer_sums[input_row][output_col] as f32
+        for input_tile in 0..INPUT_TILES {
+            let q8 = &inputs[input_tile][block];
+            for input_row in 0..4 {
+                for output_col in 0..8 {
+                    output[input_tile][input_row][output_col] += q5.d[output_col]
+                        * q8.d[input_row]
+                        * integer_sums[input_tile][input_row][output_col] as f32
                         - q5.dmin[output_col]
                             * q8.d[input_row]
-                            * bias_sums[input_row][output_col] as f32;
+                            * bias_sums[input_tile][input_row][output_col] as f32;
+                }
             }
         }
     }
@@ -1488,10 +1599,33 @@ fn matmul_q6kx8_batched_avxvnni(
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                for (input_tile, xq) in activation_tiles.iter().enumerate() {
+                let tiled_groups = activation_tiles.len() & !3;
+                for input_tile in (0..tiled_groups).step_by(4) {
+                    let values = unsafe {
+                        dot8x16_q6k_q8k_avxvnni(
+                            weights,
+                            [
+                                &activation_tiles[input_tile],
+                                &activation_tiles[input_tile + 1],
+                                &activation_tiles[input_tile + 2],
+                                &activation_tiles[input_tile + 3],
+                            ],
+                        )
+                    };
+                    for tile in 0..4 {
+                        for input_lane in 0..4 {
+                            let input_row = (input_tile + tile) * 4 + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[tile][input_lane][output_lane];
+                            }
+                        }
+                    }
+                }
+                for (tail_tile, xq) in activation_tiles[tiled_groups..].iter().enumerate() {
                     let values = unsafe { dot8x4_q6k_q8k_avxvnni(weights, xq) };
                     for input_lane in 0..4 {
-                        let input_row = input_tile * 4 + input_lane;
+                        let input_row = (tiled_groups + tail_tile) * 4 + input_lane;
                         for output_lane in 0..8 {
                             group_dst[output_lane * lhs_rows + input_row] =
                                 values[input_lane][output_lane];
@@ -1513,15 +1647,34 @@ fn matmul_q6kx8_batched_avxvnni(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,avxvnni")]
 unsafe fn dot8x4_q6k_q8k_avxvnni(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
+    dot8x4n_q6k_q8k_avxvnni(weights, [inputs])[0]
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x16_q6k_q8k_avxvnni(
+    weights: &[BlockQ6Kx8],
+    inputs: [&[BlockQ8Kx4]; 4],
+) -> [[[f32; 8]; 4]; 4] {
+    dot8x4n_q6k_q8k_avxvnni(weights, inputs)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x4n_q6k_q8k_avxvnni<const INPUT_TILES: usize>(
+    weights: &[BlockQ6Kx8],
+    inputs: [&[BlockQ8Kx4]; INPUT_TILES],
+) -> [[[f32; 8]; 4]; INPUT_TILES] {
     let weight_order = _mm256_setr_epi32(0, 2, 0, 2, 1, 3, 1, 3);
     let input_order = _mm256_setr_epi32(0, 0, 2, 2, 1, 1, 3, 3);
-    let mut output = [[0.0f32; 8]; 4];
-    for (q6, q8) in weights.iter().zip(inputs) {
-        let mut integer_sums = [[0i32; 8]; 4];
-        let mut corrections = [[0i32; 8]; 4];
+    let mut output = [[[0.0f32; 8]; 4]; INPUT_TILES];
+    for block in 0..weights.len() {
+        let q6 = &weights[block];
+        let mut integer_sums = [[[0i32; 8]; 4]; INPUT_TILES];
+        let mut corrections = [[[0i32; 8]; 4]; INPUT_TILES];
         for quant_group in 0..QK_K / 16 {
             for output_pair in 0..4 {
-                let mut pair_acc = [_mm256_setzero_si256(); 2];
+                let mut pair_acc = [[_mm256_setzero_si256(); 2]; INPUT_TILES];
                 for chunk in 0..2 {
                     let raw_weights = _mm_loadu_si128(
                         q6.qs
@@ -1533,57 +1686,71 @@ unsafe fn dot8x4_q6k_q8k_avxvnni(weights: &[BlockQ6Kx8], inputs: &[BlockQ8Kx4]) 
                         _mm256_broadcastsi128_si256(raw_weights),
                         weight_order,
                     );
-                    for input_pair in 0..2 {
-                        let raw_inputs = _mm_loadu_si128(
-                            q8.qs
-                                .as_ptr()
-                                .add(quant_group * 64 + chunk * 32 + input_pair * 16)
-                                as *const __m128i,
-                        );
-                        let quantized_inputs = _mm256_permutevar8x32_epi32(
-                            _mm256_broadcastsi128_si256(raw_inputs),
-                            input_order,
-                        );
-                        pair_acc[input_pair] = _mm256_dpbusd_avx_epi32(
-                            pair_acc[input_pair],
-                            quantized_weights,
-                            quantized_inputs,
-                        );
+                    for input_tile in 0..INPUT_TILES {
+                        let q8 = &inputs[input_tile][block];
+                        for input_pair in 0..2 {
+                            let raw_inputs = _mm_loadu_si128(
+                                q8.qs
+                                    .as_ptr()
+                                    .add(quant_group * 64 + chunk * 32 + input_pair * 16)
+                                    as *const __m128i,
+                            );
+                            let quantized_inputs = _mm256_permutevar8x32_epi32(
+                                _mm256_broadcastsi128_si256(raw_inputs),
+                                input_order,
+                            );
+                            pair_acc[input_tile][input_pair] = _mm256_dpbusd_avx_epi32(
+                                pair_acc[input_tile][input_pair],
+                                quantized_weights,
+                                quantized_inputs,
+                            );
+                        }
                     }
                 }
-                for input_pair in 0..2 {
-                    let mut partial = [0i32; 8];
-                    _mm256_storeu_si256(partial.as_mut_ptr() as *mut __m256i, pair_acc[input_pair]);
-                    let output0 = output_pair * 2;
-                    let output1 = output0 + 1;
-                    let input0 = input_pair * 2;
-                    let input1 = input0 + 1;
-                    integer_sums[input0][output0] +=
-                        (partial[0] + partial[4]) * q6.scales[quant_group][output0] as i32;
-                    integer_sums[input0][output1] +=
-                        (partial[1] + partial[5]) * q6.scales[quant_group][output1] as i32;
-                    integer_sums[input1][output0] +=
-                        (partial[2] + partial[6]) * q6.scales[quant_group][output0] as i32;
-                    integer_sums[input1][output1] +=
-                        (partial[3] + partial[7]) * q6.scales[quant_group][output1] as i32;
+                for input_tile in 0..INPUT_TILES {
+                    for input_pair in 0..2 {
+                        let mut partial = [0i32; 8];
+                        _mm256_storeu_si256(
+                            partial.as_mut_ptr() as *mut __m256i,
+                            pair_acc[input_tile][input_pair],
+                        );
+                        let output0 = output_pair * 2;
+                        let output1 = output0 + 1;
+                        let input0 = input_pair * 2;
+                        let input1 = input0 + 1;
+                        integer_sums[input_tile][input0][output0] +=
+                            (partial[0] + partial[4]) * q6.scales[quant_group][output0] as i32;
+                        integer_sums[input_tile][input0][output1] +=
+                            (partial[1] + partial[5]) * q6.scales[quant_group][output1] as i32;
+                        integer_sums[input_tile][input1][output0] +=
+                            (partial[2] + partial[6]) * q6.scales[quant_group][output0] as i32;
+                        integer_sums[input_tile][input1][output1] +=
+                            (partial[3] + partial[7]) * q6.scales[quant_group][output1] as i32;
+                    }
                 }
             }
             let bsum_quarter = quant_group / 4;
             let bsum_offset = quant_group % 4;
-            for input_row in 0..4 {
-                let bsum = q8.bsums[bsum_quarter * 16 + input_row * 4 + bsum_offset] as i32;
-                for output_col in 0..8 {
-                    corrections[input_row][output_col] +=
-                        32 * bsum * q6.scales[quant_group][output_col] as i32;
+            for input_tile in 0..INPUT_TILES {
+                let q8 = &inputs[input_tile][block];
+                for input_row in 0..4 {
+                    let bsum = q8.bsums[bsum_quarter * 16 + input_row * 4 + bsum_offset] as i32;
+                    for output_col in 0..8 {
+                        corrections[input_tile][input_row][output_col] +=
+                            32 * bsum * q6.scales[quant_group][output_col] as i32;
+                    }
                 }
             }
         }
-        for input_row in 0..4 {
-            for output_col in 0..8 {
-                let integer_sum =
-                    integer_sums[input_row][output_col] - corrections[input_row][output_col];
-                output[input_row][output_col] +=
-                    q6.d[output_col] * q8.d[input_row] * integer_sum as f32;
+        for input_tile in 0..INPUT_TILES {
+            let q8 = &inputs[input_tile][block];
+            for input_row in 0..4 {
+                for output_col in 0..8 {
+                    let integer_sum = integer_sums[input_tile][input_row][output_col]
+                        - corrections[input_tile][input_row][output_col];
+                    output[input_tile][input_row][output_col] +=
+                        q6.d[output_col] * q8.d[input_row] * integer_sum as f32;
+                }
             }
         }
     }
@@ -5644,6 +5811,15 @@ mod x86_tests {
             .collect::<Vec<_>>();
         let packed_input = quantize_q8kx4(&input, row_blocks * QK_K);
         let actual = unsafe { dot8x4_q5k_q8k_avxvnni(&packed_weights, &packed_input) };
+        let wide = unsafe {
+            dot8x16_q5k_q8k_avxvnni(
+                &packed_weights,
+                [&packed_input, &packed_input, &packed_input, &packed_input],
+            )
+        };
+        for tile in &wide {
+            assert_eq!(tile, &actual, "Q5_K VNNI 16x8 tile mismatch");
+        }
         let single = unsafe { dot8x1_q5k_q8k_avxvnni(&packed_weights, &packed_input) };
         for output in 0..8 {
             assert_eq!(
@@ -5732,6 +5908,15 @@ mod x86_tests {
             .map(quantize_q8k)
             .collect::<Vec<_>>();
         let actual = unsafe { dot8x4_q6k_q8k_avxvnni(&packed_weights, &packed_input) };
+        let wide = unsafe {
+            dot8x16_q6k_q8k_avxvnni(
+                &packed_weights,
+                [&packed_input, &packed_input, &packed_input, &packed_input],
+            )
+        };
+        for tile in &wide {
+            assert_eq!(tile, &actual, "Q6_K VNNI 16x8 tile mismatch");
+        }
         let single = unsafe { dot8x1_q6k_q8k_avxvnni(&packed_weights, &packed_input) };
         for output in 0..8 {
             assert_eq!(
@@ -5818,6 +6003,15 @@ mod x86_tests {
             .collect::<Vec<_>>();
         let packed_input = quantize_q8kx4(&input, row_blocks * QK_K);
         let actual = unsafe { dot8x4_q4k_q8k_avxvnni(&packed_weights, &packed_input) };
+        let wide = unsafe {
+            dot8x16_q4k_q8k_avxvnni(
+                &packed_weights,
+                [&packed_input, &packed_input, &packed_input, &packed_input],
+            )
+        };
+        for tile in &wide {
+            assert_eq!(tile, &actual, "Q4_K VNNI 16x8 tile mismatch");
+        }
         let single = unsafe { dot8x1_q4k_q8k_avxvnni(&packed_weights, &packed_input) };
         for output in 0..8 {
             assert_eq!(
