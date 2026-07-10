@@ -439,13 +439,7 @@ impl QuantMatrix {
                     };
                     #[cfg(target_arch = "x86_64")]
                     let used_x8 = if let Some(x8_vnni) = x8_vnni {
-                        out = matvec_x8_from_x4(
-                            x8_vnni,
-                            lhs,
-                            self.rows,
-                            self.cols,
-                            dot8x4_q4k_q8k_avxvnni,
-                        );
+                        out = matvec_x8(x8_vnni, lhs, self.rows, self.cols, dot8x1_q4k_q8k_avxvnni);
                         true
                     } else {
                         false
@@ -979,32 +973,6 @@ fn matmul_q4k_batched_avxvnni(
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-fn matvec_x8_from_x4<T: Sync>(
-    rhs: &[T],
-    lhs: &[f32],
-    matrix_rows: usize,
-    matrix_cols: usize,
-    kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [[f32; 8]; 4],
-) -> Vec<f32> {
-    debug_assert_eq!(matrix_rows % 8, 0);
-    let row_blocks = matrix_cols / QK_K;
-    let quantized = quantize_q8k(lhs);
-    let input = pack_q8kx4_repeated(&quantized);
-    let mut out = vec![0.0f32; matrix_rows];
-    out.par_chunks_mut(64)
-        .enumerate()
-        .for_each(|(chunk_idx, chunk)| {
-            let first_group = chunk_idx * 8;
-            for (local_group, dst) in chunk.chunks_exact_mut(8).enumerate() {
-                let group = first_group + local_group;
-                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                dst.copy_from_slice(&unsafe { kernel(weights, &input) }[0]);
-            }
-        });
-    out
-}
-
-#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn matvec_x8<T: Sync>(
     rhs: &[T],
     lhs: &[f32],
@@ -1236,6 +1204,80 @@ unsafe fn dot8x4_q4k_q8k_avxvnni(
                 output[input_row][output_col] +=
                     q4.d[output_col] * q8.d[input_row] * integer_sums[input_row][output_col] as f32;
             }
+        }
+    }
+    output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot8x1_q4k_q8k_avxvnni(weights: &[BlockQ4Kx8Vnni], inputs: &[BlockQ8Kx4]) -> [f32; 8] {
+    let low_nibble = _mm256_set1_epi8(0x0f);
+    let weight_order = _mm256_setr_epi32(0, 2, 0, 2, 1, 3, 1, 3);
+    let input_order = _mm256_setr_epi32(0, 0, 2, 2, 1, 1, 3, 3);
+    let mut output = [0.0f32; 8];
+
+    for (q4, q8) in weights.iter().zip(inputs) {
+        let mut integer_sums = [0i32; 8];
+        let mut bias_sums = [0i32; 8];
+        for super_block in 0..4 {
+            for half in 0..2 {
+                let quant_group = super_block * 2 + half;
+                for output_pair in 0..4 {
+                    let mut accumulator = _mm256_setzero_si256();
+                    for chunk in 0..4 {
+                        let raw_weights = _mm_loadu_si128(
+                            q4.qs
+                                .as_ptr()
+                                .add(super_block * 256 + output_pair * 16 + chunk * 64)
+                                as *const __m128i,
+                        );
+                        let packed_weights = _mm256_permutevar8x32_epi32(
+                            _mm256_broadcastsi128_si256(raw_weights),
+                            weight_order,
+                        );
+                        let quantized_weights = if half == 0 {
+                            _mm256_and_si256(packed_weights, low_nibble)
+                        } else {
+                            _mm256_and_si256(_mm256_srli_epi16::<4>(packed_weights), low_nibble)
+                        };
+                        let raw_inputs = _mm_loadu_si128(
+                            q8.qs
+                                .as_ptr()
+                                .add(super_block * 256 + (chunk + half * 4) * 32)
+                                as *const __m128i,
+                        );
+                        let quantized_inputs = _mm256_permutevar8x32_epi32(
+                            _mm256_broadcastsi128_si256(raw_inputs),
+                            input_order,
+                        );
+                        accumulator = _mm256_dpbusd_avx_epi32(
+                            accumulator,
+                            quantized_weights,
+                            quantized_inputs,
+                        );
+                    }
+                    let mut partial = [0i32; 8];
+                    _mm256_storeu_si256(partial.as_mut_ptr() as *mut __m256i, accumulator);
+                    let output0 = output_pair * 2;
+                    let output1 = output0 + 1;
+                    integer_sums[output0] +=
+                        (partial[0] + partial[4]) * q4.scales[quant_group][output0] as i32;
+                    integer_sums[output1] +=
+                        (partial[1] + partial[5]) * q4.scales[quant_group][output1] as i32;
+                }
+                let bsum_quarter = quant_group / 2;
+                let bsum_offset = (quant_group % 2) * 2;
+                let base = bsum_quarter * 16 + bsum_offset;
+                let bsum = q8.bsums[base] as i32 + q8.bsums[base + 1] as i32;
+                for output_col in 0..8 {
+                    bias_sums[output_col] += bsum * q4.mins[quant_group][output_col] as i32;
+                }
+            }
+        }
+        for output_col in 0..8 {
+            output[output_col] -= q4.dmin[output_col] * q8.d[0] * bias_sums[output_col] as f32;
+            output[output_col] += q4.d[output_col] * q8.d[0] * integer_sums[output_col] as f32;
         }
     }
     output
@@ -5745,6 +5787,14 @@ mod x86_tests {
             .collect::<Vec<_>>();
         let packed_input = quantize_q8kx4(&input, row_blocks * QK_K);
         let actual = unsafe { dot8x4_q4k_q8k_avxvnni(&packed_weights, &packed_input) };
+        let single = unsafe { dot8x1_q4k_q8k_avxvnni(&packed_weights, &packed_input) };
+        for output in 0..8 {
+            assert_eq!(
+                single[output].to_bits(),
+                actual[0][output].to_bits(),
+                "Q4_K VNNI 8x1 mismatch output={output}",
+            );
+        }
         for input_row in 0..4 {
             for output_col in 0..8 {
                 let expected = unsafe {
