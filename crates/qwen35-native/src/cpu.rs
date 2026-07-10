@@ -98,6 +98,13 @@ struct CpuDecodeWorkspace {
     delta_gate: Vec<f32>,
     delta_out: Vec<f32>,
     attention_out: Vec<f32>,
+    full_q_fused: Vec<f32>,
+    full_q: Vec<f32>,
+    full_q_gate: Vec<f32>,
+    full_k: Vec<f32>,
+    full_v: Vec<f32>,
+    full_attention: Vec<f32>,
+    attention_scores: Vec<f32>,
 }
 
 #[derive(Clone)]
@@ -653,7 +660,10 @@ impl CpuQwen35Model {
         ForwardState {
             position: 0,
             layer_states,
-            decode_workspace: CpuDecodeWorkspace::default(),
+            decode_workspace: CpuDecodeWorkspace {
+                attention_scores: vec![0.0; self.inventory.attention_heads * max_context],
+                ..CpuDecodeWorkspace::default()
+            },
             max_context,
         }
     }
@@ -1010,7 +1020,7 @@ impl CpuQwen35Model {
                     self.delta_block_rows(weights, runtime, &x, 1)?
                 }
                 (LayerKind::Full(weights), LayerState::Full(runtime)) => {
-                    self.full_attention_block(weights, runtime, state.position, &x)?
+                    self.full_attention_block_rows(weights, runtime, state.position, &x, 1)?
                 }
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
             };
@@ -1074,8 +1084,13 @@ impl CpuQwen35Model {
                     self.delta_block_into(weights, runtime, &x, workspace)?;
                 }
                 (LayerKind::Full(weights), LayerState::Full(runtime)) => {
-                    workspace.attention_out =
-                        self.full_attention_block(weights, runtime, state.position, &x)?;
+                    self.full_attention_block_into(
+                        weights,
+                        runtime,
+                        state.position,
+                        &x,
+                        workspace,
+                    )?;
                 }
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
             }
@@ -1486,40 +1501,48 @@ impl CpuQwen35Model {
             .map_err(Into::into)
     }
 
-    fn full_attention_block(
+    fn full_attention_block_into(
         &self,
         weights: &FullAttentionWeights,
         state: &mut FullAttentionState,
         position: usize,
         hidden: &[f32],
-    ) -> Result<Vec<f32>> {
+        workspace: &mut CpuDecodeWorkspace,
+    ) -> Result<()> {
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
         let input = weights.attn_q.prepare_q8k_matvec(hidden)?;
-        let (q_fused, (k, v)) = rayon::join(
-            || weights.attn_q.matvec_prepared_q8k(&input),
+        let (q_fused, k, v) = (
+            &mut workspace.full_q_fused,
+            &mut workspace.full_k,
+            &mut workspace.full_v,
+        );
+        let (q_result, (k_result, v_result)) = rayon::join(
+            || weights.attn_q.matvec_prepared_q8k_into(&input, q_fused),
             || {
                 rayon::join(
-                    || weights.attn_k.matvec_prepared_q8k(&input),
-                    || weights.attn_v.matvec_prepared_q8k(&input),
+                    || weights.attn_k.matvec_prepared_q8k_into(&input, k),
+                    || weights.attn_v.matvec_prepared_q8k_into(&input, v),
                 )
             },
         );
-        let q_fused = q_fused?;
-        let (mut q, q_gate) = split_full_attention_q_gate(
-            &q_fused,
+        q_result?;
+        k_result?;
+        v_result?;
+        split_full_attention_q_gate_into(
+            q_fused,
             self.inventory.attention_heads,
             self.inventory.head_dim,
+            &mut workspace.full_q,
+            &mut workspace.full_q_gate,
         );
-        let mut k = k?;
-        let v = v?;
         debug_assert_eq!(k.len(), kv_k_dim);
         debug_assert_eq!(v.len(), kv_v_dim);
 
         for head in 0..self.inventory.attention_heads {
             let off = head * self.inventory.head_dim;
             rms_norm_qwen(
-                &mut q[off..off + self.inventory.head_dim],
+                &mut workspace.full_q[off..off + self.inventory.head_dim],
                 &weights.attn_q_norm,
             );
         }
@@ -1531,39 +1554,47 @@ impl CpuQwen35Model {
             );
         }
         apply_rope(
-            &mut q,
+            &mut workspace.full_q,
             position,
             self.inventory.head_dim,
             self.inventory.rope_dim,
         );
         apply_rope(
-            &mut k,
+            k,
             position,
             self.inventory.head_dim,
             self.inventory.rope_dim,
         );
 
         let k_off = position * kv_k_dim;
-        state.k_cache[k_off..k_off + kv_k_dim].copy_from_slice(&k);
+        state.k_cache[k_off..k_off + kv_k_dim].copy_from_slice(k);
         let v_off = position * kv_v_dim;
-        state.v_cache[v_off..v_off + kv_v_dim].copy_from_slice(&v);
+        state.v_cache[v_off..v_off + kv_v_dim].copy_from_slice(v);
 
-        let mut attn_out = vec![0.0f32; self.inventory.attention_heads * self.inventory.value_dim];
+        workspace.full_attention.clear();
+        workspace.full_attention.resize(
+            self.inventory.attention_heads * self.inventory.value_dim,
+            0.0,
+        );
         let gqa = self.inventory.attention_heads / self.inventory.kv_heads;
         let score_scale = 1.0 / (self.inventory.head_dim as f32).sqrt();
-        attn_out
+        let score_stride = state.k_cache.len() / kv_k_dim;
+        workspace
+            .full_attention
             .par_chunks_mut(self.inventory.value_dim)
+            .zip(workspace.attention_scores.par_chunks_mut(score_stride))
             .enumerate()
-            .for_each(|(head, dst)| {
+            .for_each(|(head, (dst, score_scratch))| {
                 let kv_head = head / gqa;
-                let qh = &q[head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
-                let mut scores = Vec::with_capacity(position + 1);
+                let qh = &workspace.full_q
+                    [head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
+                let scores = &mut score_scratch[..position + 1];
                 for pos in 0..=position {
                     let key_base = pos * kv_k_dim + kv_head * self.inventory.head_dim;
                     let kh = &state.k_cache[key_base..key_base + self.inventory.head_dim];
-                    scores.push(dot(qh, kh) * score_scale);
+                    scores[pos] = dot(qh, kh) * score_scale;
                 }
-                softmax_in_place(&mut scores);
+                softmax_in_place(scores);
                 for (pos, score) in scores.iter().copied().enumerate() {
                     let value_base = pos * kv_v_dim + kv_head * self.inventory.value_dim;
                     let vh = &state.v_cache[value_base..value_base + self.inventory.value_dim];
@@ -1571,11 +1602,17 @@ impl CpuQwen35Model {
                         dst[i] += score * vh[i];
                     }
                 }
-                let gate =
-                    &q_gate[head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
+                let gate = &workspace.full_q_gate
+                    [head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
                 mul_sigmoid_in_place(dst, gate);
             });
-        weights.attn_output.matmul(&attn_out, 1).map_err(Into::into)
+        let output_input = weights
+            .attn_output
+            .prepare_q8k_matvec(&workspace.full_attention)?;
+        weights
+            .attn_output
+            .matvec_prepared_q8k_into(&output_input, &mut workspace.attention_out)
+            .map_err(Into::into)
     }
 }
 
@@ -1936,22 +1973,25 @@ fn normalize_linear_qk(q: &mut [f32], k: &mut [f32]) {
     }
 }
 
-fn split_full_attention_q_gate(
+fn split_full_attention_q_gate_into(
     packed: &[f32],
     heads: usize,
     head_dim: usize,
-) -> (Vec<f32>, Vec<f32>) {
+    q: &mut Vec<f32>,
+    gate: &mut Vec<f32>,
+) {
     let q_dim = heads * head_dim;
     debug_assert_eq!(packed.len(), q_dim * 2);
-    let mut q = vec![0.0f32; q_dim];
-    let mut gate = vec![0.0f32; q_dim];
+    q.clear();
+    q.resize(q_dim, 0.0);
+    gate.clear();
+    gate.resize(q_dim, 0.0);
     for head in 0..heads {
         let src = head * head_dim * 2;
         let dst = head * head_dim;
         q[dst..dst + head_dim].copy_from_slice(&packed[src..src + head_dim]);
         gate[dst..dst + head_dim].copy_from_slice(&packed[src + head_dim..src + head_dim * 2]);
     }
-    (q, gate)
 }
 
 fn causal_conv1d_silu(values: &mut [f32], weights: &[f32], state: &mut [f32]) {
