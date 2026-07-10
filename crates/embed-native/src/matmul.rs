@@ -203,6 +203,19 @@ struct BlockQ8Kx4 {
     bsums: [i16; QK_K / 4],
 }
 
+/// Opaque Q8_K activation prepared once for several Q4_K/Q5_K/Q6_K matvecs.
+///
+/// Qwen applies several independent weight matrices to the same normalized
+/// hidden state. Keeping this representation avoids quantizing and repacking
+/// that state for every projection while preserving the exact native kernels.
+#[derive(Debug, Clone)]
+pub struct PreparedQ8K {
+    cols: usize,
+    blocks: Vec<BlockQ8K>,
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    repeated_x4: Vec<BlockQ8Kx4>,
+}
+
 #[derive(Debug, Clone)]
 struct BlockQ8_0 {
     d: f16,
@@ -345,6 +358,152 @@ impl QuantMatrix {
 
     pub fn cols(&self) -> usize {
         self.cols
+    }
+
+    pub fn prepare_q8k_matvec(&self, lhs: &[f32]) -> Result<PreparedQ8K> {
+        if lhs.len() != self.cols {
+            return Err(Error::InvalidGguf(format!(
+                "{} prepared matvec lhs len {}, expected {}",
+                self.name,
+                lhs.len(),
+                self.cols
+            )));
+        }
+        if !matches!(
+            &self.storage,
+            QuantStorage::Q4K { .. } | QuantStorage::Q5K { .. } | QuantStorage::Q6K { .. }
+        ) {
+            return Err(Error::InvalidGguf(format!(
+                "{} cannot use a prepared Q8_K matvec with this weight dtype",
+                self.name
+            )));
+        }
+        let blocks = quantize_q8k(lhs);
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        let repeated_x4 = pack_q8kx4_repeated(&blocks);
+        Ok(PreparedQ8K {
+            cols: self.cols,
+            blocks,
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            repeated_x4,
+        })
+    }
+
+    pub fn matvec_prepared_q8k(&self, input: &PreparedQ8K) -> Result<Vec<f32>> {
+        if input.cols != self.cols {
+            return Err(Error::InvalidGguf(format!(
+                "{} prepared matvec input width {}, expected {}",
+                self.name, input.cols, self.cols
+            )));
+        }
+        let row_blocks = self.cols / QK_K;
+        let mut out = vec![0.0f32; self.rows];
+        match &self.storage {
+            QuantStorage::Q4K {
+                blocks: rhs,
+                #[cfg(target_arch = "aarch64")]
+                x8,
+                #[cfg(target_arch = "x86_64")]
+                x8_vnni,
+            } => {
+                #[cfg(target_arch = "aarch64")]
+                if let Some(x8) = x8 {
+                    out.par_chunks_mut(64)
+                        .enumerate()
+                        .for_each(|(chunk_idx, dst)| {
+                            let first_group = chunk_idx * 8;
+                            for (local_group, values) in dst.chunks_exact_mut(8).enumerate() {
+                                let group = first_group + local_group;
+                                let y = &x8[group * row_blocks..(group + 1) * row_blocks];
+                                let tile = if std::arch::is_aarch64_feature_detected!("i8mm") {
+                                    unsafe { dot8x4_q4k_q8k_neon(y, &input.repeated_x4)[0] }
+                                } else {
+                                    unsafe { dot8_q4k_q8k_neon(y, &input.blocks) }
+                                };
+                                values.copy_from_slice(&tile);
+                            }
+                        });
+                    return Ok(out);
+                }
+                #[cfg(target_arch = "x86_64")]
+                if let Some(x8_vnni) = x8_vnni {
+                    return Ok(matvec_x8_prepared(
+                        x8_vnni,
+                        &input.repeated_x4,
+                        self.rows,
+                        self.cols,
+                        dot8x1_q4k_q8k_avxvnni,
+                    ));
+                }
+                out.par_chunks_mut(64)
+                    .enumerate()
+                    .for_each(|(chunk_idx, dst)| {
+                        let first = chunk_idx * 64;
+                        let n_quad = dst.len() & !3;
+                        for local in (0..n_quad).step_by(4) {
+                            let out_col = first + local;
+                            let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                            let y1 = &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                            let y2 = &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                            let y3 = &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                            let (d0, d1, d2, d3) = dot4_q4k_q8k(y0, y1, y2, y3, &input.blocks);
+                            dst[local] = d0;
+                            dst[local + 1] = d1;
+                            dst[local + 2] = d2;
+                            dst[local + 3] = d3;
+                        }
+                        for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
+                            let out_col = first + local;
+                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                            *value = dot_q4k_q8k(y, &input.blocks);
+                        }
+                    });
+            }
+            QuantStorage::Q5K { blocks: rhs, .. } => {
+                out.par_chunks_mut(64)
+                    .enumerate()
+                    .for_each(|(chunk_idx, dst)| {
+                        let first = chunk_idx * 64;
+                        for (local, value) in dst.iter_mut().enumerate() {
+                            let out_col = first + local;
+                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                            *value = dot_q5k_q8k(y, &input.blocks);
+                        }
+                    });
+            }
+            QuantStorage::Q6K { blocks: rhs, .. } => {
+                out.par_chunks_mut(64)
+                    .enumerate()
+                    .for_each(|(chunk_idx, dst)| {
+                        let first = chunk_idx * 64;
+                        let n_quad = dst.len() & !3;
+                        for local in (0..n_quad).step_by(4) {
+                            let out_col = first + local;
+                            let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                            let y1 = &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                            let y2 = &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                            let y3 = &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                            let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, &input.blocks);
+                            dst[local] = d0;
+                            dst[local + 1] = d1;
+                            dst[local + 2] = d2;
+                            dst[local + 3] = d3;
+                        }
+                        for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
+                            let out_col = first + local;
+                            let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                            *value = dot_q6k_q8k(y, &input.blocks);
+                        }
+                    });
+            }
+            _ => {
+                return Err(Error::InvalidGguf(format!(
+                    "{} cannot use a prepared Q8_K matvec with this weight dtype",
+                    self.name
+                )));
+            }
+        }
+        Ok(out)
     }
 
     pub fn matmul(&self, lhs: &[f32], lhs_rows: usize) -> Result<Vec<f32>> {
@@ -961,9 +1120,21 @@ fn matvec_x8<T: Sync>(
     kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [f32; 8],
 ) -> Vec<f32> {
     debug_assert_eq!(matrix_rows % 8, 0);
-    let row_blocks = matrix_cols / QK_K;
     let quantized = quantize_q8k(lhs);
     let input = pack_q8kx4_repeated(&quantized);
+    matvec_x8_prepared(rhs, &input, matrix_rows, matrix_cols, kernel)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matvec_x8_prepared<T: Sync>(
+    rhs: &[T],
+    input: &[BlockQ8Kx4],
+    matrix_rows: usize,
+    matrix_cols: usize,
+    kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [f32; 8],
+) -> Vec<f32> {
+    debug_assert_eq!(matrix_rows % 8, 0);
+    let row_blocks = matrix_cols / QK_K;
     let mut out = vec![0.0f32; matrix_rows];
     if matrix_rows <= 64 {
         for (group, dst) in out.chunks_exact_mut(8).enumerate() {

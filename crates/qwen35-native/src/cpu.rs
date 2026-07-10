@@ -467,9 +467,10 @@ impl CpuQwen35Model {
     }
 
     fn ffn(&self, layer: &LayerWeights, hidden: &[f32]) -> Result<Vec<f32>> {
+        let input = layer.ffn_gate.prepare_q8k_matvec(hidden)?;
         let (gate, up) = rayon::join(
-            || layer.ffn_gate.matmul(hidden, 1),
-            || layer.ffn_up.matmul(hidden, 1),
+            || layer.ffn_gate.matvec_prepared_q8k(&input),
+            || layer.ffn_up.matvec_prepared_q8k(&input),
         );
         let mut gate = gate?;
         let up = up?;
@@ -745,11 +746,12 @@ impl CpuQwen35Model {
         state: &mut DeltaState,
         hidden: &[f32],
     ) -> Result<Vec<f32>> {
-        let mut qkv = weights.attn_qkv.matmul(hidden, 1)?;
+        let input = weights.attn_qkv.prepare_q8k_matvec(hidden)?;
+        let mut qkv = weights.attn_qkv.matvec_prepared_q8k(&input)?;
         causal_conv1d_silu(&mut qkv, &weights.ssm_conv1d, &mut state.conv);
-        let z = weights.attn_gate.matmul(hidden, 1)?;
-        let beta = weights.ssm_beta.matmul(hidden, 1)?;
-        let alpha = weights.ssm_alpha.matmul(hidden, 1)?;
+        let z = weights.attn_gate.matvec_prepared_q8k(&input)?;
+        let beta = weights.ssm_beta.matvec_prepared_q8k(&input)?;
+        let alpha = weights.ssm_alpha.matvec_prepared_q8k(&input)?;
 
         let inner = self.inventory.ssm_inner_size;
         let (q, rest) = qkv.split_at_mut(inner);
@@ -797,14 +799,15 @@ impl CpuQwen35Model {
     ) -> Result<Vec<f32>> {
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
-        let q_fused = weights.attn_q.matmul(hidden, 1)?;
+        let input = weights.attn_q.prepare_q8k_matvec(hidden)?;
+        let q_fused = weights.attn_q.matvec_prepared_q8k(&input)?;
         let (mut q, q_gate) = split_full_attention_q_gate(
             &q_fused,
             self.inventory.attention_heads,
             self.inventory.head_dim,
         );
-        let mut k = weights.attn_k.matmul(hidden, 1)?;
-        let v = weights.attn_v.matmul(hidden, 1)?;
+        let mut k = weights.attn_k.matvec_prepared_q8k(&input)?;
+        let v = weights.attn_v.matvec_prepared_q8k(&input)?;
         debug_assert_eq!(k.len(), kv_k_dim);
         debug_assert_eq!(v.len(), kv_v_dim);
 
