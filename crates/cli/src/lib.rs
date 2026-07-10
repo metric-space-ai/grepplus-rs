@@ -18,7 +18,6 @@
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
 use greppy_core::workspace as workspace_locator;
-use greppy_freshness::LockOutcome;
 
 #[cfg(unix)]
 mod embed_daemon;
@@ -201,6 +200,11 @@ pub enum Command {
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Inspect or safely reclaim Greppy-managed cache data.
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     /// Structured graph search.
     SearchGraph {
@@ -697,6 +701,29 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub enum CacheCommand {
+    /// Show managed stores, models, quotas, locks, and unmanaged paths.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the TTL/LRU garbage collector immediately.
+    Gc {
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove one worktree's verified store, or every verified cache object.
+    Clear {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 impl Cli {
     pub fn parse() -> Self {
         <Self as Parser>::parse()
@@ -711,6 +738,7 @@ impl Cli {
 const SUBCOMMANDS: &[&str] = &[
     "grep",
     "index",
+    "cache",
     "stats",
     "diagnostics",
     "doctor",
@@ -755,10 +783,10 @@ const SUBCOMMANDS: &[&str] = &[
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
-    // Feature B: probabilistically evict stale index stores on binary
-    // start (same throttle pattern as the sidecar cleanup). Best-effort
-    // and throttled to ~once per 10 min per process, so a tight loop of
-    // invocations does not repeatedly walk the cache dir. The `--root`
+    // Best-effort cache maintenance on binary start. A cross-process state
+    // file throttles scans to the configured interval (10 minutes by
+    // default), so a tight loop of invocations does not repeatedly walk the
+    // data root. The `--root`
     // of THIS invocation (peeked from argv before clap runs) is what the
     // eviction must protect — protecting only the cwd store while the
     // command operates on `--root elsewhere` evicted the very store the
@@ -833,57 +861,306 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
+        "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
         "update" | "upgrade" => "greppy update [--check|--dry-run] [-y] [--tag TAG]",
         _ => return None,
     })
 }
 
-/// Feature B — probabilistically evict stale index stores under the
-/// shared `<cache>/greppy/` root. Throttled to ~once per 10 minutes
-/// per process (the same pattern as the sidecar `cleanup_expired` call)
-/// so a tight loop of `grep`/`greppy` invocations does not repeatedly
-/// walk the cache dir. Fully best-effort: any failure is swallowed, and
-/// the store currently being used by this invocation is preserved as the
-/// `keep` dir so we never delete out from under ourselves.
+/// Run manifest-verified, cross-process-throttled maintenance under Greppy's
+/// data root. Fully best-effort: any failure is swallowed, and the current
+/// workspace is excluded in addition to being protected by its lifecycle
+/// lease.
 ///
-/// TTL comes from `GREPPY_STORE_TTL_DAYS` (default 14 days; `0`
-/// disables eviction entirely) — see
+/// TTL comes from `GREPPY_STORE_TTL_DAYS` (default 14 days; `0` disables only
+/// age-based eviction, not the independent quota) — see
 /// [`greppy_core::workspace::store_ttl_secs`].
 pub fn maybe_run_store_cleanup(root: Option<&str>) {
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    let effective = resolve_root(root).ok();
+    if greppy_core::cache::maybe_gc(effective.as_deref()).is_ok_and(|report| !report.throttled) {
+        cleanup_verified_legacy_trash();
+        cleanup_expired_legacy_entries(
+            effective.as_deref(),
+            greppy_core::cache::GcPolicy::from_env().ttl,
+        );
+        prune_expired_evidence_packs();
+    }
+    if let Some(root) = effective.as_deref() {
+        let _ =
+            greppy_grep::sidecar::cleanup_expired(root, greppy_grep::sidecar::sidecar_ttl_secs());
+    }
+}
 
-    static LAST_RUN: Mutex<Option<Instant>> = Mutex::new(None);
-    const MIN_GAP: Duration = Duration::from_secs(10 * 60);
-
-    let should_run = {
-        let mut guard = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
-        match *guard {
-            Some(t) if t.elapsed() < MIN_GAP => false,
-            _ => {
-                *guard = Some(Instant::now());
-                true
-            }
-        }
-    };
-    if !should_run {
+fn prune_expired_evidence_packs() {
+    let Ok(status) = greppy_core::cache::cache_status() else {
         return;
-    }
-    let ttl = workspace_locator::store_ttl_secs();
-    if ttl == 0 {
-        return; // eviction disabled
-    }
-    let cache_root = match workspace_locator::store_cache_root() {
-        Some(c) => c,
-        None => return,
     };
-    // Preserve the store this invocation is about to use — resolved from
-    // the invocation's own `--root` when given, else from cwd (best-effort:
-    // if we cannot resolve a root, pass a path that matches nothing).
-    let keep = resolve_root(root)
-        .map(|r| workspace_locator::store_dir(&r))
-        .unwrap_or_else(|_| cache_root.join("\0none"));
-    let _ = workspace_locator::cleanup_stale_stores(&cache_root, ttl, &keep);
+    for entry in status
+        .entries
+        .into_iter()
+        .filter(|entry| entry.kind == "workspace" && !entry.locked && !entry.orphaned)
+    {
+        let Some(root) = entry.workspace_root else {
+            continue;
+        };
+        let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
+            &root,
+            greppy_core::cache::LockMode::Shared,
+            true,
+        ) else {
+            continue;
+        };
+        let path = workspace_locator::store_path(&root);
+        let Ok(_writer) = greppy_freshness::try_acquire(&path) else {
+            continue;
+        };
+        let Ok(store) =
+            greppy_store::Store::open_with(&path, greppy_store::OpenOptions::query_writer())
+        else {
+            continue;
+        };
+        let _ = store.prune_expired_expand_packs();
+    }
+}
+
+fn dispatch_cache(command: CacheCommand, root: Option<&str>) -> Result<i32> {
+    match command {
+        CacheCommand::Status { json } => {
+            let current = resolve_root(root).ok();
+            if let Some(current) = current.as_deref() {
+                greppy_core::cache::touch_last_used_dir(&greppy_core::cache::workspace_store_dir(
+                    current,
+                ));
+            }
+            let mut status = greppy_core::cache::cache_status()
+                .map_err(|error| Error::io("read cache status", error))?;
+            let policy = greppy_core::cache::GcPolicy::from_env();
+            let legacy = verified_legacy_cache_entries();
+            for entry in &legacy {
+                status.unmanaged.retain(|path| path != &entry.path);
+                status.unmanaged_bytes = status.unmanaged_bytes.saturating_sub(entry.bytes);
+                status.managed_bytes = status.managed_bytes.saturating_add(entry.bytes);
+                if entry.locked {
+                    status.locked_bytes = status.locked_bytes.saturating_add(entry.bytes);
+                }
+            }
+            let mut entries = status
+                .entries
+                .iter()
+                .map(|entry| {
+                    let freshness = if entry.orphaned {
+                        "cold"
+                    } else if entry.kind != "workspace" {
+                        "unknown"
+                    } else if entry.workspace_root.as_deref() == current.as_deref() {
+                        current_cache_freshness(entry.workspace_root.as_deref())
+                    } else {
+                        "unknown"
+                    };
+                    serde_json::json!({
+                        "kind": entry.kind,
+                        "id": entry.id,
+                        "path": entry.path,
+                        "workspace_root": entry.workspace_root,
+                        "bytes": entry.bytes,
+                        "last_used_unix_secs": entry.last_used_unix_secs,
+                        "locked": entry.locked,
+                        "orphaned": entry.orphaned,
+                        "freshness": freshness,
+                    })
+                })
+                .collect::<Vec<_>>();
+            entries.extend(legacy.iter().map(|entry| {
+                serde_json::json!({
+                    "kind": "legacy-workspace",
+                    "id": greppy_core::workspace::workspace_hash(&entry.root),
+                    "path": entry.path,
+                    "workspace_root": entry.root,
+                    "bytes": entry.bytes,
+                    "last_used_unix_secs": entry.last_used_unix_secs,
+                    "locked": entry.locked,
+                    "orphaned": !entry.root.exists(),
+                    "freshness": if entry.root.exists() { "drift" } else { "cold" },
+                })
+            }));
+            let value = serde_json::json!({
+                "data_root": status.data_root,
+                "managed_bytes": status.managed_bytes,
+                "unmanaged_bytes": status.unmanaged_bytes,
+                "locked_bytes": status.locked_bytes,
+                "quota_bytes": policy.high_water_bytes,
+                "low_water_bytes": policy.low_water_bytes,
+                "ttl_secs": policy.ttl.as_secs(),
+                "entries": entries,
+                "unmanaged": status.unmanaged,
+            });
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&value).map_err(|error| Error::Invalid(
+                        format!("serialize cache status: {error}")
+                    ))?
+                );
+            } else {
+                println!("cache root: {}", status.data_root.display());
+                println!(
+                    "managed: {} bytes; locked: {} bytes; unmanaged: {} bytes; quota: {} bytes",
+                    status.managed_bytes,
+                    status.locked_bytes,
+                    status.unmanaged_bytes,
+                    policy.high_water_bytes
+                );
+                for entry in value["entries"].as_array().into_iter().flatten() {
+                    println!(
+                        "{} {} {} bytes last_used={} locked={} orphaned={} freshness={}",
+                        entry["kind"].as_str().unwrap_or("unknown"),
+                        entry["path"].as_str().unwrap_or("?"),
+                        entry["bytes"].as_u64().unwrap_or(0),
+                        entry["last_used_unix_secs"].as_u64().unwrap_or(0),
+                        entry["locked"].as_bool().unwrap_or(false),
+                        entry["orphaned"].as_bool().unwrap_or(false),
+                        entry["freshness"].as_str().unwrap_or("unknown")
+                    );
+                }
+                for path in &status.unmanaged {
+                    println!("unmanaged {}", path.display());
+                }
+            }
+            Ok(0)
+        }
+        CacheCommand::Gc { dry_run, json } => {
+            let current = resolve_root(root).ok();
+            let policy = greppy_core::cache::GcPolicy::from_env();
+            let mut report = greppy_core::cache::run_gc(&policy, dry_run, current.as_deref())
+                .map_err(|error| Error::io("run cache GC", error))?;
+            if !dry_run {
+                cleanup_verified_legacy_trash();
+            }
+            let now = unix_now_secs_cli();
+            for entry in verified_legacy_cache_entries() {
+                if current.as_deref() == Some(entry.root.as_path()) {
+                    continue;
+                }
+                let age = now.saturating_sub(entry.last_used_unix_secs);
+                if policy.ttl.is_zero() || age <= policy.ttl.as_secs() {
+                    continue;
+                }
+                report.scanned_bytes = report.scanned_bytes.saturating_add(entry.bytes);
+                if entry.locked {
+                    report.locked_bytes = report.locked_bytes.saturating_add(entry.bytes);
+                    report.skipped_locked.push(entry.path);
+                } else if dry_run || remove_verified_legacy_entry(&entry) {
+                    report.removed_bytes = report.removed_bytes.saturating_add(entry.bytes);
+                    report.removed.push(entry.path);
+                }
+            }
+            print_gc_report(&report, json)?;
+            Ok(if report.locked_bytes > 0 {
+                EXIT_TEMPFAIL as i32
+            } else {
+                0
+            })
+        }
+        CacheCommand::Clear { all, yes } => {
+            if !yes {
+                return Err(Error::Invalid(
+                    "cache clear requires --yes; no cache data was removed".into(),
+                ));
+            }
+            if all && root.is_some() {
+                return Err(Error::Invalid(
+                    "cache clear accepts either --all or --root DIR, not both".into(),
+                ));
+            }
+            let target = if all {
+                None
+            } else {
+                let raw = root.ok_or_else(|| {
+                    Error::Invalid("cache clear requires --root DIR or --all".into())
+                })?;
+                Some(resolve_root(Some(raw))?)
+            };
+            let mut report = greppy_core::cache::clear_cache(target.as_deref())
+                .map_err(|error| Error::io("clear cache", error))?;
+            cleanup_verified_legacy_trash();
+            for entry in verified_legacy_cache_entries() {
+                if target.as_deref().is_some_and(|root| root != entry.root) {
+                    continue;
+                }
+                report.scanned_bytes = report.scanned_bytes.saturating_add(entry.bytes);
+                if entry.locked {
+                    report.locked_bytes = report.locked_bytes.saturating_add(entry.bytes);
+                    report.skipped_locked.push(entry.path);
+                } else if remove_verified_legacy_entry(&entry) {
+                    report.removed_bytes = report.removed_bytes.saturating_add(entry.bytes);
+                    report.removed.push(entry.path);
+                }
+            }
+            print_gc_report(&report, false)?;
+            Ok(if report.locked_bytes > 0 {
+                EXIT_TEMPFAIL as i32
+            } else {
+                0
+            })
+        }
+    }
+}
+
+fn current_cache_freshness(root: Option<&std::path::Path>) -> &'static str {
+    let Some(root) = root else { return "unknown" };
+    let path = workspace_locator::store_path(root);
+    let store = match greppy_store::Store::open_with(&path, greppy_store::OpenOptions::read_only())
+    {
+        Ok(store) => store,
+        Err(_) => return "failed",
+    };
+    let project = workspace_locator::project_identity(root);
+    match greppy_freshness::check_files(
+        &store,
+        root,
+        &project,
+        std::time::Duration::from_millis(200),
+    ) {
+        Ok(state) => match state.outcome {
+            greppy_freshness::FreshnessOutcome::Fresh => "fresh",
+            greppy_freshness::FreshnessOutcome::Stale { .. }
+            | greppy_freshness::FreshnessOutcome::RootMismatch => "drift",
+            greppy_freshness::FreshnessOutcome::Cold => "cold",
+            greppy_freshness::FreshnessOutcome::Unknown { .. } => "unknown",
+        },
+        Err(_) => "failed",
+    }
+}
+
+fn print_gc_report(report: &greppy_core::cache::GcReport, json: bool) -> Result<()> {
+    let value = serde_json::json!({
+        "dry_run": report.dry_run,
+        "throttled": report.throttled,
+        "scanned_bytes": report.scanned_bytes,
+        "removed_bytes": report.removed_bytes,
+        "locked_bytes": report.locked_bytes,
+        "removed": report.removed,
+        "skipped_locked": report.skipped_locked,
+    });
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| Error::Invalid(format!("serialize cache GC: {error}")))?
+        );
+    } else {
+        println!(
+            "cache GC: scanned={} removed={} locked={} dry_run={}",
+            report.scanned_bytes, report.removed_bytes, report.locked_bytes, report.dry_run
+        );
+        for path in &report.removed {
+            println!("removed {}", path.display());
+        }
+        for path in &report.skipped_locked {
+            println!("locked {}", path.display());
+        }
+    }
+    Ok(())
 }
 
 /// Best-effort peek of a leading global `--root <val>` / `--root=<val>`
@@ -1068,6 +1345,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                 )
             }
         }
+        Command::Cache { command } => dispatch_cache(command, root),
         Command::SearchGraph { name, json } => {
             let mut q = greppy_search::GraphQuery::any().with_limit(50);
             let name_filter = name.as_deref();
@@ -3427,10 +3705,9 @@ fn graph_stale_skip_json(
     Ok(())
 }
 
-/// D2 fail-open gate for the graph navigation commands. Returns
-/// `Some(exit_code)` ONLY when there is no usable index (see
-/// [`FreshnessServe::Refuse`]); a merely-stale index proceeds with
-/// labeled results (auto-healed first when the drift is small).
+/// Fresh-or-fallback gate for graph navigation. Indexed graph data is only
+/// visible when freshness was proven; drift/unknown states trigger refresh
+/// and return EX_TEMPFAIL instead of exposing stale rows.
 fn graph_stale_gate(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -3441,7 +3718,7 @@ fn graph_stale_gate(
     empty_collection_field: &str,
 ) -> Result<Option<i32>> {
     match freshness_serve_decision(store, root, project) {
-        FreshnessServe::Fresh(_) | FreshnessServe::StaleLabeled(_) => Ok(None),
+        FreshnessServe::Fresh(_) => Ok(None),
         FreshnessServe::Refuse(freshness) => {
             if json {
                 graph_stale_skip_json(
@@ -3449,14 +3726,14 @@ fn graph_stale_gate(
                     root,
                     project,
                     command,
-                    freshness,
+                    freshness.clone(),
                     extra,
                     empty_collection_field,
                 )?;
             } else {
                 println!("{}", indexed_stale_skip_message(command, &freshness));
             }
-            Ok(Some(1))
+            Ok(Some(freshness_refusal_exit(&freshness)))
         }
     }
 }
@@ -4155,12 +4432,13 @@ fn nav_freshness_json(
                 greppy_freshness::FreshnessOutcome::Cold => {
                     (false, "cold", vec!["no persisted workspace state".into()])
                 }
-                greppy_freshness::FreshnessOutcome::RootMismatch => (
-                    false,
-                    "root_mismatch",
-                    vec!["workspace root mismatch".into()],
-                ),
-                greppy_freshness::FreshnessOutcome::Stale { reasons } => (false, "stale", reasons),
+                greppy_freshness::FreshnessOutcome::RootMismatch => {
+                    (false, "drift", vec!["workspace root mismatch".into()])
+                }
+                greppy_freshness::FreshnessOutcome::Stale { reasons } => (false, "drift", reasons),
+                greppy_freshness::FreshnessOutcome::Unknown { reasons } => {
+                    (false, "unknown", reasons)
+                }
             };
             serde_json::json!({
                 "fresh": fresh,
@@ -4171,6 +4449,7 @@ fn nav_freshness_json(
                 // check could not enumerate changes (cold store, budget
                 // exhausted, walk failure).
                 "stale_file_count": report.changed_paths.as_ref().map(Vec::len),
+                "changed_paths": report.changed_paths,
                 "total_inventory": report.total_inventory,
                 "ttl_hit": report.ttl_hit,
                 "discover_scope": discover_scope,
@@ -4194,28 +4473,12 @@ fn nav_freshness_json(
     }
 }
 
-/// D2 fail-open freshness policy for indexed query surfaces.
-///
-/// The old contract failed CLOSED: any non-fresh verdict (a single
-/// edited file, a budget overrun) suppressed ALL indexed output and
-/// exited 1 — on large repos the whole plus surface self-disabled and
-/// agents silently fell back to plain grep. The new contract:
-///
-/// - `Fresh`: proceed normally.
-/// - `StaleLabeled`: the index exists but has drifted. Serve results
-///   FROM THE EXISTING INDEX, honestly labeled (`fresh: false` +
-///   `freshness` in every JSON payload, a one-line stderr warning, and
-///   `(as of last index)` in completeness footers). Before settling for
-///   stale, if the drift is small (≤ [`AUTO_REINDEX_MAX_FILES`] changed
-///   files) an inline incremental reindex is attempted so the answer is
-///   simply fresh.
-/// - `Refuse`: there is no usable index for this root (cold store /
-///   root mismatch / invalid discover-scope config). Only this case
-///   keeps the old fail-closed behaviour (exit 1 + "run greppy
-///   index").
+/// Fresh-or-fallback policy for indexed query surfaces. Only `Fresh` may
+/// expose graph or embedding rows. `Refuse` carries cold, drift, refreshing,
+/// unknown, or failed state; callers either use a live filesystem backend or
+/// return EX_TEMPFAIL.
 enum FreshnessServe {
     Fresh(serde_json::Value),
-    StaleLabeled(serde_json::Value),
     Refuse(serde_json::Value),
 }
 
@@ -4224,21 +4487,17 @@ impl FreshnessServe {
     /// the verdict was.
     fn freshness(&self) -> &serde_json::Value {
         match self {
-            FreshnessServe::Fresh(f)
-            | FreshnessServe::StaleLabeled(f)
-            | FreshnessServe::Refuse(f) => f,
+            FreshnessServe::Fresh(f) | FreshnessServe::Refuse(f) => f,
         }
     }
 }
 
-/// Auto-reindex cap: an inline incremental reindex is only attempted
-/// when at most this many files drifted. Above the cap we serve
-/// labeled-stale results instead of stalling the query on a large
-/// reindex.
+/// Auto-reindex cap: an inline atomic snapshot is only attempted when at most
+/// this many files drifted. Above the cap one background refresh starts and
+/// stale indexed results are refused.
 const AUTO_REINDEX_MAX_FILES: usize = 10;
 
-/// Kill switch for the inline auto-reindex (`0`/`false` disables). The
-/// labeled-stale serving is NOT affected by this switch.
+/// Kill switch for automatic inline/background refresh (`0`/`false` disables).
 const ENV_AUTO_REINDEX: &str = "GREPPY_AUTO_REINDEX";
 
 fn auto_reindex_enabled() -> bool {
@@ -4251,12 +4510,10 @@ fn auto_reindex_enabled() -> bool {
     }
 }
 
-/// Set once a command decides to serve labeled-stale results; the
-/// completeness footers read it to append `(as of last index)`.
-static SERVED_STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
+/// Compatibility hook for older footer rendering. Production query paths
+/// never serve stale indexed rows, so this is always false.
 fn serving_stale() -> bool {
-    SERVED_STALE.load(std::sync::atomic::Ordering::Relaxed)
+    false
 }
 
 fn freshness_serve_decision(
@@ -4267,13 +4524,8 @@ fn freshness_serve_decision(
     freshness_serve_decision_with_policy(store, root, project, true, true)
 }
 
-/// `allow_auto_reindex = false` for surfaces whose data is
-/// generation-scoped (vector search): an inline reindex without
-/// embeddings would bump the generation and invalidate the very rows
-/// the query needs. `warn_on_stale = false` for callers that do NOT
-/// serve stale results on `StaleLabeled` but emit their own controlled
-/// skip output instead (again the vector path) — warning about serving
-/// stale results that are then not served would be noise.
+/// `allow_auto_reindex = false` for a surface that cannot guarantee its
+/// generation-scoped embeddings can be rebuilt in the same snapshot.
 /// True when the indexer-version drift is a pure VERSION bump (same
 /// discover scope on both sides), so a self-healing full reindex rebuilds
 /// under the scope the store was already indexed with — never under a
@@ -4313,7 +4565,7 @@ fn freshness_serve_decision_with_policy(
     root: Option<&str>,
     project: &str,
     allow_auto_reindex: bool,
-    warn_on_stale: bool,
+    _warn_on_stale: bool,
 ) -> FreshnessServe {
     let freshness = nav_freshness_json(store, root, project);
     if freshness_json_is_fresh(&freshness) {
@@ -4323,19 +4575,9 @@ fn freshness_serve_decision_with_policy(
         .get("state")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    // No usable index at all: refuse (fail-closed). config_error =
-    // invalid discover-scope env, a user error that a stale-labeled
-    // answer would mask.
-    if matches!(state, "cold" | "root_mismatch" | "config_error") {
+    if matches!(state, "cold" | "config_error" | "failed") {
         return FreshnessServe::Refuse(freshness);
     }
-    // An indexer-version/scope mismatch is a CONFIG mismatch, not time
-    // staleness: the persisted rows were produced under different
-    // extraction semantics or a different discover scope, so "the same
-    // data, slightly old" does not describe them. Serving them labeled
-    // "stale" would misrepresent; only a real reindex under the current
-    // config helps. This deliberately keeps the pre-D2 fail-closed
-    // contract (see discover_scope_env_controls_index_and_query_freshness).
     let scope_or_version_drift = freshness
         .get("reasons")
         .and_then(serde_json::Value::as_array)
@@ -4345,100 +4587,98 @@ fn freshness_serve_decision_with_policy(
                 .any(|r| r.contains("indexer version/scope"))
         });
     if scope_or_version_drift {
-        // Split the two kinds of drift the one reason string covers:
-        //  * VERSION bump (same discover scope, different base version): a
-        //    binary upgrade changed the extractor (O3/O8/O9/P4). A store
-        //    built by the older/buggy binary must NOT keep serving its
-        //    wrong data, and a FULL reindex under the SAME scope is exactly
-        //    what a fresh `grep index` produces — so self-heal.
-        //  * SCOPE change (different discover scope): the user is querying
-        //    with a different discover-scope env than the index was built
-        //    with. Silently reindexing under the query's scope would change
-        //    what the store holds behind the user's back — keep the
-        //    fail-closed contract and refuse.
-        if allow_auto_reindex
-            && auto_reindex_enabled()
-            && version_drift_is_scope_stable(&freshness)
-            && try_auto_reindex_inline(root)
+        if allow_auto_reindex && auto_reindex_enabled() && version_drift_is_scope_stable(&freshness)
         {
-            let after = nav_freshness_json(store, root, project);
-            if freshness_json_is_fresh(&after) {
-                return FreshnessServe::Fresh(after);
-            }
+            let started = spawn_background_index(root, "indexer-version-drift");
+            return FreshnessServe::Refuse(refresh_state(
+                freshness,
+                started || workspace_writer_active(root),
+            ));
         }
         return FreshnessServe::Refuse(freshness);
     }
 
-    // Small drift: heal inline (incremental reindex re-extracts only the
-    // changed files), then answer fresh. `stale_file_count == 0` covers
-    // pure git-fingerprint drift (e.g. a commit of already-indexed
-    // content) — the reindex just refreshes workspace_state.
     let stale_file_count = freshness
         .get("stale_file_count")
         .and_then(serde_json::Value::as_u64)
         .map(|n| n as usize);
-    if let Some(n) = stale_file_count {
-        if allow_auto_reindex
-            && n <= AUTO_REINDEX_MAX_FILES
-            && auto_reindex_enabled()
-            && try_auto_reindex_inline(root)
-        {
-            let after = nav_freshness_json(store, root, project);
-            if freshness_json_is_fresh(&after) {
-                return FreshnessServe::Fresh(after);
-            }
-            // Reindex ran but freshness still disagrees (races, walk
-            // errors): fall through to labeled-stale with the post-
-            // reindex view.
-            if warn_on_stale {
-                warn_serving_stale(store, root, &after);
-            }
-            return FreshnessServe::StaleLabeled(after);
+    let small_enough = stale_file_count.is_some_and(|count| {
+        count <= AUTO_REINDEX_MAX_FILES
+            && freshness_changed_bytes(root, &freshness)
+                .is_some_and(|bytes| bytes <= 8 * 1024 * 1024)
+    });
+    if allow_auto_reindex && auto_reindex_enabled() && small_enough {
+        let rebuilt = try_auto_reindex_inline(root);
+        return FreshnessServe::Refuse(refresh_state(
+            freshness,
+            rebuilt || workspace_writer_active(root),
+        ));
+    }
+    if allow_auto_reindex && auto_reindex_enabled() {
+        let started = spawn_background_index(root, "workspace-drift");
+        return FreshnessServe::Refuse(refresh_state(
+            freshness,
+            started || workspace_writer_active(root),
+        ));
+    }
+    FreshnessServe::Refuse(freshness)
+}
+
+fn freshness_changed_bytes(root: Option<&str>, freshness: &serde_json::Value) -> Option<u64> {
+    let root = resolve_root(root).ok()?;
+    let paths = freshness.get("changed_paths")?.as_array()?;
+    let mut bytes = 0u64;
+    for path in paths {
+        let path = path.as_str()?;
+        match std::fs::metadata(root.join(path)) {
+            Ok(metadata) => bytes = bytes.saturating_add(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
         }
     }
-
-    if warn_on_stale {
-        warn_serving_stale(store, root, &freshness);
-    }
-    FreshnessServe::StaleLabeled(freshness)
+    Some(bytes)
 }
 
-/// One-line stderr warning for labeled-stale serving. Printed at most
-/// once per invocation; stdout (grep-shaped results / JSON) stays
-/// untouched.
-fn warn_serving_stale(
-    store: &greppy_store::Store,
-    root: Option<&str>,
-    freshness: &serde_json::Value,
-) {
-    let already = SERVED_STALE.swap(true, std::sync::atomic::Ordering::Relaxed);
-    if already {
-        return;
+fn refresh_state(mut freshness: serde_json::Value, started: bool) -> serde_json::Value {
+    if let Some(object) = freshness.as_object_mut() {
+        object.insert(
+            "state".into(),
+            serde_json::json!(if started { "refreshing" } else { "failed" }),
+        );
+        object.insert("fresh".into(), serde_json::json!(false));
     }
-    let generation = current_graph_generation(store, root).unwrap_or(0);
-    let drift = match freshness
-        .get("stale_file_count")
-        .and_then(serde_json::Value::as_u64)
+    freshness
+}
+
+fn freshness_refusal_exit(freshness: &serde_json::Value) -> i32 {
+    match freshness
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
     {
-        Some(n) => format!("{n} file(s) changed"),
-        None => "extent unknown".to_string(),
-    };
-    eprintln!(
-        "grep: index may be stale ({drift}); results from generation {generation} — run 'grep index'"
-    );
+        "refreshing" | "drift" | "unknown" => EXIT_TEMPFAIL as i32,
+        _ => 1,
+    }
 }
 
-/// Inline incremental reindex of the CURRENT store, in place, holding
-/// the writer lock. Returns true when the index was rebuilt cleanly.
-///
-/// In-place (not the atomic temp-DB snapshot the `index` subcommand
-/// uses) is deliberate: the calling query command already holds an open
-/// read-only handle to this DB file, and must see the refreshed rows
-/// through it. The indexer's incremental path re-extracts only changed
-/// files, so with ≤ [`AUTO_REINDEX_MAX_FILES`] drifted files this is
-/// bounded work. Any failure (lock contention, read-only store dir,
-/// indexer error) simply reports false — the caller degrades to
-/// labeled-stale serving, never to a hard failure.
+fn workspace_writer_active(root: Option<&str>) -> bool {
+    let Ok(root) = resolve_root(root) else {
+        return false;
+    };
+    let hash = greppy_core::workspace::workspace_hash(&root);
+    matches!(
+        greppy_core::cache::acquire_named_lock(
+            &format!("workspace-{hash}.writer"),
+            greppy_core::cache::LockMode::Exclusive,
+            true,
+        ),
+        Ok(None)
+    )
+}
+
+/// Build a small-drift refresh through the same temp-snapshot publication
+/// boundary as an explicit `index`. The current query keeps its old inode and
+/// therefore never observes in-place mutation or a partially rebuilt graph.
 fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     let Ok(effective_root) = resolve_root(root) else {
         return false;
@@ -4450,13 +4690,20 @@ fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         return false;
     };
     let store_path = workspace_locator::store_path(&effective_root);
-    let _lock = match greppy_freshness::try_acquire(&store_path) {
-        Ok(LockOutcome::Acquired | LockOutcome::AcquiredFromStale) => {
-            greppy_freshness::Lock::new(greppy_freshness::lock_path_for(&store_path))
-        }
-        _ => return false, // another writer is active: serve labeled-stale
+    let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
+        &effective_root,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    ) else {
+        return false;
     };
-    let Ok(mut store) = greppy_store::Store::open(&store_path) else {
+    let _lock = match greppy_freshness::try_acquire(&store_path) {
+        Ok(lock) => lock,
+        _ => return false, // another writer is active: refuse this snapshot
+    };
+    let Ok(store) =
+        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::read_only())
+    else {
         return false;
     };
     // Remember whether this store served code-span vectors BEFORE the
@@ -4468,25 +4715,41 @@ fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         .vector_model_ids(&project)
         .unwrap_or_default()
         .is_empty();
+    drop(store);
+    let embedding_cfg = if had_vectors {
+        let no_args = EmbeddingCliArgs {
+            model_dir: None,
+            gguf: None,
+            tokenizer: None,
+            model_id: None,
+            max_length: None,
+            device: None,
+            no_gpu: false,
+        };
+        match embedding_config_optional(no_args) {
+            Ok(Some(cfg)) => Some(cfg),
+            _ => return false,
+        }
+    } else {
+        None
+    };
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
     };
-    match greppy_indexer::index_with_options(&mut store, &effective_root, &project, &options) {
-        Ok(report) => {
-            let clean = report.is_clean();
-            if clean && had_vectors {
-                auto_rebuild_vectors_inline(&mut store, &effective_root, &project, &report);
-            }
-            clean
-        }
-        Err(_) => false,
-    }
+    index_atomic_snapshot(
+        &store_path,
+        &effective_root,
+        &project,
+        embedding_cfg.as_ref(),
+        &options,
+    )
+    .map(|snapshot| snapshot.index.is_clean())
+    .unwrap_or(false)
 }
 
 /// Whether the vector query path may self-heal a stale index via the
-/// inline auto-reindex: only when the embedding model is resolvable from
-/// env/HF-cache, because only then does [`auto_rebuild_vectors_inline`]
-/// rebuild the vectors for the bumped generation.
+/// atomic auto-reindex: only when the embedding model is resolvable, because
+/// an existing vector generation must be rebuilt as part of the snapshot.
 fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
     match embedding_config_optional(args) {
         Ok(Some(cfg)) => embedding_model_source_exists(&cfg.source),
@@ -4501,73 +4764,235 @@ fn embedding_model_source_exists(source: &EmbeddingModelSource) -> bool {
     }
 }
 
-/// Rebuild code-span vectors after an inline auto-reindex of a store that
-/// had them. Incremental by design: unchanged spans keep their vectors (the
-/// embedding indexer prunes/re-embeds only what changed), so the common
-/// agent-loop case (one edited file) costs a handful of spans, not a full
-/// re-embed. Model resolution is env/HF-cache only (no CLI flags exist on
-/// this path); when the model cannot be resolved we say so ONCE instead of
-/// silently stranding the vectors.
-fn auto_rebuild_vectors_inline(
-    store: &mut greppy_store::Store,
-    root: &std::path::Path,
-    project: &str,
-    report: &greppy_indexer::IndexReport,
-) {
-    let no_args = EmbeddingCliArgs {
-        model_dir: None,
-        gguf: None,
-        tokenizer: None,
-        model_id: None,
-        max_length: None,
-        device: None,
-        no_gpu: false,
-    };
-    let cfg = match embedding_config_optional(no_args) {
-        Ok(Some(cfg)) => cfg,
-        Ok(None) => {
-            eprintln!(
-                "grep: reindex left code-span vectors on an old generation \
-                 (embedding model unavailable); run `grep index` to restore vector search"
-            );
-            return;
+/// Atomically published status for the one allowed background index job.
+const BACKGROUND_JOB_FILE: &str = "index.job";
+
+fn background_job_path(root: &std::path::Path) -> std::path::PathBuf {
+    workspace_locator::store_path(root)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join(BACKGROUND_JOB_FILE)
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
         }
-        Err(e) => {
-            log_embedding_skip_once("auto-reindex vectors", &e);
-            return;
-        }
-    };
-    let model = match load_embedding_model(&cfg, None) {
-        Ok(m) => m,
-        Err(e) => {
-            log_embedding_skip_once("auto-reindex vectors", &e);
-            return;
-        }
-    };
-    let mut provider = greppy_indexer::EmbeddingGemmaCodeProvider::new(&cfg.model_id, &model);
-    if let Err(e) = greppy_indexer::index_code_embeddings_for_project(
-        store,
-        root,
-        project,
-        &mut provider,
-        greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation),
-    ) {
-        log_embedding_skip_once("auto-reindex vectors", &e);
+        let rc = unsafe { kill(pid as std::ffi::c_int, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
     }
 }
 
-/// P11: below this node count the first-use embedding build finishes fast
-/// enough to run inline (the agent gets semantic results on THIS query);
-/// above it, the build goes to a detached background process so the query
-/// never blocks. ~3000 nodes embeds in a couple of seconds on Metal/CUDA
-/// and still tolerably on CPU; larger repos are the ones that hit minutes.
-const INLINE_EMBED_MAX_NODES: i64 = 3000;
+fn read_background_job(path: &std::path::Path) -> Option<serde_json::Value> {
+    let raw = std::fs::read(path).ok()?;
+    serde_json::from_slice(&raw).ok()
+}
 
-fn project_is_small_enough_for_inline_embed(store: &greppy_store::Store, project: &str) -> bool {
-    store
-        .stats(project)
-        .map(|s| s.total_nodes <= INLINE_EMBED_MAX_NODES)
-        .unwrap_or(false)
+fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Result<()> {
+    use std::io::Write;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Invalid("background job path has no parent".into()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| Error::io(format!("create {}", parent.display()), error))?;
+    let temp = parent.join(format!(
+        ".index.job.{}.{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0)
+    ));
+    let bytes = serde_json::to_vec_pretty(value)
+        .map_err(|error| Error::Invalid(format!("serialize background job: {error}")))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| Error::io(format!("create {}", temp.display()), error))?;
+    file.write_all(&bytes)
+        .map_err(|error| Error::io(format!("write {}", temp.display()), error))?;
+    file.sync_all()
+        .map_err(|error| Error::io(format!("sync {}", temp.display()), error))?;
+    drop(file);
+    std::fs::rename(&temp, path)
+        .map_err(|error| Error::io(format!("publish {}", path.display()), error))?;
+    sync_parent_dir(path)?;
+    Ok(())
+}
+
+struct BackgroundJobGuard {
+    path: Option<std::path::PathBuf>,
+    cause: String,
+    started_at_unix_secs: u64,
+    target_generation: u64,
+    complete: bool,
+}
+
+impl BackgroundJobGuard {
+    fn from_env() -> Self {
+        let path = std::env::var_os("GREPPY_BACKGROUND_JOB").map(std::path::PathBuf::from);
+        // The parent can only publish the job PID after spawn. Hold the child
+        // at its entry point until that atomic record is visible, preventing
+        // a very small repository from completing and removing the file
+        // before the parent writes `refreshing` over it.
+        if let Some(path) = &path {
+            for _ in 0..100 {
+                if read_background_job(path)
+                    .and_then(|job| job.get("pid").and_then(serde_json::Value::as_u64))
+                    == Some(std::process::id() as u64)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        Self {
+            path,
+            cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
+                .unwrap_or_else(|_| "background-refresh".into()),
+            started_at_unix_secs: std::env::var("GREPPY_BACKGROUND_STARTED_AT")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or_else(unix_now_secs_cli),
+            target_generation: std::env::var("GREPPY_BACKGROUND_TARGET_GENERATION")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+            complete: false,
+        }
+    }
+
+    fn complete(&mut self) {
+        self.complete = true;
+        if let Some(path) = &self.path {
+            let _ = std::fs::remove_file(path);
+            let _ = sync_parent_dir(path);
+        }
+    }
+
+    fn fail(&mut self, error: &Error) {
+        let Some(path) = &self.path else { return };
+        let value = serde_json::json!({
+            "pid": std::process::id(),
+            "started_at_unix_secs": self.started_at_unix_secs,
+            "cause": self.cause,
+            "target_generation": self.target_generation,
+            "state": "failed",
+            "last_error": error.to_string(),
+        });
+        let _ = write_background_job(path, &value);
+        self.complete = true;
+    }
+}
+
+impl Drop for BackgroundJobGuard {
+    fn drop(&mut self) {
+        if self.complete {
+            return;
+        }
+        let Some(path) = &self.path else { return };
+        let value = serde_json::json!({
+            "pid": std::process::id(),
+            "started_at_unix_secs": self.started_at_unix_secs,
+            "cause": self.cause,
+            "target_generation": self.target_generation,
+            "state": "failed",
+            "last_error": "background index exited before successful publication",
+        });
+        let _ = write_background_job(path, &value);
+    }
+}
+
+fn unix_now_secs_cli() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
+/// Start at most one detached index refresh for a worktree. A spawn lock
+/// closes the cross-process race and the atomically published job record is
+/// the public status surface.
+fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
+    let Ok(root) = resolve_root(root) else {
+        return false;
+    };
+    if greppy_core::cache::ensure_workspace_store(&root).is_err() {
+        return false;
+    }
+    let hash = greppy_core::workspace::workspace_hash(&root);
+    let Ok(Some(_spawn_lock)) = greppy_core::cache::acquire_named_lock(
+        &format!("workspace-{hash}.job-spawn"),
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    ) else {
+        return false;
+    };
+    let job_path = background_job_path(&root);
+    if let Some(job) = read_background_job(&job_path) {
+        if job
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|pid| process_is_alive(pid as u32))
+        {
+            return true;
+        }
+    }
+    let target_generation = greppy_store::Store::open_with(
+        &workspace_locator::store_path(&root),
+        greppy_store::OpenOptions::read_only(),
+    )
+    .ok()
+    .and_then(|store| {
+        store
+            .get_workspace_state(root.to_string_lossy().as_ref())
+            .ok()
+            .flatten()
+            .map(|state| state.graph_generation)
+    })
+    .unwrap_or(0)
+    .saturating_add(1);
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let started_at = unix_now_secs_cli();
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("index")
+        .arg(&root)
+        .arg("--root")
+        .arg(&root)
+        .env("GREPPY_BACKGROUND_JOB", &job_path)
+        .env("GREPPY_BACKGROUND_CAUSE", cause)
+        .env("GREPPY_BACKGROUND_STARTED_AT", started_at.to_string())
+        .env(
+            "GREPPY_BACKGROUND_TARGET_GENERATION",
+            target_generation.to_string(),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let Ok(child) = command.spawn() else {
+        return false;
+    };
+    let value = serde_json::json!({
+        "pid": child.id(),
+        "started_at_unix_secs": started_at,
+        "cause": cause,
+        "target_generation": target_generation,
+        "state": "refreshing",
+        "last_error": serde_json::Value::Null,
+    });
+    write_background_job(&job_path, &value).is_ok()
 }
 
 /// Kick off `grep index <root>` as a detached child so the
@@ -4575,81 +5000,7 @@ fn project_is_small_enough_for_inline_embed(store: &greppy_store::Store, project
 /// carries the embedded model, so no env is needed. Best-effort: a failure
 /// to spawn just means the next query heals inline instead.
 fn spawn_background_embed(root: Option<&str>) {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let Ok(root_path) = resolve_root(root) else {
-        return;
-    };
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("index")
-        .arg(&root_path)
-        .arg("--root")
-        .arg(&root_path)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    // With null stdio and no wait(), the child is orphaned (reparented to
-    // init) when this short-lived CLI exits — it keeps running and cannot
-    // receive a terminal SIGHUP (no controlling tty on its fds). Good
-    // enough for a background reindex without pulling in a setsid dep.
-    let _ = cmd.spawn();
-}
-
-/// First-use semantic self-heal (P2): build code-span embeddings for the
-/// project when a model is configured but the store has none. Returns true
-/// when a build was attempted successfully. Failures are logged (once) and
-/// never fail the query — the caller falls back to the honest skip note.
-fn build_vectors_first_use(
-    cfg: &EmbeddingModelConfig,
-    root: Option<&str>,
-    project: &str,
-    generation: u64,
-) -> bool {
-    let root_path = match resolve_root(root) {
-        Ok(p) => p,
-        Err(e) => {
-            log_embedding_skip_once("context first-use vectors", &e);
-            return false;
-        }
-    };
-    let model = match load_embedding_model(cfg, None) {
-        Ok(m) => m,
-        Err(e) => {
-            log_embedding_skip_once("context first-use vectors", &e);
-            return false;
-        }
-    };
-    // The query path holds a READ-ONLY store handle; the heal needs its
-    // own writable connection (same DB, WAL allows one writer + readers).
-    let store_path = workspace_locator::store_path(&root_path);
-    let mut write_store = match greppy_store::Store::open(&store_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log_embedding_skip_once("context first-use vectors", &e.into());
-            return false;
-        }
-    };
-    // Use the generation CURRENT AT WRITE TIME: the same context call may
-    // have auto-reindexed (bumping the generation) after the caller read
-    // it — embeddings written under the stale value are invisible to the
-    // retrieval scope and get evicted (observed: 48 of ~8k spans stored).
-    let write_generation = match current_graph_generation(&write_store, root) {
-        Ok(g) => g,
-        Err(_) => generation,
-    };
-    let mut provider = greppy_indexer::EmbeddingGemmaCodeProvider::new(&cfg.model_id, &model);
-    if let Err(e) = greppy_indexer::index_code_embeddings_for_project(
-        &mut write_store,
-        &root_path,
-        project,
-        &mut provider,
-        greppy_indexer::EmbeddingIndexOptions::for_generation(write_generation),
-    ) {
-        log_embedding_skip_once("context first-use vectors", &e);
-        return false;
-    }
-    true
+    let _ = spawn_background_index(root, "embedding-first-use");
 }
 
 /// Read one source line (1-based) for the grep-shaped call-site rows the
@@ -5270,9 +5621,10 @@ fn dispatch_impact_diff_scope(
 ) -> Result<i32> {
     let store = open_default_store(root)?;
     let project = project_for(root)?;
-    // D2 fail-open: refuse only when no usable index exists; a stale
-    // index serves labeled results (auto-healed first when small).
+    // Never compute impact from a stale graph; trigger the bounded refresh
+    // policy and return a stable refusal payload.
     if let FreshnessServe::Refuse(freshness) = freshness_serve_decision(&store, root, &project) {
+        let refusal_exit = freshness_refusal_exit(&freshness);
         if json {
             // Impact reports only real code providers (excludes .stderr/.snap).
             let incomplete_providers = code_incomplete_provider_json(&store, &project)?;
@@ -5302,7 +5654,7 @@ fn dispatch_impact_diff_scope(
         } else {
             println!("{}", indexed_stale_skip_message("impact diff", &freshness));
         }
-        return Ok(1);
+        return Ok(refusal_exit);
     }
     let mut gate_extra = serde_json::json!({
         "scope": "diff",
@@ -5906,6 +6258,33 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
     let effective_root = resolve_root(root)?;
     let project = workspace_locator::project_identity(&effective_root);
     let store_path = workspace_locator::store_path(&effective_root);
+    let store_format = store_path
+        .parent()
+        .and_then(|parent| greppy_core::cache::read_store_manifest(parent).ok())
+        .map(|manifest| manifest.format_version);
+    let store_bytes = store_path
+        .parent()
+        .map(cache_path_bytes)
+        .unwrap_or_default();
+    let background_job = read_background_job(&background_job_path(&effective_root));
+    let effective_root_string = effective_root.to_string_lossy().into_owned();
+    let writer_active = workspace_writer_active(Some(&effective_root_string));
+    let job_state = background_job.as_ref().map(|job| {
+        if job
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|pid| process_is_alive(pid as u32))
+        {
+            "refreshing"
+        } else {
+            "failed"
+        }
+    });
+    let background_state = if writer_active {
+        Some("refreshing")
+    } else {
+        job_state
+    };
     let dirty_overlay = dirty_overlay(&effective_root)?;
 
     if !store_path.exists() {
@@ -5916,6 +6295,11 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "store_exists": false,
             "root_path": effective_root,
             "store_path": store_path,
+            "store_format": store_format,
+            "store_bytes": store_bytes,
+            "background_job": background_job,
+            "background_state": background_state,
+            "embedding_complete": false,
             "project": project,
             "fresh": false,
             "freshness": null,
@@ -5992,6 +6376,44 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         })
     });
     let graph_generation = workspace.map(|w| w.graph_generation);
+    let current_embedding_rows = graph_generation
+        .and_then(|generation| {
+            store
+                .conn()
+                .query_row(
+                    "SELECT COUNT(*) FROM vector_embeddings WHERE project = ?1 AND graph_generation = ?2",
+                    (&project, generation as i64),
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok()
+        })
+        .unwrap_or(0);
+    let configured_embedding_model = embedding_config_optional(EmbeddingCliArgs {
+        model_dir: None,
+        gguf: None,
+        tokenizer: None,
+        model_id: None,
+        max_length: None,
+        device: None,
+        no_gpu: false,
+    })
+    .ok()
+    .flatten();
+    let embedding_complete = graph_generation.is_some_and(|generation| {
+        let Some(model) = configured_embedding_model.as_ref() else {
+            return false;
+        };
+        let key = embedding_complete_key(&project);
+        store
+            .conn()
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = ?1",
+                [&key],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            == Some(format!("{generation}|{}", model.model_id))
+    });
     // Robustness (problem dossier, systemic lesson 1&2): silent
     // under-indexing must be VISIBLE. Two independent-oracle checks:
     //   * coverage: compare the store's indexed file count against
@@ -6009,28 +6431,19 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         )),
         _ => None,
     };
-    let vectors_missing_with_model = {
-        let no_args = EmbeddingCliArgs {
-            model_dir: None,
-            gguf: None,
-            tokenizer: None,
-            model_id: None,
-            max_length: None,
-            device: None,
-            no_gpu: false,
-        };
-        matches!(embedding_config_optional(no_args), Ok(Some(_)))
-            && store
-                .vector_model_ids(&project)
-                .map(|v| v.is_empty())
-                .unwrap_or(false)
-    };
+    let vectors_missing_with_model = configured_embedding_model.is_some()
+        && store
+            .vector_model_ids(&project)
+            .map(|v| v.is_empty())
+            .unwrap_or(false);
     let healthy = diag.schema_current
         && diag.integrity_ok
         && project_present
         && fresh
+        && embedding_complete
         && incomplete_provider_count == 0
-        && coverage_warning.is_none();
+        && coverage_warning.is_none()
+        && background_state != Some("refreshing");
     let status_label = if healthy { "ok" } else { "unhealthy" };
 
     if json {
@@ -6041,6 +6454,12 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "store_exists": true,
             "root_path": effective_root,
             "store_path": store_path,
+            "store_format": store_format,
+            "store_bytes": store_bytes,
+            "background_job": background_job,
+            "background_state": background_state,
+            "embedding_complete": embedding_complete,
+            "current_embedding_rows": current_embedding_rows,
             "project": project,
             "fresh": fresh,
             "freshness": freshness,
@@ -6078,6 +6497,12 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         }
         println!("root: {}", effective_root.display());
         println!("store: {}", store_path.display());
+        println!("store_format: {}", store_format.unwrap_or(0));
+        println!("store_bytes: {store_bytes}");
+        println!("embedding_complete: {embedding_complete}");
+        if let Some(state) = background_state {
+            println!("background_job: {state}");
+        }
         println!("project: {project}");
         println!(
             "schema: {}/{} {}",
@@ -6133,6 +6558,28 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
     }
 
     Ok(if healthy { 0 } else { EXIT_IO as i32 })
+}
+
+fn cache_path_bytes(path: &std::path::Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if metadata.file_type().is_symlink() {
+        return 0;
+    }
+    if metadata.is_file() {
+        return metadata.len();
+    }
+    if !metadata.is_dir() {
+        return 0;
+    }
+    std::fs::read_dir(path)
+        .ok()
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| cache_path_bytes(&entry.path()))
+        .fold(0u64, u64::saturating_add)
 }
 
 /// `greppy who-calls S` — the callers of `S`: every node with an
@@ -7487,8 +7934,7 @@ fn dispatch_search_symbols(
         return Err(Error::Invalid("search-symbols requires a query".into()));
     }
     let project = project_for(root)?;
-    // D2 fail-open: refuse only when no usable index exists; a stale
-    // index serves labeled results (auto-healed first when small).
+    // Symbol rows are visible only from a freshness-proven snapshot.
     let decision = freshness_serve_decision(&store, root, &project);
     if let FreshnessServe::Refuse(freshness) = &decision {
         if json {
@@ -7506,7 +7952,7 @@ fn dispatch_search_symbols(
                 indexed_stale_skip_message("search-symbols", freshness)
             );
         }
-        return Ok(1);
+        return Ok(freshness_refusal_exit(freshness));
     }
     let freshness = decision.freshness().clone();
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
@@ -7673,40 +8119,19 @@ fn dispatch_search_code(
     // cwd basename. Index + search-code + semantic must agree on
     // this value so a search after an index hits the right rows.
     let project = project_for(root)?;
-    // D2 fail-open: refuse only when no usable index exists. A stale
-    // index is auto-healed when the drift is small; if it stays stale,
-    // text output prefers a LIVE grep (strictly fresher than stale
-    // indexed rows) while JSON keeps the indexed shape, honestly
-    // labeled `fresh: false`.
+    // A stale/unknown content index is never queried. Search-code has a
+    // correctness-preserving live filesystem backend, so both text and JSON
+    // use it while an atomic refresh runs.
     let decision = freshness_serve_decision(&store, root, &project);
     match &decision {
         FreshnessServe::Refuse(freshness) => {
-            if json {
-                search_code_json(
-                    &store,
-                    q,
-                    &project,
-                    "skipped_stale_index",
-                    Some(freshness),
-                    0,
-                    &[],
-                )?;
-                return Ok(1);
-            }
-            eprintln!(
-                "{}; falling back to live grep",
-                indexed_stale_skip_message("search-code", freshness)
-            );
-            return live_grep_search_code(q, root);
-        }
-        FreshnessServe::StaleLabeled(freshness) => {
             if !json {
                 eprintln!(
                     "{}; falling back to live grep",
                     indexed_stale_skip_message("search-code", freshness)
                 );
-                return live_grep_search_code(q, root);
             }
+            return live_grep_search_code(q, root, json, Some(freshness));
         }
         FreshnessServe::Fresh(_) => {}
     }
@@ -7733,7 +8158,7 @@ fn dispatch_search_code(
         // text patterns via grep, then enriches with the graph. greppy is a
         // grep wrapper, so this is free and keeps `search-code` working
         // without eager content-FTS.
-        return live_grep_search_code(q, root);
+        return live_grep_search_code(q, root, false, None);
     }
     for h in &hits {
         println!("{}  {}", h.location, clamp_snippet(&h.snippet));
@@ -8674,8 +9099,7 @@ fn dispatch_plus(
     let k = k.max(1);
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
-    // D2 fail-open: refuse only when no usable index exists; a stale
-    // index serves labeled results (auto-healed first when small).
+    // Combined search also refuses stale indexed lexical/graph/vector rows.
     let decision = freshness_serve_decision(&store, root, &project);
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
     let provider_complete = incomplete_providers.is_empty();
@@ -8715,7 +9139,7 @@ fn dispatch_plus(
                 root.unwrap_or(".")
             );
         }
-        return Ok(1);
+        return Ok(freshness_refusal_exit(freshness));
     }
     let freshness = decision.freshness().clone();
     if provider_policy_blocks_query(&incomplete_providers)? {
@@ -9082,7 +9506,12 @@ fn dispatch_plus(
 /// Live `grep -rnI` over the resolved repo root, used as the `search-code`
 /// fallback when the content-FTS index is empty. Output mirrors the FTS
 /// form (`relpath:line  snippet`) so an agent sees a consistent shape.
-fn live_grep_search_code(query: &str, root: Option<&str>) -> Result<i32> {
+fn live_grep_search_code(
+    query: &str,
+    root: Option<&str>,
+    json: bool,
+    index_freshness: Option<&serde_json::Value>,
+) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let out = std::process::Command::new("grep")
         .args(["-rnI", "--", query])
@@ -9099,20 +9528,49 @@ fn live_grep_search_code(query: &str, root: Option<&str>) -> Result<i32> {
         }
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut printed = 0usize;
+    let mut hits = Vec::new();
     for line in text.lines() {
-        if printed >= SEARCH_CODE_LIMIT {
-            break;
-        }
         if let Some(hit) = parse_grep_code_hit(line) {
-            println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
-            printed += 1;
+            hits.push(hit);
         }
     }
-    if printed == 0 {
+    let shown = hits.len().min(SEARCH_CODE_LIMIT);
+    if json {
+        let rows = hits[..shown]
+            .iter()
+            .map(|hit| {
+                serde_json::json!({
+                    "location": hit.location,
+                    "rank": hit.rank,
+                    "snippet": clamp_snippet(&hit.snippet).as_ref(),
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "command": "search-code",
+                "status": "live-fallback",
+                "backend": "live-filesystem",
+                "query": query,
+                "fresh": true,
+                "index_freshness": index_freshness,
+                "total_exact": hits.len(),
+                "shown": shown,
+                "omitted": hits.len().saturating_sub(shown),
+                "truncated": hits.len() > shown,
+                "hits": rows,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize live search-code JSON: {error}")))?
+        );
+    } else if shown == 0 {
         println!("(no matches)");
+    } else {
+        for hit in &hits[..shown] {
+            println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
+        }
     }
-    Ok(0)
+    Ok(if hits.is_empty() { 1 } else { 0 })
 }
 
 fn git_changed_files(root_path: &std::path::Path) -> Result<Vec<String>> {
@@ -9450,15 +9908,9 @@ fn dispatch_semantic(
 
     let store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
-    // D2 fail-open: refuse only when no usable index exists; a stale
-    // index serves labeled results (auto-healed first when small). The
-    // vector path keeps its own stricter stale check below (vector rows
-    // are generation-scoped, so stale-serving them is meaningless). It may
-    // self-heal via the inline auto-reindex ONLY when the embedding model
-    // is resolvable — the reindex then rebuilds the vectors for the new
-    // generation (auto_rebuild_vectors_inline). Without a resolvable model
-    // an inline reindex would bump the generation and orphan the very
-    // vectors it queries, so we keep the old skip behaviour.
+    // Stale/unknown snapshots are never served. Semantic search is always
+    // vector-backed on current main, so auto-refresh is allowed only when the
+    // embedding model can be rebuilt in the same atomic snapshot.
     let allow_reindex = vector_auto_reindex_can_rebuild(embedding_args);
     let decision =
         freshness_serve_decision_with_policy(&store, root, &project, allow_reindex, false);
@@ -9493,27 +9945,6 @@ fn dispatch_semantic(
         );
         let total = greppy_search::count_vector_search_scope(&store, &scope)?;
         let candidate_limit = vector_exact_candidate_limit()?;
-        if total == 0 {
-            if json {
-                semantic_vector_json(
-                    &store,
-                    &project,
-                    &cfg,
-                    generation,
-                    total,
-                    candidate_limit,
-                    Some(&freshness),
-                    "no_indexed_vectors",
-                    &[],
-                )?;
-            } else {
-                println!(
-                    "(no vector embeddings for model {}; run `grep index` first)",
-                    cfg.model_id
-                );
-            }
-            return Ok(1);
-        }
         if !freshness_json_is_fresh(&freshness) {
             if json {
                 semantic_vector_json(
@@ -9533,7 +9964,28 @@ fn dispatch_semantic(
                     vector_stale_skip_message("semantic-search", &freshness)
                 );
             }
-            return Ok(1);
+            return Ok(freshness_refusal_exit(&freshness));
+        }
+        if total == 0 {
+            if json {
+                semantic_vector_json(
+                    &store,
+                    &project,
+                    &cfg,
+                    generation,
+                    total,
+                    candidate_limit,
+                    Some(&freshness),
+                    "no_indexed_vectors",
+                    &[],
+                )?;
+            } else {
+                println!(
+                    "(no vector embeddings for model {}; run `grep index` first)",
+                    cfg.model_id
+                );
+            }
+            return Ok(freshness_refusal_exit(&freshness));
         }
         if let Some(limit) = vector_exact_scan_exceeds_limit(total, candidate_limit) {
             if json {
@@ -10147,11 +10599,8 @@ fn dispatch_context(
     let k = k.max(1);
     let project = project_for(root)?;
     let span_root = resolve_root(root)?;
-    // D2 fail-open: refuse only when no usable index exists; a stale
-    // index serves labeled results (auto-healed first when small).
-    // Span bodies are read from the CURRENT files on disk, so even
-    // labeled-stale context output never shows outdated code — at worst
-    // a stale line number drifts, which read_span skips gracefully.
+    // Context also refuses stale/unknown graph locations. It never combines
+    // an old indexed line number with current source text.
     let decision = freshness_serve_decision(&store, root, &project);
     let incomplete_providers = incomplete_provider_json(&store, &project)?;
     if let FreshnessServe::Refuse(freshness) = &decision {
@@ -10169,7 +10618,7 @@ fn dispatch_context(
         } else {
             println!("{}", context_stale_skip_message(freshness));
         }
-        return Ok(1);
+        return Ok(freshness_refusal_exit(freshness));
     }
     let freshness = decision.freshness().clone();
     if provider_policy_blocks_query(&incomplete_providers)? {
@@ -10435,7 +10884,7 @@ fn context_vector_fallback(
         Some(generation),
         fetch,
     );
-    let mut total = greppy_search::count_vector_search_scope(store, &scope)?;
+    let total = greppy_search::count_vector_search_scope(store, &scope)?;
     if total == 0 {
         // P2 (problem dossier): a resolvable model with a vector-less store
         // used to degrade to lexical/FTS SILENTLY — the agent got junk
@@ -10448,40 +10897,15 @@ fn context_vector_fallback(
              use, model {}) — subsequent queries are instant.",
             cfg.model_id
         );
-        // P11: a large project's first embedding build takes minutes and
-        // used to BLOCK this call. Only build inline when the graph is
-        // small enough to finish quickly; otherwise kick off a detached
-        // background build and answer THIS query from lexical/FTS now, so
-        // the agent never waits. The next query finds the vectors ready.
-        if project_is_small_enough_for_inline_embed(store, project) {
-            if build_vectors_first_use(&cfg, root, project, generation) {
-                total = greppy_search::count_vector_search_scope(store, &scope)?;
-            }
-        } else {
-            spawn_background_embed(root);
-            eprintln!(
-                "context: this project is large — building the semantic index \
-                 in the background; answering from lexical results for now. \
-                 Retry in a moment for semantic results."
-            );
-            return Ok(None);
-        }
-        if total == 0 {
-            eprintln!(
-                "context: no indexed vectors for model {} (run `grep index`); \
-                 skipping vector fallback.",
-                cfg.model_id
-            );
-            return Ok(None);
-        }
-        // The freshly built vectors carry the current generation; re-derive
-        // the scope so the freshness/generation filters line up.
-        scope = greppy_search::embeddinggemma_code_retrieval_scope(
-            project,
-            &cfg.model_id,
-            Some(current_graph_generation(store, root)?),
-            fetch,
+        // First-use embeddings use the same atomic writer/snapshot path as a
+        // normal index. Never mutate the graph DB already opened by this query.
+        spawn_background_embed(root);
+        eprintln!(
+            "context: building the semantic index in the background through an \
+             atomic snapshot; answering from lexical results for now. Retry in \
+             a moment for semantic results."
         );
+        return Ok(None);
     }
     if !freshness_json_is_fresh(freshness) {
         eprintln!(
@@ -11096,12 +11520,10 @@ fn context_json(
 /// `greppy_core::workspace::project_identity` recognises so that the
 /// store path (hashed from the resolved root) and the project name
 /// (derived from the same root) always agree (RV-006 / RV-011).
-const ROOT_MARKERS: [&str; 3] = [".git", "Cargo.toml", "pyproject.toml"];
-
 /// Resolve the effective workspace root for a command.
 ///
-/// * If `--root <PATH>` was given, use it verbatim (the user is
-///   explicit).
+/// * If `--root <PATH>` was given, canonicalize it and resolve its enclosing
+///   Git worktree/project root through the shared core resolver.
 /// * Otherwise start at the current directory and walk **up** until a
 ///   repo marker (`.git`, `Cargo.toml`, `pyproject.toml`) is found,
 ///   returning that directory.
@@ -11122,11 +11544,12 @@ fn resolve_root(root: Option<&str>) -> Result<std::path::PathBuf> {
         // canonicalized root — later lookups then failed with "no
         // workspace_state". Normalize to the canonical absolute path so
         // every spelling of the same directory is one workspace.
-        return Ok(absolutize_path(std::path::Path::new(r)));
+        let explicit = absolutize_path(std::path::Path::new(r));
+        return Ok(workspace_locator::resolve_workspace_root(&explicit));
     }
     let cwd = std::env::current_dir()
         .map_err(|e| Error::io("read current_dir for root resolution", e))?;
-    Ok(find_repo_root(&cwd))
+    Ok(workspace_locator::resolve_workspace_root(&cwd))
 }
 
 /// Canonicalize when the path exists; otherwise make it absolute
@@ -11143,16 +11566,7 @@ fn absolutize_path(p: &std::path::Path) -> std::path::PathBuf {
 /// itself when none is found. Pure path logic so it is unit-testable
 /// without touching the process cwd.
 fn find_repo_root(start: &std::path::Path) -> std::path::PathBuf {
-    let mut cur: &std::path::Path = start;
-    loop {
-        if ROOT_MARKERS.iter().any(|m| cur.join(m).exists()) {
-            return cur.to_path_buf();
-        }
-        match cur.parent() {
-            Some(p) if p != cur => cur = p,
-            _ => return start.to_path_buf(),
-        }
-    }
+    workspace_locator::resolve_workspace_root(start)
 }
 
 /// Compute the project identity string for the effective root
@@ -11228,9 +11642,7 @@ mod embeddinggemma_assets {
         static GGUF: &[u8] =
             include_bytes!(concat!(env!("OUT_DIR"), "/embeddinggemma-300M-Q4_K.gguf"));
         static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer.json"));
-        let root = greppy_core::workspace::store_cache_root()?
-            .join("models")
-            .join("embeddinggemma-300m-q4k");
+        let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
         let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
         let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
         Some((gguf, tok))
@@ -11242,14 +11654,21 @@ mod embeddinggemma_assets {
         name: &str,
         bytes: &[u8],
     ) -> Option<String> {
-        let root = root.join(expected_sha);
+        let model = root.file_name()?.to_str()?.to_owned();
+        let _lease = greppy_core::cache::acquire_model_lifecycle(
+            expected_sha,
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .ok()??;
+        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
         let dest = root.join(name);
         let marker = root.join(format!("{name}.sha256"));
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            greppy_core::cache::touch_last_used_dir(&root);
             return Some(dest.to_string_lossy().into_owned());
         }
 
-        std::fs::create_dir_all(&root).ok()?;
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
             return Some(dest.to_string_lossy().into_owned());
         }
@@ -11270,6 +11689,7 @@ mod embeddinggemma_assets {
         }
 
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            greppy_core::cache::touch_last_used_dir(&root);
             Some(dest.to_string_lossy().into_owned())
         } else {
             None
@@ -11339,9 +11759,7 @@ mod qwen35_assets {
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
         static GGUF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Qwen3.5-0.8B-Q4_K_M.gguf"));
         static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35-tokenizer.json"));
-        let root = greppy_core::workspace::store_cache_root()?
-            .join("models")
-            .join("qwen35-0.8b-q4km");
+        let root = greppy_core::cache::models_root().join("qwen35-0.8b-q4km");
         let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-Q4_K_M.gguf", GGUF)?;
         let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
         Some((gguf, tok))
@@ -11353,14 +11771,21 @@ mod qwen35_assets {
         name: &str,
         bytes: &[u8],
     ) -> Option<String> {
-        let root = root.join(expected_sha);
+        let model = root.file_name()?.to_str()?.to_owned();
+        let _lease = greppy_core::cache::acquire_model_lifecycle(
+            expected_sha,
+            greppy_core::cache::LockMode::Exclusive,
+            false,
+        )
+        .ok()??;
+        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
         let dest = root.join(name);
         let marker = root.join(format!("{name}.sha256"));
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            greppy_core::cache::touch_last_used_dir(&root);
             return Some(dest.to_string_lossy().into_owned());
         }
 
-        std::fs::create_dir_all(&root).ok()?;
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
             return Some(dest.to_string_lossy().into_owned());
         }
@@ -11380,6 +11805,7 @@ mod qwen35_assets {
         }
 
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            greppy_core::cache::touch_last_used_dir(&root);
             Some(dest.to_string_lossy().into_owned())
         } else {
             None
@@ -11460,39 +11886,42 @@ fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePrefer
     greppy_qwen35_native::DevicePreference::parse(&raw).map_err(|e| Error::Invalid(e.to_string()))
 }
 
-fn load_qwen35_summarizer(
-    cfg: &QwenSummaryConfig,
-) -> Result<greppy_qwen35_native::Qwen35Summarizer> {
+struct LoadedQwen35Summarizer {
+    inner: greppy_qwen35_native::Qwen35Summarizer,
+    _model_lease: Option<greppy_core::cache::FileLock>,
+}
+
+impl std::ops::Deref for LoadedQwen35Summarizer {
+    type Target = greppy_qwen35_native::Qwen35Summarizer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summarizer> {
+    let lease = acquire_cached_model_lease(&cfg.gguf)?;
     let options = greppy_qwen35_native::LoadOptions {
         device: cfg.device.clone(),
     };
-    greppy_qwen35_native::Qwen35Summarizer::load_gguf(&cfg.gguf, &cfg.tokenizer, options)
-        .map_err(|e| Error::Store(format!("load Qwen3.5 summarizer {}: {e}", cfg.model_id)))
+    let inner =
+        greppy_qwen35_native::Qwen35Summarizer::load_gguf(&cfg.gguf, &cfg.tokenizer, options)
+            .map_err(|e| Error::Store(format!("load Qwen3.5 summarizer {}: {e}", cfg.model_id)))?;
+    Ok(LoadedQwen35Summarizer {
+        inner,
+        _model_lease: lease,
+    })
 }
 
 fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
-    fn file_fp(path: &std::path::Path) -> String {
-        match std::fs::metadata(path) {
-            Ok(meta) => {
-                let mtime_ns = meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                format!("{}:{}:{}", path.display(), meta.len(), mtime_ns)
-            }
-            Err(_) => format!("{}:unknown", path.display()),
-        }
-    }
     format!(
         "{}:{}:{}:{}:{}:{}",
         cfg.model_id,
         greppy_qwen35_native::PROMPT_VERSION,
         greppy_qwen35_native::TRIAGE_PROMPT_VERSION,
         cfg.device.as_str(),
-        file_fp(&cfg.gguf),
-        file_fp(&cfg.tokenizer)
+        model_file_digest(&cfg.gguf).unwrap_or_else(|_| "unknown".into()),
+        model_file_digest(&cfg.tokenizer).unwrap_or_else(|_| "unknown".into())
     )
 }
 
@@ -11555,12 +11984,38 @@ fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingMode
             }
         }
     };
+    let source_digest = embedding_source_content_digest(&source)?;
     Ok(EmbeddingModelConfig {
-        model_id,
+        model_id: format!("{model_id}@sha256:{source_digest}"),
         source,
         max_length,
         device,
     })
+}
+
+fn embedding_source_content_digest(source: &EmbeddingModelSource) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let paths = match source {
+        EmbeddingModelSource::SafetensorsDir(dir) => vec![
+            dir.join("model.safetensors"),
+            dir.join("config.json"),
+            dir.join("tokenizer.json"),
+        ],
+        EmbeddingModelSource::Gguf { gguf, tokenizer } => {
+            vec![gguf.clone(), tokenizer.clone()]
+        }
+    };
+    let mut combined = Sha256::new();
+    for path in paths {
+        let digest = model_file_digest(&path)
+            .map_err(|error| Error::io(format!("digest model file {}", path.display()), error))?;
+        combined.update(path.file_name().unwrap_or_default().as_encoded_bytes());
+        combined.update([0]);
+        combined.update(digest.as_bytes());
+        combined.update([0]);
+    }
+    Ok(format!("{:x}", combined.finalize()))
 }
 
 fn embedding_device_preference(
@@ -11584,44 +12039,51 @@ fn embedding_device_preference(
 /// per-workspace store dir, honoring `GREPPY_STORE_DIR`) enables the
 /// tokenizer fast-load sidecar for GGUF models, cutting warm model-load
 /// latency roughly in half; pass `None` to force a full parse.
+struct LoadedEmbeddingModel {
+    inner: greppy_embed_native::EmbeddingGemma,
+    _model_lease: Option<greppy_core::cache::FileLock>,
+}
+
+impl std::ops::Deref for LoadedEmbeddingModel {
+    type Target = greppy_embed_native::EmbeddingGemma;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 fn load_embedding_model(
     cfg: &EmbeddingModelConfig,
     tokenizer_cache_dir: Option<std::path::PathBuf>,
-) -> Result<greppy_embed_native::EmbeddingGemma> {
+) -> Result<LoadedEmbeddingModel> {
     let options = greppy_embed_native::LoadOptions {
         device: cfg.device.clone(),
         max_length: cfg.max_length,
         tokenizer_cache_dir,
     };
-    match &cfg.source {
+    let (inner, lease) = match &cfg.source {
         EmbeddingModelSource::SafetensorsDir(_) => Err(greppy_embed_native::Error::InvalidGguf(
             "native EmbeddingGemma supports GGUF + tokenizer.json only; configure --embedding-gguf with --embedding-tokenizer".into(),
         )),
         EmbeddingModelSource::Gguf { gguf, tokenizer } => {
+            let lease = acquire_cached_model_lease(gguf)?;
             greppy_embed_native::EmbeddingGemma::load_gguf(gguf, tokenizer, options)
+                .map(|model| (model, lease))
         }
     }
-    .map_err(|e| Error::Store(format!("load EmbeddingGemma model {}: {e}", cfg.model_id)))
+    .map_err(|e| Error::Store(format!("load EmbeddingGemma model {}: {e}", cfg.model_id)))?;
+    Ok(LoadedEmbeddingModel {
+        inner,
+        _model_lease: lease,
+    })
 }
 
-/// Cache key for query embeddings: logical model id + prompt/task
-/// contract + a (len, mtime) fingerprint of the model source files, so
-/// swapping the GGUF/tokenizer/safetensors invalidates cached vectors
-/// even when the logical model id stays the same.
+/// Cache key for query embeddings: logical model id + prompt/task contract +
+/// content digests. A same-size/same-mtime model replacement cannot reuse a
+/// vector computed by different weights.
 fn embedding_query_cache_key(cfg: &EmbeddingModelConfig) -> String {
     fn file_fp(path: &std::path::Path) -> String {
-        match std::fs::metadata(path) {
-            Ok(meta) => {
-                let mtime_ns = meta
-                    .modified()
-                    .ok()
-                    .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                format!("{}:{}:{}", path.display(), meta.len(), mtime_ns)
-            }
-            Err(_) => format!("{}:unknown", path.display()),
-        }
+        model_file_digest(path).unwrap_or_else(|_| format!("{}:unknown", path.display()))
     }
     let source_fp = match &cfg.source {
         EmbeddingModelSource::SafetensorsDir(dir) => {
@@ -11638,6 +12100,51 @@ fn embedding_query_cache_key(cfg: &EmbeddingModelConfig) -> String {
         greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
         source_fp
     )
+}
+
+fn cached_model_digest(path: &std::path::Path) -> Option<String> {
+    if !path.starts_with(greppy_core::cache::models_root()) {
+        return None;
+    }
+    let digest = path.parent()?.file_name()?.to_str()?;
+    (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| digest.to_ascii_lowercase())
+}
+
+fn acquire_cached_model_lease(
+    path: &std::path::Path,
+) -> Result<Option<greppy_core::cache::FileLock>> {
+    let Some(digest) = cached_model_digest(path) else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        greppy_core::cache::touch_last_used_dir(parent);
+    }
+    greppy_core::cache::acquire_model_lifecycle(
+        &digest,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .map_err(|e| Error::io(format!("acquire model lease for {}", path.display()), e))
+}
+
+fn model_file_digest(path: &std::path::Path) -> std::io::Result<String> {
+    if let Some(digest) = cached_model_digest(path) {
+        return Ok(digest);
+    }
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Embed a code-retrieval query, consulting the store-level query cache
@@ -11938,16 +12445,8 @@ fn open_default_store_query_writer(root: Option<&str>) -> Result<greppy_store::S
     Ok(store)
 }
 
-/// Feature A helper — build a fresh GRAPH index (no embeddings) for the
-/// workspace at `root` on an empty/absent store, holding the writer
-/// lock. Returns true when the index was written cleanly.
-///
-/// This reuses the same inline-index machinery as
-/// [`try_auto_reindex_inline`]: it opens (creating) the store at the
-/// workspace's `store_path` and runs `greppy_indexer::index_with_options`,
-/// which builds the graph without touching embeddings. Any failure (lock
-/// contention, read-only store dir, indexer error) reports false so the
-/// caller degrades to the actionable "run `grep index`" diagnostic.
+/// First-use indexing goes through the same all-or-nothing graph + embedding
+/// snapshot path as an explicit index command.
 fn try_auto_index_inline(root: Option<&str>) -> bool {
     let Ok(effective_root) = resolve_root(root) else {
         return false;
@@ -11959,31 +12458,54 @@ fn try_auto_index_inline(root: Option<&str>) -> bool {
         return false;
     };
     let store_path = workspace_locator::store_path(&effective_root);
-    // Ensure the store dir exists (0700) before we try to create the DB.
-    if let Some(parent) = store_path.parent() {
-        if workspace_locator::ensure_store_dir(parent).is_err() {
-            return false;
-        }
+    // Create the versioned store namespace and its ownership manifest before
+    // opening the DB. GC will never manage a directory without this manifest.
+    if greppy_core::cache::ensure_workspace_store(&effective_root).is_err() {
+        return false;
     }
-    let _lock = match greppy_freshness::try_acquire(&store_path) {
-        Ok(LockOutcome::Acquired | LockOutcome::AcquiredFromStale) => {
-            greppy_freshness::Lock::new(greppy_freshness::lock_path_for(&store_path))
-        }
-        _ => return false, // another writer is active
-    };
-    // A concurrent invocation may have built the index while we waited
-    // for the lock — if the DB now exists, treat that as success.
-    let Ok(mut store) = greppy_store::Store::open(&store_path) else {
+    let Ok(Some(_lifecycle)) = greppy_core::cache::acquire_workspace_lifecycle(
+        &effective_root,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    ) else {
         return false;
     };
-    let _ = workspace_locator::ensure_db_mode(&store_path);
+    let _lock = match greppy_freshness::try_acquire(&store_path) {
+        Ok(lock) => lock,
+        _ => return false, // another writer is active
+    };
+    if store_path.exists() {
+        return true;
+    }
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
     };
-    match greppy_indexer::index_with_options(&mut store, &effective_root, &project, &options) {
-        Ok(report) => report.is_clean(),
-        Err(_) => false,
-    }
+    let embedding_cfg = if test_inference_skipped() {
+        None
+    } else {
+        let args = EmbeddingCliArgs {
+            model_dir: None,
+            gguf: None,
+            tokenizer: None,
+            model_id: None,
+            max_length: None,
+            device: None,
+            no_gpu: false,
+        };
+        match embedding_config_optional(args) {
+            Ok(value) => value,
+            Err(_) => return false,
+        }
+    };
+    index_atomic_snapshot(
+        &store_path,
+        &effective_root,
+        &project,
+        embedding_cfg.as_ref(),
+        &options,
+    )
+    .map(|snapshot| snapshot.index.is_clean())
+    .unwrap_or(false)
 }
 
 fn dispatch_grep(argv: &[String]) -> Result<i32> {
@@ -12048,6 +12570,7 @@ fn dispatch_index(
     root: Option<&str>,
     embedding_args: EmbeddingCliArgs<'_>,
 ) -> Result<i32> {
+    let mut background_job = BackgroundJobGuard::from_env();
     // RV-006: `--root` overrides the indexed target. When both are
     // given we still walk `path` (the user's workspace) but key the
     // store under the canonical `root` so the indexer and the
@@ -12071,7 +12594,10 @@ fn dispatch_index(
     // <subdir>` and a later `greppy search-code` from anywhere in the
     // same repo open the same store and use the same project name.
     let effective_root = match root {
-        Some(r) => absolutize_path(std::path::Path::new(r)),
+        Some(r) => {
+            let explicit = absolutize_path(std::path::Path::new(r));
+            workspace_locator::resolve_workspace_root(&explicit)
+        }
         None => find_repo_root(&target),
     };
     let project = workspace_locator::project_identity(&effective_root);
@@ -12082,39 +12608,34 @@ fn dispatch_index(
 
     // Open the on-disk store under the workspace locator's path
     // never at `<root>/.greppy/graph.db` (which would
-    // pollute `grep -R .`). Default is `$XDG_CACHE_HOME/greppy/<ws-hash>/graph.db`
-    // on Linux, `~/Library/Caches/greppy/<ws-hash>/graph.db` on macOS;
-    // overridable via `GREPPY_STORE_DIR`.
+    // pollute `grep -R .`). The versioned platform data directory is used on
+    // Linux/macOS and can be overridden via `GREPPY_STORE_DIR`.
     let store_path = workspace_locator::store_path(&effective_root);
-    if let Some(parent) = store_path.parent() {
-        workspace_locator::ensure_store_dir(parent)
-            .map_err(|e| Error::io(format!("create store dir {}", parent.display()), e))?;
-    }
+    greppy_core::cache::ensure_workspace_store(&effective_root).map_err(|e| {
+        Error::io(
+            format!("create workspace store for {}", effective_root.display()),
+            e,
+        )
+    })?;
+    let _lifecycle = greppy_core::cache::acquire_workspace_lifecycle(
+        &effective_root,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .map_err(|error| Error::io("acquire index lifecycle lease", error))?
+    .ok_or_else(|| Error::Lock("blocking lifecycle lease returned no guard".into()))?;
     // Acquire the crash-safe
     // advisory lock BEFORE opening/migrating the store. Opening first lets a
     // concurrent indexer hit a SQLite busy error inside Store::open and exit
     // EXIT_IO (73) silently, instead of the documented EX_TEMPFAIL (75) with a
     // diagnostic on contention. Concurrent indexers on the same path get
-    // `LockError::Held`; a crashed prior holder's lock is taken over via the
-    // stale-recovery path. The lock file path is derived inside `try_acquire`
-    // from `target` (i.e. `<store_path>.lock`); the RAII handle must wrap the
-    // SAME path the lock was created on and must outlive the store mutation.
+    // `LockError::Held`; a crashed prior holder is released by the OS. The
+    // guard must outlive the complete snapshot build + publish operation.
     let _lock = match greppy_freshness::try_acquire(&store_path) {
-        Ok(LockOutcome::Acquired | LockOutcome::AcquiredFromStale) => Some(
-            greppy_freshness::Lock::new(greppy_freshness::lock_path_for(&store_path)),
-        ),
-        Ok(LockOutcome::Contended) => {
+        Ok(lock) => Some(lock),
+        Err(greppy_freshness::LockError::Held { .. }) => {
             eprintln!(
                 "grep: another indexer is running against {}",
-                store_path.display()
-            );
-            return Ok(EXIT_TEMPFAIL as i32);
-        }
-        Err(greppy_freshness::LockError::Held { pid, age_secs, .. }) => {
-            eprintln!(
-                "grep: lock held by another writer (pid {:?}, age {:?}s) on {}",
-                pid,
-                age_secs,
                 store_path.display()
             );
             return Ok(EXIT_TEMPFAIL as i32);
@@ -12128,13 +12649,19 @@ fn dispatch_index(
     // supports in-place incremental updates for library tests; the CLI path is
     // the production publication boundary, so it must never expose a half-built
     // graph.db to query commands.
-    let snapshot = index_atomic_snapshot(
+    let snapshot = match index_atomic_snapshot(
         &store_path,
         &target,
         &project,
         embedding_config.as_ref(),
         &index_options,
-    )?;
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            background_job.fail(&error);
+            return Err(error);
+        }
+    };
     let report = &snapshot.index;
 
     println!(
@@ -12148,13 +12675,17 @@ fn dispatch_index(
         report.nodes_extracted,
         report.graph_generation
     );
-    if !report.is_clean() {
+    if !report.is_clean()
+        || report.files_skipped_by_file_limit > 0
+        || report.files_skipped_by_time_budget > 0
+    {
         return Ok(EXIT_IO as i32);
     }
     if let Some(embedding_report) = &snapshot.embeddings {
         println!(
-            "embedded {} code spans ({} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} stale pruned)",
+            "embedded {} code spans ({} reused, {} considered, {} non-definition skipped, {} missing-file, {} invalid-span, {} oversize, {} stale pruned)",
             embedding_report.nodes_embedded,
+            embedding_report.nodes_reused,
             embedding_report.nodes_considered,
             embedding_report.nodes_skipped_non_definition,
             embedding_report.nodes_skipped_missing_file,
@@ -12170,7 +12701,288 @@ fn dispatch_index(
             ENV_DISCOVER_INCLUDE, ENV_DISCOVER_EXCLUDE
         );
     }
+    retire_verified_legacy_store(&effective_root);
+    background_job.complete();
     Ok(0)
+}
+
+fn retire_verified_legacy_store(root: &std::path::Path) {
+    let legacy = greppy_core::cache::legacy_workspace_store_dir(root);
+    let graph = legacy.join("graph.db");
+    let Ok(metadata) = std::fs::symlink_metadata(&legacy) else {
+        return;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return;
+    }
+    if legacy_indexer_alive(&graph) {
+        return;
+    }
+    let mut header = [0u8; 16];
+    let Ok(mut file) = std::fs::File::open(&graph) else {
+        return;
+    };
+    if std::io::Read::read_exact(&mut file, &mut header).is_err() || &header != b"SQLite format 3\0"
+    {
+        return;
+    }
+    let Ok(store) = greppy_store::Store::open_with(&graph, greppy_store::OpenOptions::read_only())
+    else {
+        return;
+    };
+    let schema_valid = store
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some();
+    let expected_hash = greppy_core::workspace::workspace_hash(root);
+    let workspace_valid = store
+        .conn()
+        .query_row(
+            "SELECT root_path FROM workspace_state ORDER BY updated_at DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .is_some_and(|stored_root| {
+            greppy_core::workspace::workspace_hash(std::path::Path::new(&stored_root))
+                == expected_hash
+        });
+    drop(store);
+    if !schema_valid || !workspace_valid {
+        return;
+    }
+    let trash = greppy_core::cache::trash_root().join(format!(
+        "legacy-{}-{}-{}",
+        greppy_core::workspace::workspace_hash(root),
+        std::process::id(),
+        unix_now_secs_cli()
+    ));
+    if std::fs::create_dir_all(greppy_core::cache::trash_root()).is_ok()
+        && std::fs::rename(&legacy, &trash).is_ok()
+    {
+        let _ = std::fs::remove_dir_all(trash);
+    }
+}
+
+fn legacy_indexer_alive(graph: &std::path::Path) -> bool {
+    let mut lock_name = graph.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let Ok(raw) = std::fs::read_to_string(std::path::PathBuf::from(lock_name)) else {
+        return false;
+    };
+    raw.split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse::<u32>().ok())
+        .is_some_and(process_is_alive)
+}
+
+#[derive(Debug, Clone)]
+struct LegacyCacheEntry {
+    path: std::path::PathBuf,
+    root: std::path::PathBuf,
+    bytes: u64,
+    last_used_unix_secs: u64,
+    locked: bool,
+}
+
+fn verified_legacy_cache_entries() -> Vec<LegacyCacheEntry> {
+    let data = greppy_core::cache::data_root();
+    let Ok(entries) = std::fs::read_dir(&data) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(hash) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if hash.len() != 16 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let graph = path.join("graph.db");
+        if !sqlite_header_is_valid(&graph) {
+            continue;
+        }
+        let Ok(connection) = rusqlite::Connection::open_with_flags(
+            &graph,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            continue;
+        };
+        let schema_valid = connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some();
+        let root = connection
+            .query_row(
+                "SELECT root_path FROM workspace_state ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .map(std::path::PathBuf::from);
+        let Some(root) = root.filter(|root| {
+            greppy_core::workspace::workspace_hash(root).eq_ignore_ascii_case(&hash)
+        }) else {
+            continue;
+        };
+        if !schema_valid {
+            continue;
+        }
+        let last_used_unix_secs = read_last_used_unix_secs(&path);
+        out.push(LegacyCacheEntry {
+            bytes: cache_path_bytes(&path),
+            locked: legacy_indexer_alive(&graph),
+            path,
+            root,
+            last_used_unix_secs,
+        });
+    }
+    out.sort_by_key(|entry| entry.last_used_unix_secs);
+    out
+}
+
+fn cleanup_expired_legacy_entries(current: Option<&std::path::Path>, ttl: std::time::Duration) {
+    if ttl.is_zero() {
+        return;
+    }
+    let now = unix_now_secs_cli();
+    for entry in verified_legacy_cache_entries() {
+        if current == Some(entry.root.as_path()) || entry.locked {
+            continue;
+        }
+        if now.saturating_sub(entry.last_used_unix_secs) > ttl.as_secs() {
+            let _ = remove_verified_legacy_entry(&entry);
+        }
+    }
+}
+
+/// Resume only legacy trash entries whose name, SQLite header, schema and
+/// workspace hash all prove that Greppy created them. Unknown trash is left
+/// untouched and remains visible as unmanaged cache data.
+fn cleanup_verified_legacy_trash() {
+    let Ok(entries) = std::fs::read_dir(greppy_core::cache::trash_root()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix("legacy-") else {
+            continue;
+        };
+        let Some(hash) = rest.get(..16) else {
+            continue;
+        };
+        if !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || rest.as_bytes().get(16) != Some(&b'-')
+        {
+            continue;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            continue;
+        }
+        let graph = path.join("graph.db");
+        if !sqlite_header_is_valid(&graph) {
+            continue;
+        }
+        let Ok(connection) = rusqlite::Connection::open_with_flags(
+            &graph,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) else {
+            continue;
+        };
+        let schema_valid = connection
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_some();
+        let workspace_valid = connection
+            .query_row(
+                "SELECT root_path FROM workspace_state ORDER BY updated_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .is_some_and(|root| {
+                greppy_core::workspace::workspace_hash(std::path::Path::new(&root))
+                    .eq_ignore_ascii_case(hash)
+            });
+        drop(connection);
+        if schema_valid && workspace_valid {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+fn sqlite_header_is_valid(path: &std::path::Path) -> bool {
+    let mut header = [0u8; 16];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    std::io::Read::read_exact(&mut file, &mut header).is_ok() && &header == b"SQLite format 3\0"
+}
+
+fn read_last_used_unix_secs(dir: &std::path::Path) -> u64 {
+    let marker = dir.join(".lastused");
+    std::fs::read_to_string(&marker)
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .or_else(|| {
+            std::fs::metadata(&marker)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_secs())
+        })
+        .or_else(|| {
+            std::fs::metadata(dir)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_secs())
+        })
+        .unwrap_or(0)
+}
+
+fn remove_verified_legacy_entry(entry: &LegacyCacheEntry) -> bool {
+    if entry.locked {
+        return false;
+    }
+    let trash = greppy_core::cache::trash_root().join(format!(
+        "legacy-{}-{}-{}",
+        greppy_core::workspace::workspace_hash(&entry.root),
+        std::process::id(),
+        unix_now_secs_cli()
+    ));
+    std::fs::create_dir_all(greppy_core::cache::trash_root()).is_ok()
+        && std::fs::rename(&entry.path, &trash).is_ok()
+        && std::fs::remove_dir_all(trash).is_ok()
 }
 
 struct IndexSnapshotReport {
@@ -12185,7 +12997,33 @@ fn index_atomic_snapshot(
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
 ) -> Result<IndexSnapshotReport> {
-    cleanup_stale_next_snapshots(active_path)?;
+    for attempt in 0..2 {
+        if let Some(report) = index_atomic_snapshot_attempt(
+            active_path,
+            target,
+            project,
+            embedding_config,
+            index_options,
+        )? {
+            return Ok(report);
+        }
+        if attempt == 0 {
+            eprintln!("grep: workspace changed during indexing; rebuilding snapshot once");
+        }
+    }
+    Err(Error::Store(
+        "workspace kept changing during indexing; snapshot was not published".into(),
+    ))
+}
+
+fn index_atomic_snapshot_attempt(
+    active_path: &std::path::Path,
+    target: &std::path::Path,
+    project: &str,
+    embedding_config: Option<&EmbeddingModelConfig>,
+    index_options: &greppy_indexer::IndexOptions,
+) -> Result<Option<IndexSnapshotReport>> {
+    cleanup_stale_snapshot_artifacts(active_path, true)?;
     let temp_path = unique_store_sibling(active_path, "next");
     cleanup_sqlite_family(&temp_path)?;
     seed_temp_store_from_active_if_usable(active_path, &temp_path)?;
@@ -12208,13 +13046,16 @@ fn index_atomic_snapshot(
             }
         };
 
-    if !report.is_clean() {
+    if !report.is_clean()
+        || report.files_skipped_by_file_limit > 0
+        || report.files_skipped_by_time_budget > 0
+    {
         drop(temp_store);
         cleanup_sqlite_family(&temp_path)?;
-        return Ok(IndexSnapshotReport {
+        return Ok(Some(IndexSnapshotReport {
             index: report,
             embeddings: None,
-        });
+        }));
     }
 
     let embedding_report = if let Some(cfg) = embedding_config {
@@ -12246,13 +13087,35 @@ fn index_atomic_snapshot(
     })?;
     drop(temp_store);
     cleanup_sqlite_sidecars(&temp_path)?;
+    sync_file(&temp_path)?;
+    sync_parent_dir(&temp_path)?;
     maybe_index_test_failpoint("after-temp-before-publish", &temp_path)?;
 
+    let verify_store =
+        greppy_store::Store::open_with(&temp_path, greppy_store::OpenOptions::read_only())?;
+    let verification = greppy_freshness::check_files_report_with_ttl(
+        &verify_store,
+        target,
+        project,
+        std::time::Duration::from_secs(300),
+        &index_options.discover_overrides,
+        std::time::Duration::ZERO,
+    )?;
+    drop(verify_store);
+    if !matches!(
+        verification.state.outcome,
+        greppy_freshness::FreshnessOutcome::Fresh
+    ) {
+        cleanup_sqlite_family(&temp_path)?;
+        return Ok(None);
+    }
+
     publish_store_snapshot(&temp_path, active_path)?;
-    Ok(IndexSnapshotReport {
+    cleanup_stale_snapshot_artifacts(active_path, true)?;
+    Ok(Some(IndexSnapshotReport {
         index: report,
         embeddings: embedding_report,
-    })
+    }))
 }
 
 fn index_embeddings_into_temp_store(
@@ -12266,18 +13129,34 @@ fn index_embeddings_into_temp_store(
     let model = match load_embedding_model(cfg, tokenizer_cache_dir) {
         Ok(model) => model,
         Err(e) => {
-            log_embedding_skip_once("index", &e);
-            return Ok(greppy_indexer::EmbeddingIndexReport::default());
+            log_embedding_skip_once("index --embeddings", &e);
+            return Err(Error::Store(format!(
+                "embedding model load failed; snapshot is incomplete: {e}"
+            )));
         }
     };
     let mut provider = greppy_indexer::EmbeddingGemmaCodeProvider::new(&cfg.model_id, &model);
-    greppy_indexer::index_code_embeddings_for_project(
+    let embedding_report = greppy_indexer::index_code_embeddings_for_project(
         store,
         target,
         project,
         &mut provider,
         greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation),
-    )
+    )?;
+    let key = embedding_complete_key(project);
+    store
+        .conn()
+        .execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            rusqlite::params![key, format!("{}|{}", report.graph_generation, cfg.model_id)],
+        )
+        .map_err(|error| Error::Store(format!("record embedding completeness: {error}")))?;
+    Ok(embedding_report)
+}
+
+fn embedding_complete_key(project: &str) -> String {
+    format!("embedding_complete:{project}")
 }
 
 fn publish_store_snapshot(
@@ -12299,42 +13178,74 @@ fn publish_store_snapshot(
     };
     let backup_path = store_sibling(active_path, "prev");
 
-    if active_backupable {
+    #[cfg(unix)]
+    {
+        let _ = active_backupable;
+        // POSIX rename replaces the directory entry atomically. Existing
+        // readers keep their old inode; new readers see the complete new DB.
+        // No full-size graph.db.prev copy is needed or retained.
         cleanup_sqlite_family(&backup_path)?;
-        std::fs::copy(active_path, &backup_path).map_err(|e| {
+        std::fs::rename(temp_path, active_path).map_err(|error| {
             Error::io(
                 format!(
-                    "copy previous index {} to {}",
-                    active_path.display(),
-                    backup_path.display()
+                    "atomically publish temp index {} to {}",
+                    temp_path.display(),
+                    active_path.display()
                 ),
-                e,
+                error,
             )
         })?;
-        workspace_locator::ensure_db_mode(&backup_path)
-            .map_err(|e| Error::io(format!("chmod db {}", backup_path.display()), e))?;
-        sync_file(&backup_path)?;
-        sync_parent_dir(&backup_path)?;
+        workspace_locator::ensure_db_mode(active_path)
+            .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
+        sync_file(active_path)?;
+        cleanup_sqlite_sidecars(temp_path)?;
+        cleanup_sqlite_family(&backup_path)?;
+        sync_parent_dir(active_path)?;
+        Ok(())
     }
 
-    replace_active_with_temp(
-        temp_path,
-        active_path,
-        &backup_path,
-        PublishRenameMode::Native,
-    )?;
-    workspace_locator::ensure_db_mode(active_path)
-        .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
-    sync_file(active_path)?;
-    cleanup_sqlite_family(temp_path)?;
-    sync_parent_dir(active_path)?;
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        if active_backupable {
+            cleanup_sqlite_family(&backup_path)?;
+            std::fs::copy(active_path, &backup_path).map_err(|e| {
+                Error::io(
+                    format!(
+                        "copy previous index {} to {}",
+                        active_path.display(),
+                        backup_path.display()
+                    ),
+                    e,
+                )
+            })?;
+            workspace_locator::ensure_db_mode(&backup_path)
+                .map_err(|e| Error::io(format!("chmod db {}", backup_path.display()), e))?;
+            sync_file(&backup_path)?;
+            sync_parent_dir(&backup_path)?;
+        }
+
+        replace_active_with_temp(
+            temp_path,
+            active_path,
+            &backup_path,
+            PublishRenameMode::Native,
+        )?;
+        workspace_locator::ensure_db_mode(active_path)
+            .map_err(|e| Error::io(format!("chmod db {}", active_path.display()), e))?;
+        sync_file(active_path)?;
+        cleanup_sqlite_family(temp_path)?;
+        cleanup_sqlite_family(&backup_path)?;
+        sync_parent_dir(active_path)?;
+        Ok(())
+    }
 }
 
 fn active_snapshot_is_recoverable(error: &Error) -> bool {
     matches!(error, Error::Store(_))
 }
 
+#[cfg(any(not(unix), test))]
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PublishRenameMode {
     /// Preferred path. On POSIX this atomically replaces the active file.
@@ -12349,6 +13260,7 @@ enum PublishRenameMode {
     RemoveExistingFirst,
 }
 
+#[cfg(any(not(unix), test))]
 fn replace_active_with_temp(
     temp_path: &std::path::Path,
     active_path: &std::path::Path,
@@ -12413,6 +13325,7 @@ fn replace_active_with_temp(
     }
 }
 
+#[cfg(any(not(unix), test))]
 fn rename_target_exists_error(e: &std::io::Error, active_path: &std::path::Path) -> bool {
     if !active_path.exists() {
         return false;
@@ -12430,6 +13343,7 @@ fn rename_target_exists_error(e: &std::io::Error, active_path: &std::path::Path)
     }
 }
 
+#[cfg(any(not(unix), test))]
 fn restore_active_from_backup(
     active_path: &std::path::Path,
     backup_path: &std::path::Path,
@@ -12559,6 +13473,12 @@ fn seed_temp_store_from_active_if_usable(
         }
         Err(e) => return Err(e),
     }
+    if try_clone_store_file(active_path, temp_path)? {
+        workspace_locator::ensure_db_mode(temp_path)
+            .map_err(|e| Error::io(format!("chmod db {}", temp_path.display()), e))?;
+        return Ok(true);
+    }
+    ensure_copy_headroom(active_path)?;
     std::fs::copy(active_path, temp_path).map_err(|e| {
         Error::io(
             format!(
@@ -12574,14 +13494,106 @@ fn seed_temp_store_from_active_if_usable(
     Ok(true)
 }
 
-fn cleanup_stale_next_snapshots(active_path: &std::path::Path) -> Result<usize> {
+#[cfg(target_os = "macos")]
+fn try_clone_store_file(source: &std::path::Path, target: &std::path::Path) -> Result<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn clonefile(
+            source: *const std::ffi::c_char,
+            target: *const std::ffi::c_char,
+            flags: u32,
+        ) -> i32;
+    }
+    let source_c = CString::new(source.as_os_str().as_bytes())
+        .map_err(|_| Error::Invalid("store path contains NUL".into()))?;
+    let target_c = CString::new(target.as_os_str().as_bytes())
+        .map_err(|_| Error::Invalid("store path contains NUL".into()))?;
+    let cloned = unsafe { clonefile(source_c.as_ptr(), target_c.as_ptr(), 0) } == 0;
+    if !cloned {
+        let _ = remove_file_if_exists(target);
+    }
+    Ok(cloned)
+}
+
+#[cfg(target_os = "linux")]
+fn try_clone_store_file(source: &std::path::Path, target: &std::path::Path) -> Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+    }
+    const FICLONE: std::ffi::c_ulong = 0x4004_9409;
+    let source_file = std::fs::File::open(source)
+        .map_err(|error| Error::io(format!("open {} for reflink", source.display()), error))?;
+    let target_file = std::fs::File::create(target)
+        .map_err(|error| Error::io(format!("create {} for reflink", target.display()), error))?;
+    let cloned = unsafe { ioctl(target_file.as_raw_fd(), FICLONE, source_file.as_raw_fd()) } == 0;
+    drop(target_file);
+    if !cloned {
+        remove_file_if_exists(target)?;
+    }
+    Ok(cloned)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn try_clone_store_file(_source: &std::path::Path, _target: &std::path::Path) -> Result<bool> {
+    Ok(false)
+}
+
+fn ensure_copy_headroom(active_path: &std::path::Path) -> Result<()> {
+    let active_bytes = std::fs::metadata(active_path)
+        .map_err(|error| Error::io(format!("stat {}", active_path.display()), error))?
+        .len();
+    let reserve = (active_bytes / 4).max(256 * 1024 * 1024);
+    let required = active_bytes.saturating_add(reserve);
+    let parent = active_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let output = std::process::Command::new("df")
+        .args(["-Pk"])
+        .arg(parent)
+        .output()
+        .map_err(|error| Error::io("run df for snapshot capacity check", error))?;
+    if !output.status.success() {
+        return Err(Error::Store(format!(
+            "cannot verify free space before copying {}",
+            active_path.display()
+        )));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let available_kib = stdout
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().nth(3))
+        .filter_map(|value| value.parse::<u64>().ok())
+        .last()
+        .ok_or_else(|| Error::Store("cannot parse free-space result from df".into()))?;
+    let available = available_kib.saturating_mul(1024);
+    if available < required {
+        return Err(Error::Store(format!(
+            "insufficient free space for atomic index snapshot: need {} bytes, have {} bytes",
+            required, available
+        )));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_snapshot_artifacts(
+    active_path: &std::path::Path,
+    include_quarantine: bool,
+) -> Result<usize> {
     let Some(parent) = active_path.parent() else {
         return Ok(0);
     };
     let Some(file_name) = active_path.file_name().and_then(|s| s.to_str()) else {
         return Ok(0);
     };
-    let prefix = format!("{file_name}.next.");
+    let next_prefix = format!("{file_name}.next.");
+    let corrupt_prefix = format!("{file_name}.corrupt.");
+    let previous = format!("{file_name}.prev");
+    let previous_sidecar_prefix = format!("{previous}-");
     let mut removed = 0usize;
     let entries = match std::fs::read_dir(parent) {
         Ok(entries) => entries,
@@ -12594,7 +13606,12 @@ fn cleanup_stale_next_snapshots(active_path: &std::path::Path) -> Result<usize> 
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.starts_with(&prefix) {
+        let managed = name.starts_with(&next_prefix)
+            || name == previous
+            || name.starts_with(&previous_sidecar_prefix)
+            || (name.starts_with(".index.job.") && name.ends_with(".tmp"))
+            || (include_quarantine && name.starts_with(&corrupt_prefix));
+        if !managed {
             continue;
         }
         match std::fs::remove_file(&path) {
@@ -14000,6 +15017,12 @@ where
         let want = repo.canonicalize().unwrap();
         let got = find_repo_root(&deep.canonicalize().unwrap());
         assert_eq!(got, want, "should walk up to the .git repo root");
+        std::fs::write(repo.join("a/b/Cargo.toml"), "[workspace]\n").unwrap();
+        assert_eq!(
+            resolve_root(deep.to_str()).unwrap(),
+            want,
+            "an explicit nested --root must still resolve to the worktree root"
+        );
 
         // No marker anywhere → returns `start` unchanged.
         let orphan = base.join("orphan");
@@ -14693,5 +15716,41 @@ where
         assert!(is_noncode_provider("unsupported", "file extension .snap"));
         assert!(is_noncode_provider("accepted", "no file extension"));
         assert!(!is_noncode_provider("partial", "java"));
+    }
+
+    #[test]
+    fn cache_commands_parse_with_stable_public_flags() {
+        let status = Cli::try_parse_from(["greppy", "cache", "status", "--json"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Command::Cache {
+                command: CacheCommand::Status { json: true }
+            })
+        ));
+
+        let gc = Cli::try_parse_from(["greppy", "cache", "gc", "--dry-run", "--json"]).unwrap();
+        assert!(matches!(
+            gc.command,
+            Some(Command::Cache {
+                command: CacheCommand::Gc {
+                    dry_run: true,
+                    json: true
+                }
+            })
+        ));
+
+        let clear =
+            Cli::try_parse_from(["greppy", "cache", "clear", "--root", "/tmp/repo", "--yes"])
+                .unwrap();
+        assert_eq!(clear.root.as_deref(), Some("/tmp/repo"));
+        assert!(matches!(
+            clear.command,
+            Some(Command::Cache {
+                command: CacheCommand::Clear {
+                    all: false,
+                    yes: true
+                }
+            })
+        ));
     }
 }

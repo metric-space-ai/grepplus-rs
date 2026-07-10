@@ -114,7 +114,7 @@ mod structural;
 use std::path::Path;
 
 use greppy_core::Result;
-use greppy_discover::InventoryEntry;
+use greppy_discover::{read_stable_file, stable_metadata, InventoryEntry, StableFileMetadata};
 use greppy_parser::{
     self, extract as parser_extract, manifest_for_language, ExtractedEdge, ExtractedNode, Language,
     ProviderManifest, ProviderOutput, ProviderStatus,
@@ -122,8 +122,8 @@ use greppy_parser::{
 use greppy_store::{
     self,
     file_state::{self, FileState},
-    workspace_state as ws, ContentRow, IndexSkip, NewEdge, NewNode, NewRawEdge, Project,
-    ProviderState, RawEdge, Store, WorkspaceState,
+    workspace_state as ws, ContentRow, FileIdentity, IndexSkip, NewEdge, NewNode, NewRawEdge,
+    Project, ProviderState, RawEdge, Store, WorkspaceState,
 };
 use rayon::prelude::*;
 
@@ -502,6 +502,7 @@ fn run_full(
                 rel_path,
                 abs_path,
                 bytes,
+                metadata,
                 nodes,
                 edges,
             } => {
@@ -511,6 +512,7 @@ fn run_full(
                     &rel_path,
                     &abs_path,
                     &bytes,
+                    metadata,
                     &nodes,
                     generation,
                     false, // content batched below
@@ -681,6 +683,7 @@ fn run_incremental(
                 rel_path,
                 abs_path,
                 bytes,
+                metadata,
                 nodes,
                 edges,
             } => {
@@ -690,6 +693,7 @@ fn run_incremental(
                     &rel_path,
                     &abs_path,
                     &bytes,
+                    metadata,
                     &nodes,
                     generation,
                     content_indexing_enabled(), // incremental per-file content
@@ -757,6 +761,7 @@ enum FileOutcome {
         rel_path: String,
         abs_path: std::path::PathBuf,
         bytes: Vec<u8>,
+        metadata: StableFileMetadata,
         nodes: Vec<ExtractedNode>,
         edges: Vec<ExtractedEdge>,
     },
@@ -772,8 +777,8 @@ enum FileOutcome {
 /// Read + parse + extract one file. Pure with respect to the store, so
 /// it is safe to call from many rayon worker threads at once.
 fn extract_one(entry: &InventoryEntry, lang: Language) -> FileOutcome {
-    let bytes = match std::fs::read(&entry.abs_path) {
-        Ok(b) => b,
+    let (bytes, metadata) = match read_stable_file(&entry.abs_path) {
+        Ok(value) => value,
         Err(e) => {
             return FileOutcome::Unreadable {
                 entry: entry.clone(),
@@ -803,6 +808,7 @@ fn extract_one(entry: &InventoryEntry, lang: Language) -> FileOutcome {
                 rel_path: entry.rel_path.clone(),
                 abs_path: entry.abs_path.clone(),
                 bytes,
+                metadata,
                 nodes: extraction.nodes,
                 edges: extraction.edges,
             }
@@ -934,6 +940,7 @@ fn apply_file_nodes(
     rel_path: &str,
     abs_path: &Path,
     bytes: &[u8],
+    metadata: StableFileMetadata,
     nodes: &[ExtractedNode],
     generation: u64,
     // When false, this file's content rows are NOT written here — the caller
@@ -1015,13 +1022,21 @@ fn apply_file_nodes(
             .name()
             .to_string(),
         sha256: file_state::sha256_hex(bytes),
-        mtime_ns: mtime_ns(abs_path).unwrap_or(0),
+        mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
         extractor_version: "greppy-extractor-v1".into(),
         last_indexed_generation: generation,
     };
     store.upsert_file_state(&fs)?;
+    store.upsert_file_identity(
+        project,
+        rel_path,
+        FileIdentity {
+            ctime_ns: metadata.ctime_ns,
+            file_id: metadata.file_id,
+        },
+    )?;
     Ok(())
 }
 
@@ -2670,6 +2685,7 @@ fn record_unsupported_file_state(
         return;
     };
     if md.len() > max_file_size_bytes() {
+        let metadata = stable_metadata(&md);
         // Oversized: record stat only, never read the body.
         let fs = FileState {
             project: project.to_string(),
@@ -2678,16 +2694,24 @@ fn record_unsupported_file_state(
                 .name()
                 .to_string(),
             sha256: OVERSIZE_SENTINEL_SHA.to_string(),
-            mtime_ns: mtime_ns(&entry.abs_path).unwrap_or(0),
+            mtime_ns: metadata.mtime_ns.unwrap_or(0),
             size: md.len() as i64,
             parser_version: format!("tree-sitter-{}", tree_sitter_version()),
             extractor_version: "greppy-extractor-v1".into(),
             last_indexed_generation: generation,
         };
         let _ = store.upsert_file_state(&fs);
+        let _ = store.upsert_file_identity(
+            project,
+            &entry.rel_path,
+            FileIdentity {
+                ctime_ns: metadata.ctime_ns,
+                file_id: metadata.file_id,
+            },
+        );
         return;
     }
-    let Ok(bytes) = std::fs::read(&entry.abs_path) else {
+    let Ok((bytes, metadata)) = read_stable_file(&entry.abs_path) else {
         return;
     };
     let fs = FileState {
@@ -2697,13 +2721,21 @@ fn record_unsupported_file_state(
             .name()
             .to_string(),
         sha256: file_state::sha256_hex(&bytes),
-        mtime_ns: mtime_ns(&entry.abs_path).unwrap_or(0),
+        mtime_ns: metadata.mtime_ns.unwrap_or(0),
         size: bytes.len() as i64,
         parser_version: format!("tree-sitter-{}", tree_sitter_version()),
         extractor_version: "greppy-extractor-v1".into(),
         last_indexed_generation: generation,
     };
     let _ = store.upsert_file_state(&fs);
+    let _ = store.upsert_file_identity(
+        project,
+        &entry.rel_path,
+        FileIdentity {
+            ctime_ns: metadata.ctime_ns,
+            file_id: metadata.file_id,
+        },
+    );
 }
 
 #[cfg(test)]

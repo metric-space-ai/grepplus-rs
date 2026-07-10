@@ -36,6 +36,7 @@ pub fn run_with_optional_augment(
     args: &GrepArgs,
 ) -> Result<i32, Error> {
     let real_exit = crate::run_grep(real_grep, argv)?;
+    touch_passthrough_store();
 
     // Real-grep miss/error must not trigger
     // any visible semantic output. A non-zero exit code skips the
@@ -49,7 +50,8 @@ pub fn run_with_optional_augment(
     let mode = classify(args, gate);
 
     if matches!(mode, Mode::Sidecar | Mode::VisibleAugment) {
-        if let Ok(workspace_root) = std::env::current_dir() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let workspace_root = workspace_locator::resolve_workspace_root(&cwd);
             // Augment errors are non-fatal; we never let them bubble
             // up as a real-grep exit-code change.
             let _ = run_augment(args, mode, &workspace_root, real_grep, argv);
@@ -73,6 +75,7 @@ pub fn run_with_optional_augment_os(
     args: &GrepArgs,
 ) -> Result<i32, Error> {
     let real_exit = crate::run_grep_os(real_grep, argv)?;
+    touch_passthrough_store();
 
     // Real-grep miss/error must not trigger
     // any visible semantic output.
@@ -84,7 +87,8 @@ pub fn run_with_optional_augment_os(
     let mode = classify(args, gate);
 
     if matches!(mode, Mode::Sidecar | Mode::VisibleAugment) {
-        if let Ok(workspace_root) = std::env::current_dir() {
+        if let Ok(cwd) = std::env::current_dir() {
+            let workspace_root = workspace_locator::resolve_workspace_root(&cwd);
             // The original command string for the sidecar header is a
             // best-effort lossy rendering of the OsString argv; only the
             // forwarded argv (above) must be byte-exact.
@@ -99,6 +103,18 @@ pub fn run_with_optional_augment_os(
     Ok(real_exit)
 }
 
+fn touch_passthrough_store() {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    let root = workspace_locator::resolve_workspace_root(&cwd);
+    let dir = greppy_core::cache::workspace_store_dir(&root);
+    if greppy_core::cache::read_store_manifest(&dir).is_ok() {
+        greppy_core::cache::touch_last_used_dir(&dir);
+    }
+    let _ = sidecar::cleanup_expired(&root, sidecar::sidecar_ttl_secs());
+}
+
 /// Compute the freshness gate for the current invocation. Used by
 /// both the drop-in binary and the CLI dispatcher. Returns `Strict`
 /// if the graph is stale, the store is unreadable, or the budget is
@@ -111,21 +127,19 @@ pub fn freshness_gate(args: &GrepArgs) -> FreshnessGate {
         Ok(c) => c,
         Err(_) => return FreshnessGate::Strict,
     };
+    let workspace_root = workspace_locator::resolve_workspace_root(&cwd);
     // Read the graph DB from the platform-locator's path,
     // never from `<cwd>/.greppy/graph.db`.
-    let store_path = workspace_locator::store_path(&cwd);
+    let store_path = workspace_locator::store_path(&workspace_root);
     let store = match greppy_store::Store::open_with(&store_path, OpenOptions::read_only()) {
         Ok(s) => s,
         Err(_) => return FreshnessGate::Strict,
     };
-    let project = cwd
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("default");
+    let project = workspace_locator::project_identity(&workspace_root);
     let res = match greppy_freshness::check_files(
         &store,
-        &cwd,
-        project,
+        &workspace_root,
+        &project,
         std::time::Duration::from_millis(200),
     ) {
         Ok(r) => r,

@@ -74,6 +74,14 @@ impl Store {
     /// file is removed from the workspace.
     pub fn delete_file_state(&mut self, project: &str, rel_path: &str) -> Result<()> {
         let tx = self.transaction()?;
+        // SQLite foreign-key enforcement is connection-local and legacy
+        // stores may have created this connection with it disabled. Remove
+        // the additive identity row explicitly so deleted paths cannot leave
+        // stale stat metadata behind.
+        tx.raw().execute(
+            "DELETE FROM file_identity WHERE project = ?1 AND rel_path = ?2",
+            params![project, rel_path],
+        )?;
         tx.raw().execute(
             "DELETE FROM file_state WHERE project = ?1 AND rel_path = ?2",
             params![project, rel_path],

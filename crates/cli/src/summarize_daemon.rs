@@ -363,19 +363,16 @@ pub(super) fn daemon_main(socket: PathBuf, cfg: super::QwenSummaryConfig, prewar
         );
     }
 
-    let mut model: Option<greppy_qwen35_native::Qwen35Summarizer> = None;
+    let mut model: Option<super::LoadedQwen35Summarizer> = None;
     let mut last_used = Instant::now();
     if prewarm {
         let t0 = Instant::now();
-        match super::load_qwen35_summarizer(&cfg) {
-            Ok(m) => {
-                if log_enabled() {
-                    eprintln!("summarize-daemon: prewarmed model in {:?}", t0.elapsed());
-                }
-                model = Some(m);
-                last_used = Instant::now();
+        if let Ok(m) = super::load_qwen35_summarizer(&cfg) {
+            if log_enabled() {
+                eprintln!("summarize-daemon: prewarmed model in {:?}", t0.elapsed());
             }
-            Err(_) => {}
+            model = Some(m);
+            last_used = Instant::now();
         }
     }
 
@@ -410,7 +407,7 @@ pub(super) fn daemon_main(socket: PathBuf, cfg: super::QwenSummaryConfig, prewar
 fn handle_connection(
     stream: UnixStream,
     cfg: &super::QwenSummaryConfig,
-    model: &mut Option<greppy_qwen35_native::Qwen35Summarizer>,
+    model: &mut Option<super::LoadedQwen35Summarizer>,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -435,7 +432,7 @@ fn handle_connection(
 fn respond(
     raw: &str,
     cfg: &super::QwenSummaryConfig,
-    model: &mut Option<greppy_qwen35_native::Qwen35Summarizer>,
+    model: &mut Option<super::LoadedQwen35Summarizer>,
 ) -> serde_json::Value {
     let req: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,

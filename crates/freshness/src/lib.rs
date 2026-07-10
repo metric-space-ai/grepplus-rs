@@ -27,4 +27,4 @@ pub use fingerprint::{
     DEFAULT_FRESHNESS_TTL, ENV_FRESHNESS_TTL_MS,
 };
 pub use incremental::{compute_file_diff, incremental_update, FileDiff};
-pub use lock::{lock_path_for, try_acquire, try_lock, with_lock, Lock, LockError, LockOutcome};
+pub use lock::{acquire, lock_path_for, try_acquire, try_lock, with_lock, Lock, LockError};

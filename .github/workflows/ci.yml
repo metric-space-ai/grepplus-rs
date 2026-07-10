@@ -6,7 +6,7 @@ name: CI
 #   * cargo build  --workspace
 #   * cargo test   --workspace
 #   * cargo clippy --workspace --all-targets -- -D warnings
-#   * cargo fmt    --check        (informational; see note below)
+#   * cargo fmt    --check
 #   * a --release build + the black-box battle suite
 #     (bash bench/battle/run_battle.sh)
 #
@@ -14,13 +14,6 @@ name: CI
 # (channel 1.95.0, components rustfmt + clippy); we do NOT override the
 # channel here so local and CI builds use the identical compiler.
 #
-# Note on `cargo fmt --check`: the working tree is not currently
-# rustfmt-clean and there is no rustfmt.toml in the repo. Formatting the
-# crates is a source-owning change outside this CI track, so the fmt
-# step is run as informational (continue-on-error) to surface drift
-# without failing unrelated PRs. Flip `continue-on-error` to false once
-# the tree is formatted to make it a hard gate.
-
 on:
   push:
     branches: ["**"]
@@ -110,10 +103,14 @@ jobs:
           -A clippy::manual_is_multiple_of
           -A clippy::len_zero
           -A clippy::bool_assert_comparison
+          -A clippy::skip_while_next
+          -A clippy::needless_return
+          -A clippy::single_char_add_str
+          -A clippy::assertions_on_constants
+          -A clippy::useless_vec
+          -A clippy::infallible_destructuring_match
 
-      # Informational only (see header note). Does not fail the job.
-      - name: cargo fmt --check (informational)
-        continue-on-error: true
+      - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
       - name: cargo build --release --bins

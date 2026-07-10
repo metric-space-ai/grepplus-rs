@@ -62,8 +62,8 @@ pub fn discover_grep() -> Result<std::path::PathBuf> {
     // `~/.greppy/shims/` candidates so a shimmed PATH cannot
     // discover the wrapper as "real grep".
     let own_exe = std::env::current_exe().ok();
-    let shim_dir = std::env::var_os("HOME")
-        .map(|h| std::path::PathBuf::from(h).join(".greppy").join("shims"));
+    let shim_dir =
+        std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".greppy").join("shims"));
     let which_result = which::which("grep").map_err(|e| {
         Error::io(
             "locate real grep binary on PATH",

@@ -99,53 +99,22 @@ fn maybe_run_sidecar_cleanup() {
         Ok(c) => c,
         Err(_) => return,
     };
+    let root = greppy_core::workspace::resolve_workspace_root(&cwd);
     let ttl = sidecar::sidecar_ttl_secs();
-    let _ = sidecar::cleanup_expired(&cwd, ttl);
+    let _ = sidecar::cleanup_expired(&root, ttl);
 }
 
-/// Feature B — probabilistically evict stale index stores under the
-/// shared `<cache>/greppy/` root. Throttled to ~once per 10 minutes
-/// per process (mirrors [`maybe_run_sidecar_cleanup`]). Best-effort: any
-/// failure is swallowed. The store dir for the current working directory
-/// is preserved as the `keep` dir so an in-use store is never evicted.
+/// Run manifest-verified cache maintenance under Greppy's versioned data root.
+/// A cross-process state file throttles it to ten minutes by default, and OS
+/// lifecycle leases protect active readers/writers. Best-effort: failures do
+/// not affect grep passthrough.
 ///
-/// TTL comes from `GREPPY_STORE_TTL_DAYS` (default 14 days; `0`
-/// disables eviction) — see
+/// TTL comes from `GREPPY_STORE_TTL_DAYS` (default 14 days; `0` disables only
+/// age eviction, not the independent quota) — see
 /// [`greppy_core::workspace::store_ttl_secs`].
 fn maybe_run_store_cleanup() {
-    use greppy_core::workspace;
-    use std::sync::Mutex;
-    use std::time::{Duration, Instant};
-
-    static LAST_RUN: Mutex<Option<Instant>> = Mutex::new(None);
-    const MIN_GAP: Duration = Duration::from_secs(10 * 60);
-
-    let should_run = {
-        let mut guard = LAST_RUN.lock().unwrap_or_else(|e| e.into_inner());
-        match *guard {
-            Some(t) if t.elapsed() < MIN_GAP => false,
-            _ => {
-                *guard = Some(Instant::now());
-                true
-            }
-        }
-    };
-    if !should_run {
-        return;
-    }
-    let ttl = workspace::store_ttl_secs();
-    if ttl == 0 {
-        return; // eviction disabled
-    }
-    let cache_root = match workspace::store_cache_root() {
-        Some(c) => c,
-        None => return,
-    };
-    // Preserve the store this workspace uses so we never delete it out
-    // from under an in-flight query on the same repo.
-    let keep = match std::env::current_dir() {
-        Ok(cwd) => workspace::store_dir(&cwd),
-        Err(_) => cache_root.join("\0none"),
-    };
-    let _ = workspace::cleanup_stale_stores(&cache_root, ttl, &keep);
+    let root = std::env::current_dir()
+        .ok()
+        .map(|cwd| greppy_core::workspace::resolve_workspace_root(&cwd));
+    let _ = greppy_core::cache::maybe_gc(root.as_deref());
 }

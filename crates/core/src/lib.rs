@@ -26,6 +26,7 @@
 ///   O3 closure attribution, P4 edge call-site line now persisted.
 pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v2";
 
+pub mod cache;
 pub mod diag;
 pub mod error;
 pub mod git_fingerprint;
@@ -57,4 +58,6 @@ pub use crate::validate::{
     is_valid_project_name, is_valid_shell_arg, json_escape, validate_project_name,
     validate_shell_arg, ProjectNameError, ShellArgError,
 };
-pub use crate::workspace::{project_identity, store_dir, store_path, workspace_hash};
+pub use crate::workspace::{
+    project_identity, resolve_workspace_root, store_dir, store_path, workspace_hash,
+};

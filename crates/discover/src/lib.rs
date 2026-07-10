@@ -7,6 +7,7 @@
 
 #![deny(rust_2018_idioms)]
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use greppy_core::{Error, Result};
@@ -50,7 +51,7 @@ fn has_skipped_dir_component(rel: &str) -> bool {
 /// workspace-relative path. The relative path is what we store in the
 /// graph; the absolute path is what we read.
 ///
-/// `size` and `mtime_ns` carry the file metadata captured during the
+/// `size`, `mtime_ns`, `ctime_ns`, and `file_id` carry the file metadata captured during the
 /// walk so the indexer and freshness layers can compare against stored
 /// `file_state` without an extra `stat(2)` per file. They are
 /// `Option<…>` so existing call sites that build an `InventoryEntry`
@@ -76,6 +77,11 @@ pub struct InventoryEntry {
     /// or the platform time is before the epoch in a way that cannot be
     /// represented.
     pub mtime_ns: Option<i64>,
+    /// Metadata-change time in nanoseconds since the Unix epoch. On Tier-1
+    /// Unix platforms this changes even when an editor restores the mtime.
+    pub ctime_ns: Option<i64>,
+    /// Stable filesystem identity (inode on Tier-1 Unix platforms).
+    pub file_id: Option<u64>,
 }
 
 /// Explicit include/exclude globs supplied by a caller.
@@ -148,17 +154,30 @@ impl InventoryEntry {
             abs_path: abs_path.into(),
             size: None,
             mtime_ns: None,
+            ctime_ns: None,
+            file_id: None,
         }
     }
 }
 
-/// Read `(size, mtime_ns)` for a file, returning `(None, None)` on any
+/// Metadata used to prove that bytes came from one stable file version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StableFileMetadata {
+    pub size: u64,
+    pub mtime_ns: Option<i64>,
+    pub ctime_ns: Option<i64>,
+    pub file_id: Option<u64>,
+}
+
+/// Read `(size, mtime_ns, ctime_ns, file_id)` for a file.
 /// error. `mtime_ns` is nanoseconds since the Unix epoch; times before
 /// the epoch are encoded as negative values. This is the single place
 /// the walker turns a `std::fs::Metadata` into the additive
 /// `InventoryEntry` fields, so the conversion (and its saturation
 /// behaviour for out-of-range durations) lives in one tested spot.
-fn metadata_fields(meta: &std::fs::Metadata) -> (Option<u64>, Option<i64>) {
+fn metadata_fields(
+    meta: &std::fs::Metadata,
+) -> (Option<u64>, Option<i64>, Option<i64>, Option<u64>) {
     let size = Some(meta.len());
     let mtime_ns = meta.modified().ok().map(|mt| {
         match mt.duration_since(std::time::UNIX_EPOCH) {
@@ -170,7 +189,81 @@ fn metadata_fields(meta: &std::fs::Metadata) -> (Option<u64>, Option<i64>) {
             }
         }
     });
-    (size, mtime_ns)
+    let (ctime_ns, file_id) = unix_identity_fields(meta);
+    (size, mtime_ns, ctime_ns, file_id)
+}
+
+#[cfg(unix)]
+fn unix_identity_fields(meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) {
+    use std::os::unix::fs::MetadataExt;
+
+    let seconds = meta.ctime();
+    let nanos = meta.ctime_nsec();
+    let ctime_ns = seconds
+        .checked_mul(1_000_000_000)
+        .and_then(|value| value.checked_add(nanos));
+    (ctime_ns, Some(meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn unix_identity_fields(_meta: &std::fs::Metadata) -> (Option<i64>, Option<u64>) {
+    (None, None)
+}
+
+/// Convert metadata obtained through an open handle into a comparable
+/// snapshot signature.
+pub fn stable_metadata(meta: &std::fs::Metadata) -> StableFileMetadata {
+    let (_, mtime_ns, ctime_ns, file_id) = metadata_fields(meta);
+    StableFileMetadata {
+        size: meta.len(),
+        mtime_ns,
+        ctime_ns,
+        file_id,
+    }
+}
+
+/// Read a regular file through one handle and verify with `fstat` before and
+/// after the read that the bytes belong to a stable version. A racing editor
+/// gets two retries; a persistently changing file is rejected rather than
+/// admitted to a snapshot with mismatched metadata.
+pub fn read_stable_file(path: &Path) -> io::Result<(Vec<u8>, StableFileMetadata)> {
+    const ATTEMPTS: usize = 3;
+    for attempt in 0..ATTEMPTS {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            #[cfg(target_os = "linux")]
+            const O_NOFOLLOW: i32 = 0x20_000;
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+            const O_NOFOLLOW: i32 = 0;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        let mut file = options.open(path)?;
+        let before = stable_metadata(&file.metadata()?);
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{} is not a regular file", path.display()),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(before.size.min(16 * 1024 * 1024) as usize);
+        file.read_to_end(&mut bytes)?;
+        let after = stable_metadata(&file.metadata()?);
+        if before == after && after.size == bytes.len() as u64 {
+            return Ok((bytes, after));
+        }
+        if attempt + 1 == ATTEMPTS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} changed while it was being read", path.display()),
+            ));
+        }
+    }
+    unreachable!()
 }
 
 /// Walk `root` and return every regular file under it that is not
@@ -333,7 +426,7 @@ pub fn walk_with_policy_and_overrides(
         // slipped past the `file_type` check above (platform variance) is
         // caught here, and the `size`/`mtime_ns` we record come from this
         // single non-following stat.
-        let (size, mtime_ns) = match std::fs::symlink_metadata(&abs) {
+        let (size, mtime_ns, ctime_ns, file_id) = match std::fs::symlink_metadata(&abs) {
             Ok(meta) => {
                 if meta.file_type().is_symlink() {
                     continue;
@@ -343,7 +436,7 @@ pub fn walk_with_policy_and_overrides(
             // Could not stat: keep the entry (it was a regular file at
             // walk time) but with unknown metadata, mirroring the
             // walker's fail-open posture for transient races.
-            Err(_) => (None, None),
+            Err(_) => (None, None, None, None),
         };
         // Name-based + size-based skip (ignored suffixes, generated
         // patterns, max size). Uses the basename and the size we just
@@ -357,6 +450,8 @@ pub fn walk_with_policy_and_overrides(
             abs_path: abs,
             size,
             mtime_ns,
+            ctime_ns,
+            file_id,
         });
     }
     entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -1091,8 +1186,13 @@ mod tests {
         let p = dir.join("f.txt");
         fs::write(&p, "abcdef").unwrap();
         let meta = fs::metadata(&p).unwrap();
-        let (size, mtime) = metadata_fields(&meta);
+        let (size, mtime, ctime, file_id) = metadata_fields(&meta);
         assert_eq!(size, Some(6));
         assert!(mtime.is_some());
+        #[cfg(unix)]
+        {
+            assert!(ctime.is_some());
+            assert!(file_id.is_some());
+        }
     }
 }

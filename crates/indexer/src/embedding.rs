@@ -12,7 +12,7 @@ use greppy_embed_native::{
     tokenizer::DEFAULT_MAX_LENGTH, EmbedTask, EmbeddingGemma, CODE_RETRIEVAL_PROFILE,
     PROMPT_VERSION,
 };
-use greppy_store::{file_state::sha256_hex, NewVectorEmbedding, Store};
+use greppy_store::{file_state::sha256_hex, NewVectorEmbedding, ReusableVectorEmbeddingKey, Store};
 
 const NODE_PAGE_SIZE: usize = 1000;
 const DEFAULT_MAX_SPAN_BYTES: usize = 32 * 1024;
@@ -139,6 +139,7 @@ impl EmbeddingIndexOptions {
 pub struct EmbeddingIndexReport {
     pub nodes_considered: usize,
     pub nodes_embedded: usize,
+    pub nodes_reused: usize,
     pub nodes_skipped_non_definition: usize,
     pub nodes_skipped_missing_file: usize,
     pub nodes_skipped_invalid_span: usize,
@@ -193,7 +194,8 @@ pub fn index_code_embeddings_for_project(
             // Skip minified / generated spans (a single line longer than this is
             // machine-generated): embedding them is noise and pathologically slow.
             const MAX_EMBED_LINE_BYTES: usize = 2048;
-            if span_has_overlong_line(source, node.start_line, node.end_line, MAX_EMBED_LINE_BYTES) {
+            if span_has_overlong_line(source, node.start_line, node.end_line, MAX_EMBED_LINE_BYTES)
+            {
                 report.nodes_skipped_oversize += 1;
                 continue;
             }
@@ -215,6 +217,37 @@ pub fn index_code_embeddings_for_project(
             }
 
             for chunk in chunks {
+                let content_sha256 = sha256_hex(chunk.text.as_bytes());
+                if let Some(existing) =
+                    store.find_reusable_vector_embedding(&ReusableVectorEmbeddingKey {
+                        project,
+                        model_id: provider.model_id(),
+                        prompt_version: provider.prompt_version(),
+                        task: provider.task_profile(),
+                        qualified_name: &node.qualified_name,
+                        chunk_idx: chunk.chunk_idx,
+                        content_sha256: &content_sha256,
+                    })?
+                {
+                    store.upsert_vector_embedding(&NewVectorEmbedding {
+                        project: node.project.clone(),
+                        model_id: provider.model_id().to_string(),
+                        prompt_version: provider.prompt_version().to_string(),
+                        task: provider.task_profile().to_string(),
+                        node_id: Some(node.id),
+                        chunk_idx: chunk.chunk_idx,
+                        qualified_name: node.qualified_name.clone(),
+                        file_path: node.file_path.clone(),
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        content_sha256,
+                        graph_generation: options.graph_generation,
+                        vector: existing.vector,
+                    })?;
+                    report.nodes_embedded += 1;
+                    report.nodes_reused += 1;
+                    continue;
+                }
                 pending.push(PendingDoc {
                     node: node.clone(),
                     title: title.clone(),
@@ -240,7 +273,13 @@ pub fn index_code_embeddings_for_project(
         embedding_batch_failed |= flush.failed;
     }
 
-    if options.prune_before_generation && !embedding_batch_failed {
+    if embedding_batch_failed {
+        return Err(Error::Store(
+            "embedding generation incomplete: at least one batch failed".into(),
+        ));
+    }
+
+    if options.prune_before_generation {
         report.stale_rows_pruned =
             store.prune_vector_embeddings_before_generation(project, options.graph_generation)?;
     }
@@ -921,7 +960,12 @@ fn source_span(source: &str, start_line: i64, end_line: i64) -> Option<String> {
 /// `max_line_bytes`. Such a line is machine-generated (minified / bundled), not
 /// human-authored code; embedding it is noise for semantic search and, because
 /// many symbols can share one huge line, pathologically expensive to chunk.
-fn span_has_overlong_line(source: &str, start_line: i64, end_line: i64, max_line_bytes: usize) -> bool {
+fn span_has_overlong_line(
+    source: &str,
+    start_line: i64,
+    end_line: i64,
+    max_line_bytes: usize,
+) -> bool {
     if start_line <= 0 {
         return false;
     }
@@ -1426,7 +1470,7 @@ pub fn next_definition() {
     }
 
     #[test]
-    fn embedding_batch_failure_skips_prune_and_keeps_prior_generation() {
+    fn embedding_batch_failure_fails_build_and_keeps_prior_generation() {
         let root = tempdir_via_env();
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/lib.rs"), "pub fn current() {}\n").unwrap();
@@ -1460,17 +1504,18 @@ pub fn next_definition() {
             .unwrap();
 
         let mut provider = FailingBatchProvider { failed: false };
-        let report = index_code_embeddings_for_project(
+        let error = index_code_embeddings_for_project(
             &mut store,
             &root,
             "p",
             &mut provider,
             EmbeddingIndexOptions::for_generation(5),
         )
-        .unwrap();
+        .unwrap_err();
 
-        assert_eq!(report.nodes_embedded, 0);
-        assert_eq!(report.stale_rows_pruned, 0);
+        assert!(error
+            .to_string()
+            .contains("embedding generation incomplete"));
         assert_eq!(
             store
                 .count_vector_embeddings(

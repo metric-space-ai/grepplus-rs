@@ -284,6 +284,54 @@ mod tests {
     }
 
     #[test]
+    fn linked_worktrees_have_distinct_roots_and_indexes_but_common_git_dir() {
+        let repo = init_repo_with_commit("linked-worktree");
+        let worktree = repo.parent().unwrap().join(format!(
+            "{}-wt",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        let ok = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "add", "-q", "-b", "feature"])
+            .arg(&worktree)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+
+        let main = GitFingerprint::capture(&repo);
+        let linked = GitFingerprint::capture(&worktree);
+        assert_ne!(main.canonical_root, linked.canonical_root);
+        assert_ne!(
+            crate::workspace::workspace_hash(&main.canonical_root),
+            crate::workspace::workspace_hash(&linked.canonical_root)
+        );
+        assert_ne!(main.git_dir, linked.git_dir);
+        let main_common = main
+            .git_common_dir
+            .as_ref()
+            .map(|path| repo.join(path).canonicalize().unwrap());
+        let linked_common = linked
+            .git_common_dir
+            .as_ref()
+            .map(|path| worktree.join(path).canonicalize().unwrap());
+        assert_eq!(main_common, linked_common);
+
+        let before = linked.index_signature;
+        std::fs::write(worktree.join("a.txt"), b"staged in linked worktree").unwrap();
+        git(&worktree, &["add", "a.txt"]);
+        let after = GitFingerprint::capture(&worktree).index_signature;
+        assert_ne!(before, after);
+
+        let _ = Command::new("git")
+            .current_dir(&repo)
+            .args(["worktree", "remove", "--force"])
+            .arg(&worktree)
+            .status();
+        let _ = std::fs::remove_dir_all(repo);
+    }
+
+    #[test]
     fn detached_head_matches_reference() {
         let tmp = init_repo_with_commit("detached");
         // Second commit, then detach onto the first.

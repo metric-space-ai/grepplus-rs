@@ -13,9 +13,9 @@
 use std::path::Path;
 
 use greppy_core::Result;
-use greppy_discover::InventoryEntry;
+use greppy_discover::{read_stable_file, stable_metadata, InventoryEntry};
 use greppy_parser;
-use greppy_store::{file_state::sha256_hex, FileState, Store};
+use greppy_store::{file_state::sha256_hex, FileIdentity, FileState, Store};
 use sha2::{Digest, Sha256};
 
 /// The freshness hotpath must refuse to slurp
@@ -56,11 +56,11 @@ pub enum FileDiff {
 /// 429-file repo, which blew the per-query budget and fail-closed the
 /// whole plus surface. The check is now tiered:
 ///
-/// 1. **stat tier** — compare the persisted `(size, mtime_ns)` against
-///    the on-disk stat (already captured by the discover walk, so this
-///    usually costs zero extra syscalls). A match ⇒ `Unchanged` without
-///    reading the body. This is the same trade git's index stat-cache
-///    makes; a same-size same-mtime_ns content swap is not detected.
+/// 1. **stat tier** — compare the persisted `(size, mtime_ns, ctime_ns,
+///    file_id)` against the on-disk stat (already captured by the discover
+///    walk, so this usually costs zero extra syscalls). Only a complete match
+///    is `Unchanged` without reading the body. Same-size replacements with a
+///    restored mtime still change ctime and/or file identity.
 /// 2. **hash tier** — only files whose stat drifted (or that have no
 ///    persisted row / a `mtime_ns == 0` sentinel row) are read and
 ///    content-hashed, exactly as before. A touch that does not change
@@ -71,12 +71,12 @@ pub enum FileDiff {
 /// runs on EVERY `greppy grep`, so a multi-GB file on the hotpath
 /// must not OOM the wrapper. The guard checks the size *before*
 /// any `std::fs::read`, then for oversized files compares the persisted
-/// `(size, mtime_ns)` against the on-disk stat instead of hashing the
+/// complete stat identity against the on-disk stat instead of hashing the
 /// body:
 ///
-/// - no persisted row, or size/mtime differ → `Modified` (gate goes
+/// - no persisted row, missing identity, or any stat field differs → `Modified` (gate goes
 ///   `Stale`, prompting a reindex that the indexer also caps);
-/// - persisted size & mtime match → `Unchanged` (cheap, no read).
+/// - all reliable persisted stat fields match → `Unchanged` (cheap, no read).
 ///
 /// The indexer side enforces the same cap, so the persisted
 /// `file_state` row never sees an oversized file's actual content hash.
@@ -86,6 +86,7 @@ pub fn compute_file_diff(
     inventory: &[InventoryEntry],
 ) -> Result<Vec<FileDiff>> {
     let persisted = store.list_file_states(project)?;
+    let identities = store.list_file_identities(project)?;
     let mut diffs = Vec::with_capacity(inventory.len());
     let max_size = max_file_size_bytes();
 
@@ -95,12 +96,15 @@ pub fn compute_file_diff(
     let mut by_rel: std::collections::HashMap<String, PersistedStat> = persisted
         .into_iter()
         .map(|f| {
+            let identity = identities.get(&f.rel_path).copied();
             (
                 f.rel_path,
                 PersistedStat {
                     sha256: f.sha256,
                     size: f.size,
                     mtime_ns: f.mtime_ns,
+                    ctime_ns: identity.and_then(|value| value.ctime_ns),
+                    file_id: identity.and_then(|value| value.file_id),
                 },
             )
         })
@@ -111,25 +115,40 @@ pub fn compute_file_diff(
         // (size, mtime_ns) for every entry, so the common case costs no
         // extra syscall; fall back to one metadata() call otherwise. A
         // multi-GB file costs one syscall here, not a multi-GB allocation.
-        let (on_disk_size, on_disk_mtime) = match (entry.size, entry.mtime_ns) {
-            (Some(size), mtime @ Some(_)) => (size, mtime),
+        let current = match (entry.size, entry.mtime_ns) {
+            (Some(size), mtime @ Some(_)) => CurrentStat {
+                size,
+                mtime_ns: mtime,
+                ctime_ns: entry.ctime_ns,
+                file_id: entry.file_id,
+            },
             _ => match std::fs::metadata(&entry.abs_path) {
-                Ok(md) => (md.len(), mtime_ns_from_metadata(&md)),
-                Err(_) => continue, // skip unreadable; indexer handles this too
+                Ok(md) => {
+                    let metadata = stable_metadata(&md);
+                    CurrentStat {
+                        size: metadata.size,
+                        mtime_ns: metadata.mtime_ns,
+                        ctime_ns: metadata.ctime_ns,
+                        file_id: metadata.file_id,
+                    }
+                }
+                Err(error) => {
+                    return Err(greppy_core::Error::io(
+                        format!("stat {}", entry.abs_path.display()),
+                        error,
+                    ));
+                }
             },
         };
 
-        if on_disk_size > max_size {
+        if current.size > max_size {
             // Oversized: diff by (size, mtime) against the persisted
             // row instead of slurping + hashing the body.
             let persisted = by_rel.remove(&entry.rel_path);
             match persisted {
                 // Unchanged iff a row exists and both size & mtime
                 // line up with the current stat.
-                Some(p)
-                    if p.size == on_disk_size as i64
-                        && p.mtime_ns == on_disk_mtime.unwrap_or(i64::MIN) =>
-                {
+                Some(p) if stat_identity_matches(&p, &current) => {
                     diffs.push(FileDiff::Unchanged);
                 }
                 // No row, or stat drifted → treat as Modified so the
@@ -143,13 +162,12 @@ pub fn compute_file_diff(
             continue;
         }
 
-        // Stat tier: persisted (size, mtime_ns) match the on-disk stat
-        // ⇒ Unchanged without reading the body. `mtime_ns == 0` is the
+        // Stat tier: all reliable persisted identity fields match the
+        // on-disk stat ⇒ Unchanged without reading the body. `mtime_ns == 0` is the
         // "mtime unknown" sentinel some writers record; never fast-path
         // it (fall through to the hash tier).
         if let Some(p) = by_rel.get(&entry.rel_path) {
-            if p.mtime_ns != 0 && p.size == on_disk_size as i64 && Some(p.mtime_ns) == on_disk_mtime
-            {
+            if stat_identity_matches(p, &current) {
                 by_rel.remove(&entry.rel_path);
                 diffs.push(FileDiff::Unchanged);
                 continue;
@@ -157,10 +175,9 @@ pub fn compute_file_diff(
         }
 
         // Hash tier (stat drifted or file unknown): safe to read + hash.
-        let bytes = match std::fs::read(&entry.abs_path) {
-            Ok(b) => b,
-            Err(_) => continue, // skip unreadable; indexer handles this case too
-        };
+        let (bytes, _) = read_stable_file(&entry.abs_path).map_err(|error| {
+            greppy_core::Error::io(format!("stable read {}", entry.abs_path.display()), error)
+        })?;
         let sha = sha256_hex(&bytes);
         match by_rel.remove(&entry.rel_path) {
             None => diffs.push(FileDiff::Added(entry.clone())),
@@ -186,6 +203,27 @@ struct PersistedStat {
     sha256: String,
     size: i64,
     mtime_ns: i64,
+    ctime_ns: Option<i64>,
+    file_id: Option<u64>,
+}
+
+struct CurrentStat {
+    size: u64,
+    mtime_ns: Option<i64>,
+    ctime_ns: Option<i64>,
+    file_id: Option<u64>,
+}
+
+fn stat_identity_matches(persisted: &PersistedStat, current: &CurrentStat) -> bool {
+    persisted.mtime_ns != 0
+        && persisted.size == current.size as i64
+        && Some(persisted.mtime_ns) == current.mtime_ns
+        && persisted.ctime_ns.is_some()
+        && current.ctime_ns.is_some()
+        && persisted.ctime_ns == current.ctime_ns
+        && persisted.file_id.is_some()
+        && current.file_id.is_some()
+        && persisted.file_id == current.file_id
 }
 
 fn rel_of(d: &FileDiff) -> String {
@@ -225,8 +263,8 @@ pub fn incremental_update(
                         continue;
                     }
                 }
-                let bytes = std::fs::read(&entry.abs_path).map_err(|e| {
-                    greppy_core::Error::io(format!("read {}", entry.abs_path.display()), e)
+                let (bytes, metadata) = read_stable_file(&entry.abs_path).map_err(|e| {
+                    greppy_core::Error::io(format!("stable read {}", entry.abs_path.display()), e)
                 })?;
                 let extraction = greppy_parser::extract(lang, &bytes, &entry.rel_path)?;
                 // We use the public store API: upsert each
@@ -249,12 +287,20 @@ pub fn incremental_update(
                     rel_path: entry.rel_path.clone(),
                     language: lang.name().into(),
                     sha256: sha256_hex(&bytes),
-                    mtime_ns: mtime_ns(&entry.abs_path).unwrap_or(0),
+                    mtime_ns: metadata.mtime_ns.unwrap_or(0),
                     size: bytes.len() as i64,
                     parser_version: "tree-sitter-0.25".into(),
                     extractor_version: "greppy-extractor-v1".into(),
                     last_indexed_generation: 0,
                 })?;
+                store.upsert_file_identity(
+                    project,
+                    &entry.rel_path,
+                    FileIdentity {
+                        ctime_ns: metadata.ctime_ns,
+                        file_id: metadata.file_id,
+                    },
+                )?;
                 reindexed += 1;
             }
             FileDiff::Deleted(rel) => {
@@ -314,6 +360,7 @@ fn bump(store: &mut Store, root: &str) -> Result<u64> {
     Ok(greppy_store::Store::bump_generation(store, root)?)
 }
 
+#[cfg(test)]
 fn mtime_ns(path: &Path) -> Option<i64> {
     mtime_ns_from_metadata(&std::fs::metadata(path).ok()?)
 }
@@ -326,6 +373,7 @@ fn mtime_ns(path: &Path) -> Option<i64> {
 /// [`compute_file_diff`] compares the walker-captured value against the
 /// value this crate persisted, so any conversion drift would silently
 /// disable the fast path (or worse, fast-path a changed file).
+#[cfg(test)]
 fn mtime_ns_from_metadata(md: &std::fs::Metadata) -> Option<i64> {
     let mtime = md.modified().ok()?;
     Some(match mtime.duration_since(std::time::UNIX_EPOCH) {
@@ -564,6 +612,18 @@ mod tests {
             })
             .unwrap();
 
+        let metadata = greppy_discover::stable_metadata(&fs::metadata(&entry.abs_path).unwrap());
+        store
+            .upsert_file_identity(
+                "p",
+                "big.bin",
+                FileIdentity {
+                    ctime_ns: metadata.ctime_ns,
+                    file_id: metadata.file_id,
+                },
+            )
+            .unwrap();
+
         let diffs = compute_file_diff(&store, "p", std::slice::from_ref(&entry)).unwrap();
         assert_eq!(diffs.len(), 1);
         assert_eq!(
@@ -725,12 +785,79 @@ mod tests {
             })
             .unwrap();
 
+        let metadata = greppy_discover::stable_metadata(&md);
+        store
+            .upsert_file_identity(
+                "p",
+                "src/keep.rs",
+                FileIdentity {
+                    ctime_ns: metadata.ctime_ns,
+                    file_id: metadata.file_id,
+                },
+            )
+            .unwrap();
+
         let diffs = compute_file_diff(&store, "p", std::slice::from_ref(&entry)).unwrap();
         assert_eq!(
             diffs,
             vec![FileDiff::Unchanged],
             "matching (size, mtime_ns) must fast-path to Unchanged without hashing"
         );
+    }
+
+    #[test]
+    fn same_size_change_with_restored_mtime_is_detected() {
+        let mut store = Store::open_memory().unwrap();
+        store
+            .upsert_project(&Project {
+                name: "p".into(),
+                indexed_at: "x".into(),
+                root_path: "/p".into(),
+            })
+            .unwrap();
+
+        let dir = tempdir_via_env();
+        let entry = make_entry(&dir, "src/swap.rs", "old-body");
+        let original = fs::metadata(&entry.abs_path).unwrap();
+        let original_modified = original.modified().unwrap();
+        let original_identity = greppy_discover::stable_metadata(&original);
+        store
+            .upsert_file_state(&FileState {
+                project: "p".into(),
+                rel_path: entry.rel_path.clone(),
+                language: "rust".into(),
+                sha256: sha256_hex(b"old-body"),
+                mtime_ns: original_identity.mtime_ns.unwrap(),
+                size: 8,
+                parser_version: "x".into(),
+                extractor_version: "x".into(),
+                last_indexed_generation: 1,
+            })
+            .unwrap();
+        store
+            .upsert_file_identity(
+                "p",
+                &entry.rel_path,
+                FileIdentity {
+                    ctime_ns: original_identity.ctime_ns,
+                    file_id: original_identity.file_id,
+                },
+            )
+            .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        fs::write(&entry.abs_path, "new-body").unwrap();
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(&entry.abs_path)
+            .unwrap();
+        file.set_modified(original_modified).unwrap();
+
+        let diffs = compute_file_diff(&store, "p", std::slice::from_ref(&entry)).unwrap();
+        assert!(matches!(
+            diffs.as_slice(),
+            [FileDiff::Modified { entry, .. }] if entry.rel_path == "src/swap.rs"
+        ));
     }
 
     #[test]

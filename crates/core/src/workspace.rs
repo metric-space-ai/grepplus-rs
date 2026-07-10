@@ -12,11 +12,12 @@
 //! 1. The graph DB is **never** placed at `<repo>/.greppy/graph.db`.
 //!    That path lives inside the workspace and trips every `grep -R .`
 //!    over the SQLite file.
-//! 2. Default store location:
-//!    - `$XDG_CACHE_HOME/greppy/<ws-hash>/graph.db` if `XDG_CACHE_HOME`
-//!      is set (or `$HOME/.cache/greppy/...` on Linux);
-//!    - `$TMPDIR/greppy/<ws-hash>/graph.db` as fallback on Unix;
-//!    - `%LOCALAPPDATA%/greppy/<ws-hash>/graph.db` on Windows
+//! 2. Default store location uses the versioned data root:
+//!    - `$XDG_DATA_HOME/greppy/workspaces/v2/<ws-hash>/graph.db`
+//!      (or `$HOME/.local/share/greppy/...`) on Linux;
+//!    - `~/Library/Application Support/greppy/workspaces/v2/<ws-hash>/graph.db`
+//!      on macOS;
+//!    - `%LOCALAPPDATA%/greppy/workspaces/v2/<ws-hash>/graph.db` on Windows
 //!      (Tier 2 — not Tier 1 today; kept so the function compiles).
 //! 3. Override via `GREPPY_STORE_DIR=/path/to/dir`; the workspace hash
 //!    is still appended so different workspaces do not collide.
@@ -62,96 +63,7 @@ pub fn workspace_hash(workspace_root: &Path) -> String {
 /// **not** created by this function — callers create it on first write
 /// so we never leave an empty dir behind on read-only paths.
 pub fn store_dir(workspace_root: &Path) -> PathBuf {
-    if let Ok(p) = std::env::var("GREPPY_STORE_DIR") {
-        return PathBuf::from(p).join(workspace_hash(workspace_root));
-    }
-
-    // DATA directories, deliberately NOT cache directories (O7, 2026-07-06):
-    // stores hold expensively-computed embeddings, and the OS is entitled to
-    // purge cache locations at will — macOS cache maintenance wiped
-    // `~/Library/Caches/greppy` mid-session repeatedly, silently degrading
-    // semantic search. Our own TTL eviction keeps the footprint bounded, so
-    // nothing is lost by moving to a data location.
-    //
-    // macOS:      ~/Library/Application Support/greppy/<ws-hash>
-    // Linux XDG:  $XDG_DATA_HOME/greppy/<ws-hash>, or ~/.local/share/...
-    // Windows:    %LOCALAPPDATA%\greppy\<ws-hash>  (not OS-purged)
-    // Fallback:   $TMPDIR/greppy/<ws-hash>.
-    //
-    // A store still living at the pre-O7 cache location is MIGRATED
-    // (renamed) to the data location once, so existing indexes and
-    // embeddings survive the move.
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            let hash = workspace_hash(workspace_root);
-            let new = home
-                .join("Library")
-                .join("Application Support")
-                .join("greppy")
-                .join(&hash);
-            let old = home
-                .join("Library")
-                .join("Caches")
-                .join("greppy")
-                .join(&hash);
-            migrate_store_dir(&old, &new);
-            return new;
-        }
-    }
-    #[cfg(all(target_os = "linux", not(target_os = "android")))]
-    {
-        let data_base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("share"))
-            });
-        if let Some(base) = data_base {
-            let hash = workspace_hash(workspace_root);
-            let new = base.join("greppy").join(&hash);
-            let cache_base = std::env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")));
-            if let Some(cb) = cache_base {
-                migrate_store_dir(&cb.join("greppy").join(&hash), &new);
-            }
-            return new;
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            return PathBuf::from(local)
-                .join("greppy")
-                .join(workspace_hash(workspace_root));
-        }
-    }
-    if let Some(tmp) = std::env::var_os("TMPDIR") {
-        return PathBuf::from(tmp)
-            .join("greppy")
-            .join(workspace_hash(workspace_root));
-    }
-    // Last resort: a per-process tmp dir.
-    std::env::temp_dir()
-        .join("greppy")
-        .join(workspace_hash(workspace_root))
-}
-
-/// One-time, best-effort migration of a store from the pre-O7 cache
-/// location to the data location. A plain rename (same volume in practice);
-/// silently a no-op when the old dir is absent, the new dir already exists,
-/// or the rename fails (the caller then simply starts fresh at `new`).
-fn migrate_store_dir(old: &Path, new: &Path) {
-    if new.exists() || !old.exists() {
-        return;
-    }
-    if let Some(parent) = new.parent() {
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-    }
-    let _ = std::fs::rename(old, new);
+    crate::cache::workspace_store_dir(workspace_root)
 }
 
 /// Full path to the workspace's graph DB.
@@ -159,21 +71,13 @@ pub fn store_path(workspace_root: &Path) -> PathBuf {
     store_dir(workspace_root).join("graph.db")
 }
 
-/// Root directory that holds every workspace's per-hash store dir —
-/// i.e. the `<cache>/greppy/` parent of `store_dir(<any-root>)`. This
-/// is where [`cleanup_stale_stores`] scans for evictable stores.
-///
-/// Derived from `store_dir` of a throwaway path so the two never drift:
-/// `store_dir` appends `<ws-hash>`, and this strips that last segment.
-/// Returns `None` only in the degenerate case where `store_dir` has no
-/// parent (it always does today).
+/// Root of Greppy's owned data namespaces.
 pub fn store_cache_root() -> Option<PathBuf> {
-    // Any path works: we only want the `<cache>/greppy/` prefix that
-    // is common to every workspace's store dir.
-    store_dir(Path::new("/")).parent().map(|p| p.to_path_buf())
+    Some(crate::cache::data_root())
 }
 
-/// Name of the per-store "last used" marker file. Written on every
+/// Name of the per-store "last used" marker file. Rate-limited to one write
+/// per minute and updated on every
 /// query that opens the store to serve a read (via [`touch_lastused`]),
 /// because a read-only query never bumps `graph.db`'s mtime, so the
 /// mtime of the DB alone cannot tell a stale store from a recently used
@@ -187,14 +91,12 @@ pub const LASTUSED_MARKER: &str = ".lastused";
 /// The write updates the file's mtime, which is what
 /// [`cleanup_stale_stores`] reads.
 pub fn touch_lastused(store_dir: &Path) {
-    let marker = store_dir.join(LASTUSED_MARKER);
-    // Overwrite the (tiny) file so its mtime advances to now. An empty
-    // body is fine — only the mtime is read back.
-    let _ = std::fs::write(&marker, b"");
+    crate::cache::touch_last_used_dir(store_dir);
 }
 
 /// Environment variable overriding the store eviction TTL, in **days**.
-/// `0` disables eviction entirely. Absent/unparsable falls back to
+/// `0` disables only age-based eviction; the quota remains independent.
+/// Absent/unparsable falls back to
 /// [`STORE_TTL_DAYS_DEFAULT`].
 pub const ENV_STORE_TTL_DAYS: &str = "GREPPY_STORE_TTL_DAYS";
 
@@ -214,78 +116,53 @@ pub fn store_ttl_secs() -> u64 {
     days.saturating_mul(24 * 60 * 60)
 }
 
-/// Evict stale index stores under `cache_root` (the `<cache>/greppy/`
-/// directory returned by [`store_cache_root`]).
-///
-/// Scans each immediate subdirectory `<cache_root>/<ws-hash>/` and
-/// removes the whole store dir when its `.lastused` marker (see
-/// [`touch_lastused`]) is older than `ttl_secs` — EXCEPT the `keep` dir
-/// (the store the current invocation is using), which is never removed
-/// even if its marker looks stale. A store dir with **no** marker at all
-/// is treated as stale (legacy stores predating the marker, or a store
-/// whose marker write failed) and is eligible for eviction once
-/// old enough by dir mtime.
-///
-/// `ttl_secs == 0` disables eviction and returns `0` immediately.
-///
-/// Best-effort throughout: unreadable entries, un-removable dirs, and a
-/// missing `cache_root` are skipped, never surfaced as errors. Returns
-/// the number of store dirs removed.
+/// Compatibility wrapper around the manifest-verified global GC. The
+/// `cache_root` argument is ignored so an arbitrary caller-provided directory
+/// can never become a recursive deletion root. `ttl_secs == 0` disables only
+/// age eviction; the independently configured quota still applies.
 pub fn cleanup_stale_stores(cache_root: &Path, ttl_secs: u64, keep: &Path) -> usize {
-    use std::time::{Duration, SystemTime};
+    let _ = cache_root; // retained for source compatibility; GC owns its root.
+    let current_root = crate::cache::read_store_manifest(keep)
+        .ok()
+        .map(|m| m.canonical_root);
+    let mut policy = crate::cache::GcPolicy::from_env();
+    policy.ttl = std::time::Duration::from_secs(ttl_secs);
+    crate::cache::run_gc(&policy, false, current_root.as_deref())
+        .map(|r| r.removed.len())
+        .unwrap_or(0)
+}
 
-    if ttl_secs == 0 {
-        return 0;
-    }
-    let read_dir = match std::fs::read_dir(cache_root) {
-        Ok(rd) => rd,
-        Err(_) => return 0, // cache root absent or unreadable: nothing to do
-    };
-    // Canonicalise `keep` so a comparison is robust to symlinks and
-    // relative-vs-absolute forms. Fall back to the raw path if it does
-    // not resolve (e.g. does not exist yet).
-    let keep_canon = keep.canonicalize().unwrap_or_else(|_| keep.to_path_buf());
-    let now = SystemTime::now();
-    let cutoff = Duration::from_secs(ttl_secs);
-    let mut removed = 0usize;
-
-    for entry in read_dir.flatten() {
-        let dir = entry.path();
-        // Only consider directories (the per-workspace store dirs).
-        if !dir.is_dir() {
-            continue;
+/// Resolve the canonical workspace root shared by every CLI and drop-in path.
+/// `.git` may be either a directory or a file (linked worktree/submodule).
+pub fn resolve_workspace_root(start: &Path) -> PathBuf {
+    let canonical = start
+        .canonicalize()
+        .or_else(|_| std::path::absolute(start))
+        .unwrap_or_else(|_| start.to_path_buf());
+    let mut cur = canonical.as_path();
+    let mut nearest_project_marker = None;
+    loop {
+        // A linked worktree has a `.git` file rather than a directory. In
+        // either form it is the authoritative isolation boundary and must
+        // win over nested Cargo/Python project markers in a monorepo.
+        if cur.join(".git").exists() {
+            return cur.to_path_buf();
         }
-        // Never evict the store the current invocation is serving from.
-        let dir_canon = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-        if dir_canon == keep_canon {
-            continue;
+        if nearest_project_marker.is_none()
+            && (cur.join("Cargo.toml").exists() || cur.join("pyproject.toml").exists())
+        {
+            nearest_project_marker = Some(cur.to_path_buf());
         }
-        // Age = time since the store was last used. Prefer the dedicated
-        // `.lastused` marker's mtime; if it is absent, fall back to the
-        // store dir's own mtime so legacy stores can still be reaped.
-        let marker = dir.join(LASTUSED_MARKER);
-        let last_used = std::fs::metadata(&marker)
-            .and_then(|m| m.modified())
-            .or_else(|_| entry.metadata().and_then(|m| m.modified()));
-        let last_used = match last_used {
-            Ok(t) => t,
-            Err(_) => continue, // cannot determine age: leave it alone
-        };
-        let age = match now.duration_since(last_used) {
-            Ok(a) => a,
-            Err(_) => continue, // clock skew / future mtime: leave it alone
-        };
-        if age > cutoff && std::fs::remove_dir_all(&dir).is_ok() {
-            removed += 1;
+        match cur.parent() {
+            Some(parent) if parent != cur => cur = parent,
+            _ => return nearest_project_marker.unwrap_or(canonical),
         }
     }
-    removed
 }
 
 /// Return the project-identity string for `start`: the basename of the
-/// canonical repo root (walking up looking for `.git`, `Cargo.toml`,
-/// or `pyproject.toml`). Falls back to the basename of `start` itself,
-/// then to `"default"` if the basename is empty.
+/// canonical workspace root resolved by [`resolve_workspace_root`]. Falls
+/// back to the basename of `start` itself, then to `"default"` if empty.
 ///
 /// This is the *one* function the CLI dispatcher and the indexer use
 /// to derive the `project` column for the store.
@@ -293,27 +170,7 @@ pub fn cleanup_stale_stores(cache_root: &Path, ttl_secs: u64, keep: &Path) -> us
 /// from any cwd, then `greppy search-code Q` from a subdir, and the
 /// project identity matches.
 pub fn project_identity(start: &Path) -> String {
-    let canonical = start.canonicalize().unwrap_or_else(|_| start.to_path_buf());
-    let mut cur = canonical.clone();
-    let mut found_marker = false;
-    loop {
-        if cur.join(".git").exists()
-            || cur.join("Cargo.toml").exists()
-            || cur.join("pyproject.toml").exists()
-        {
-            found_marker = true;
-            break;
-        }
-        match cur.parent() {
-            Some(p) if !p.as_os_str().is_empty() && p != cur => cur = p.to_path_buf(),
-            _ => break,
-        }
-    }
-    // When no marker exists in the chain, return the basename of the
-    // original `start` (not the walked-up `cur`, which would be `/`
-    // or `private`).
-    let final_path = if found_marker { &cur } else { &canonical };
-    final_path
+    resolve_workspace_root(start)
         .file_name()
         .and_then(|s| s.to_str())
         .filter(|s| !s.is_empty())
@@ -530,6 +387,27 @@ mod tests {
     }
 
     #[test]
+    fn git_worktree_root_wins_over_nested_project_marker() {
+        let tmp = tempdir_root("greppy-root-nested-project");
+        let root = tmp.join("monorepo");
+        let nested = root.join("crates/member/src");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            root.join("crates/member/Cargo.toml"),
+            "[package]\nname = \"member\"\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_workspace_root(&nested),
+            root.canonicalize().unwrap()
+        );
+        assert_eq!(project_identity(&nested), "monorepo");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn project_identity_falls_back_to_basename_when_no_marker() {
         let tmp = tempdir_root("greppy-projid-nomarker");
         let naked = tmp.join("naked/dir");
@@ -596,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_stale_stores_removes_old_keeps_fresh_and_keep_dir() {
+    fn legacy_cleanup_api_never_removes_unverified_directories() {
         let cache = tempdir_root("greppy-cleanup-stores");
         // An OLD store: marker aged well past the TTL → evicted. Use a
         // large back-date (10 days) so a timezone skew in the `touch -t`
@@ -619,10 +497,11 @@ mod tests {
         std::fs::write(keep.join("graph.db"), b"sqlite").unwrap();
         write_marker_aged(&keep, 10 * 86_400);
 
-        // TTL = 1 day: only the old, non-keep store is stale.
+        // These directories have no V2 manifest. The compatibility API now
+        // delegates to the safe GC and must leave every one untouched.
         let removed = cleanup_stale_stores(&cache, 86_400, &keep);
-        assert_eq!(removed, 1, "exactly the old non-keep store is removed");
-        assert!(!old.exists(), "old store must be evicted");
+        assert_eq!(removed, 0, "unverified directories are unmanaged");
+        assert!(old.exists(), "old but unverified data must survive");
         assert!(fresh.exists(), "fresh store must survive");
         assert!(keep.exists(), "keep store must survive even when stale");
 

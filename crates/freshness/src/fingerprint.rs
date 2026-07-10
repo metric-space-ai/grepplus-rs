@@ -24,10 +24,26 @@ fn fingerprint_matches(
     let other_root = std::path::PathBuf::from(&ws.root_path);
     let roots_match = fp.canonical_root == other_root
         || fp.canonical_root == other_root.canonicalize().unwrap_or(other_root.clone());
+    let git_dir_match = stored_git_path_matches(ws.git_dir.as_deref(), fp.git_dir.as_deref());
+    let git_common_dir_match =
+        stored_git_path_matches(ws.git_common_dir.as_deref(), fp.git_common_dir.as_deref());
     let head_match = fp.head_oid == ws.head_oid;
     let index_match = fp.index_signature == ws.index_signature;
     let indexer_match = ws.indexer_version == expected_indexer_version;
-    roots_match && head_match && index_match && indexer_match
+    roots_match
+        && git_dir_match
+        && git_common_dir_match
+        && head_match
+        && index_match
+        && indexer_match
+}
+
+fn stored_git_path_matches(stored: Option<&str>, current: Option<&Path>) -> bool {
+    match (stored, current) {
+        (None, None) => true,
+        (Some(stored), Some(current)) => Path::new(stored) == current,
+        _ => false,
+    }
 }
 
 /// One row of the on-demand freshness check.
@@ -39,6 +55,9 @@ pub enum FreshnessOutcome {
     Fresh,
     /// Fingerprint disagrees; graph is stale.
     Stale { reasons: Vec<String> },
+    /// Freshness could not be proven. Callers must fall back instead of
+    /// serving indexed data.
+    Unknown { reasons: Vec<String> },
     /// Persisted state exists but points at a different root path.
     /// Caller should usually trigger a full reindex.
     RootMismatch,
@@ -53,7 +72,7 @@ pub struct FreshnessState {
 
 /// Compute the freshness check against the persisted workspace state.
 /// Uses an overall budget of `budget`; if exceeded, returns a
-/// `Stale` outcome with `Budget exceeded` in the reasons list.
+/// `Unknown` outcome with `budget exceeded` in the reasons list.
 pub fn check(
     store: &Store,
     current: &WorkspaceFingerprint,
@@ -109,7 +128,7 @@ pub fn check_with_overrides(
 
     if start.elapsed() > budget {
         return Ok(FreshnessState {
-            outcome: FreshnessOutcome::Stale {
+            outcome: FreshnessOutcome::Unknown {
                 reasons: vec!["budget exceeded".into()],
             },
             elapsed: start.elapsed(),
@@ -126,6 +145,21 @@ pub fn check_with_overrides(
         }
         Some(persisted) => {
             let mut reasons = Vec::new();
+            if !stored_git_path_matches(persisted.git_dir.as_deref(), current.git_dir.as_deref()) {
+                reasons.push(format!(
+                    "git_dir changed (was {:?}, now {:?})",
+                    persisted.git_dir, current.git_dir
+                ));
+            }
+            if !stored_git_path_matches(
+                persisted.git_common_dir.as_deref(),
+                current.git_common_dir.as_deref(),
+            ) {
+                reasons.push(format!(
+                    "git_common_dir changed (was {:?}, now {:?})",
+                    persisted.git_common_dir, current.git_common_dir
+                ));
+            }
             if persisted.head_oid != current.head_oid {
                 reasons.push(format!(
                     "head_oid changed (was {:?}, now {:?})",
@@ -208,10 +242,9 @@ pub fn check_files_with_overrides(
 /// Detailed file-level freshness report (defect D2).
 ///
 /// The plain [`check_files_with_overrides`] verdict is enough for a
-/// yes/no gate, but the D2 fail-open policy needs to know *how* stale
+/// yes/no gate, but the refresh policy needs to know *how* stale
 /// the index is: a handful of changed files can be auto-reindexed
-/// inline, and a labeled-stale answer should tell the agent how many
-/// files drifted.
+/// inline, while larger drift starts one background build.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileFreshnessReport {
     pub state: FreshnessState,
@@ -237,7 +270,7 @@ pub struct FileFreshnessReport {
 /// made within the window is served from the index unlabeled for at
 /// most this long. Override with `GREPPY_FRESHNESS_TTL_MS` (0
 /// disables).
-pub const DEFAULT_FRESHNESS_TTL: Duration = Duration::from_millis(2_000);
+pub const DEFAULT_FRESHNESS_TTL: Duration = Duration::ZERO;
 
 /// Env var overriding [`DEFAULT_FRESHNESS_TTL`] in milliseconds.
 pub const ENV_FRESHNESS_TTL_MS: &str = "GREPPY_FRESHNESS_TTL_MS";
@@ -254,7 +287,7 @@ fn freshness_ttl_from_env() -> Duration {
 
 /// [`check_files_with_overrides`], but returning the detailed
 /// [`FileFreshnessReport`]. TTL comes from the environment
-/// (`GREPPY_FRESHNESS_TTL_MS`, default 2000 ms).
+/// (`GREPPY_FRESHNESS_TTL_MS`, default 0 ms / disabled).
 pub fn check_files_report_with_overrides(
     store: &Store,
     root: &Path,
@@ -311,7 +344,7 @@ pub fn check_files_report_with_ttl(
     // the file-level diff has nothing to compare against.
     if matches!(
         ws.outcome,
-        FreshnessOutcome::Cold | FreshnessOutcome::RootMismatch
+        FreshnessOutcome::Cold | FreshnessOutcome::RootMismatch | FreshnessOutcome::Unknown { .. }
     ) {
         return Ok(FileFreshnessReport {
             state: ws,
@@ -328,7 +361,7 @@ pub fn check_files_report_with_ttl(
         reasons.push("budget exceeded".into());
         return Ok(FileFreshnessReport {
             state: FreshnessState {
-                outcome: FreshnessOutcome::Stale { reasons },
+                outcome: FreshnessOutcome::Unknown { reasons },
                 elapsed: start.elapsed(),
             },
             ttl_hit: false,
@@ -341,7 +374,7 @@ pub fn check_files_report_with_ttl(
     // D2: this runs even when the workspace-level check is already
     // Stale (a commit / staging drift), because the caller needs the
     // changed-file set to decide between inline auto-reindex and a
-    // labeled-stale answer.
+    // background refresh.
     let entries = match greppy_discover::walk_with_policy_and_overrides(
         root,
         &greppy_discover::SkipPolicy::walk_default(),
@@ -352,7 +385,7 @@ pub fn check_files_report_with_ttl(
             reasons.push(format!("discover walk failed: {e}"));
             return Ok(FileFreshnessReport {
                 state: FreshnessState {
-                    outcome: FreshnessOutcome::Stale { reasons },
+                    outcome: FreshnessOutcome::Unknown { reasons },
                     elapsed: start.elapsed(),
                 },
                 ttl_hit: false,
@@ -363,12 +396,26 @@ pub fn check_files_report_with_ttl(
     };
     let inventory: Vec<greppy_discover::InventoryEntry> = entries.into_iter().collect();
     let total_inventory = inventory.len();
-    let diffs = crate::incremental::compute_file_diff(store, project, &inventory)?;
+    let diffs = match crate::incremental::compute_file_diff(store, project, &inventory) {
+        Ok(diffs) => diffs,
+        Err(error) => {
+            reasons.push(format!("file verification failed: {error}"));
+            return Ok(FileFreshnessReport {
+                state: FreshnessState {
+                    outcome: FreshnessOutcome::Unknown { reasons },
+                    elapsed: start.elapsed(),
+                },
+                ttl_hit: false,
+                changed_paths: None,
+                total_inventory: Some(total_inventory),
+            });
+        }
+    };
     if start.elapsed() > budget {
         reasons.push("budget exceeded".into());
         return Ok(FileFreshnessReport {
             state: FreshnessState {
-                outcome: FreshnessOutcome::Stale { reasons },
+                outcome: FreshnessOutcome::Unknown { reasons },
                 elapsed: start.elapsed(),
             },
             ttl_hit: false,
@@ -606,6 +653,18 @@ mod tests {
             .unwrap();
         let r = check(&store, &fp, Duration::from_secs(1)).unwrap();
         assert_eq!(r.outcome, FreshnessOutcome::Fresh);
+
+        let mut different_worktree_metadata = fp.clone();
+        different_worktree_metadata.git_dir = Some(std::path::PathBuf::from("different-git-dir"));
+        let r = check(&store, &different_worktree_metadata, Duration::from_secs(1)).unwrap();
+        match r.outcome {
+            FreshnessOutcome::Stale { reasons } => {
+                assert!(reasons
+                    .iter()
+                    .any(|reason| reason.contains("git_dir changed")));
+            }
+            other => panic!("changed worktree git_dir must be stale, got {other:?}"),
+        }
     }
 
     #[test]

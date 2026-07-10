@@ -59,12 +59,29 @@ fn run_with_env(
     store_dir: &Path,
     envs: &[(&str, &str)],
 ) -> (i32, String, String) {
+    run_with_env_and_inference(args, cwd, store_dir, envs, false)
+}
+
+fn run_with_inference(args: &[&str], cwd: &Path, store_dir: &Path) -> (i32, String, String) {
+    run_with_env_and_inference(args, cwd, store_dir, &[], true)
+}
+
+fn run_with_env_and_inference(
+    args: &[&str],
+    cwd: &Path,
+    store_dir: &Path,
+    envs: &[(&str, &str)],
+    inference: bool,
+) -> (i32, String, String) {
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .current_dir(cwd)
         .env("GREPPY_STORE_DIR", store_dir)
         .env_remove("GREPPY_DISCOVER_INCLUDE")
         .env_remove("GREPPY_DISCOVER_EXCLUDE");
+    if !inference {
+        cmd.env("GREPPY_TEST_SKIP_INFERENCE", "1");
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -177,6 +194,38 @@ fn mode_of(path: &Path) -> u32 {
     std::fs::metadata(path).unwrap().mode() & 0o777
 }
 
+#[cfg(unix)]
+struct TestFileLock(std::fs::File);
+
+#[cfg(unix)]
+impl Drop for TestFileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+        let _ = unsafe { flock(self.0.as_raw_fd(), 8) };
+    }
+}
+
+#[cfg(unix)]
+fn hold_exclusive_lock(path: &Path) -> TestFileLock {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn flock(fd: i32, operation: i32) -> i32;
+    }
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .unwrap();
+    assert_eq!(unsafe { flock(file.as_raw_fd(), 2) }, 0);
+    TestFileLock(file)
+}
+
 // ---------------------------------------------------------------------------
 // RV-011 — index . then search-code finds content (same project identity).
 // RV-006 — searching from a subdirectory resolves the SAME store.
@@ -282,10 +331,8 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
     );
 }
 
-/// D2 fail-open, small drift: the one-file edit is auto-reindexed
-/// inline, so search-code answers FRESH about the CURRENT tree — the
-/// removed marker is honestly gone, the new one is found. (The old
-/// contract refused with `skipped_stale_index` + exit 1.)
+/// Small drift is atomically reindexed, while the current search-code request
+/// uses the live filesystem rather than the already-open old snapshot.
 #[test]
 fn search_code_json_auto_reindexes_and_reports_current_state() {
     let (repo, store) = make_repo("search-json-stale", "old_json_stale_marker");
@@ -312,11 +359,8 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-code");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(
-        v["fresh"], true,
-        "auto-reindex must yield a fresh answer: {v:?}"
-    );
+    assert_eq!(v["status"], "live-fallback");
+    assert_eq!(v["fresh"], true, "live fallback itself is current: {v:?}");
     assert_eq!(v["total_exact"], 0);
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
 
@@ -338,9 +382,8 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
     );
 }
 
-/// D2: with the auto-reindex kill switch set, stale search-code --json
-/// serves the OLD indexed rows, labeled `fresh: false`, plus a stderr
-/// warning — never exit-1-with-nothing.
+/// With auto-reindex disabled, stale search-code still uses the current live
+/// filesystem and never exposes old FTS rows.
 #[test]
 fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
     let (repo, store) = make_repo("search-json-stale-label", "old_labeled_stale_marker");
@@ -362,24 +405,17 @@ fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
-        "labeled-stale search-code must serve the indexed rows; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("index may be stale") && err.contains("run 'grep index'"),
-        "labeled-stale search-code must warn on stderr; stderr={err:?}"
+        code, 1,
+        "old marker is absent from live fallback; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-code");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["fresh"], false, "result must be labeled stale: {v:?}");
-    assert_eq!(v["freshness"]["state"], "stale");
-    assert_eq!(v["freshness"]["stale_file_count"], 1);
-    assert!(
-        !v["hits"].as_array().unwrap().is_empty(),
-        "labeled-stale search-code must serve rows from the existing index: {v:?}"
-    );
+    assert_eq!(v["status"], "live-fallback");
+    assert_eq!(v["fresh"], true);
+    assert_eq!(v["index_freshness"]["state"], "drift");
+    assert_eq!(v["index_freshness"]["stale_file_count"], 1);
+    assert!(v["hits"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -973,11 +1009,17 @@ fn insert_default_model_vectors(store_dir: &Path, count: usize) {
         .expect("workspace state present")
         .graph_generation;
 
+    let model_id = store
+        .vector_model_ids("repo")
+        .expect("list vector model ids")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "google/embeddinggemma-300m".into());
     for i in 0..count {
         store
             .upsert_vector_embedding(&greppy_store::NewVectorEmbedding {
                 project: "repo".into(),
-                model_id: "google/embeddinggemma-300m".into(),
+                model_id: model_id.clone(),
                 prompt_version: greppy_embed_native::PROMPT_VERSION.into(),
                 task: greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE.into(),
                 node_id: None,
@@ -997,7 +1039,7 @@ fn insert_default_model_vectors(store_dir: &Path, count: usize) {
 #[test]
 fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     let (repo, store_dir) = make_repo("semantic-vector-guard", "vector_guard_marker");
-    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    let (code, out, err) = run_with_inference(&["index", "."], &repo, &store_dir);
     assert_eq!(
         code, 0,
         "index . should succeed; stderr={err}\nstdout={out}"
@@ -1005,15 +1047,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     insert_default_model_vectors(&store_dir, 2);
 
     let (code, out, err) = run_with_env(
-        &[
-            "semantic-search",
-            "--json",
-            "--embedding-gguf",
-            "/missing/embeddinggemma.gguf",
-            "--embedding-tokenizer",
-            "/missing/tokenizer.json",
-            "find vector guard marker",
-        ],
+        &["semantic-search", "--json", "find vector guard marker"],
         &repo,
         &store_dir,
         &[("GREPPY_VECTOR_EXACT_CANDIDATE_LIMIT", "1")],
@@ -1045,7 +1079,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
         "rust provider incompleteness must be visible: {v:?}"
     );
     assert_eq!(v["candidate_limit"], 1);
-    assert_eq!(v["total_exact"], 2);
+    assert_eq!(v["total_exact"], 3);
     assert_eq!(v["shown"], 0);
     assert_eq!(v["truncated"], true);
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
@@ -1054,7 +1088,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
 #[test]
 fn semantic_vectors_stale_index_skips_before_model_load() {
     let (repo, store_dir) = make_repo("semantic-vector-stale", "vector_stale_marker");
-    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    let (code, out, err) = run_with_inference(&["index", "."], &repo, &store_dir);
     assert_eq!(
         code, 0,
         "index . should succeed; stderr={err}\nstdout={out}"
@@ -1066,22 +1100,15 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
     )
     .unwrap();
 
-    let (code, out, err) = run(
-        &[
-            "semantic-search",
-            "--json",
-            "--embedding-gguf",
-            "/missing/embeddinggemma.gguf",
-            "--embedding-tokenizer",
-            "/missing/tokenizer.json",
-            "find vector stale marker",
-        ],
+    let (code, out, err) = run_with_env(
+        &["semantic-search", "--json", "find vector stale marker"],
         &repo,
         &store_dir,
+        &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 1,
-        "stale vector search should return no-hit code without trying to load the missing model; stderr={err}\nstdout={out}"
+        code, 75,
+        "stale vector search is temporary failure; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
@@ -1091,18 +1118,15 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(v["fresh"], false);
-    assert_eq!(v["freshness"]["state"], "stale");
-    assert_eq!(v["total_exact"], 1);
+    assert_eq!(v["freshness"]["state"], "drift");
+    assert_eq!(v["total_exact"], 2);
     assert_eq!(v["shown"], 0);
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
 }
 
-/// D2 fail-open: stale algorithmic semantic serves the OLD indexed
-/// hits, labeled `fresh: false` + stderr warning, instead of refusing
-/// (kill switch pins the labeled-stale path; the default policy would
-/// auto-heal this one-file drift and answer fresh).
+/// Algorithmic semantic search also refuses stale indexed rows.
 #[test]
-fn semantic_algorithmic_stale_index_serves_labeled_hits() {
+fn semantic_stale_index_refuses_vector_hits() {
     let (repo, store_dir) = make_repo("semantic-stale", "semantic_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store_dir);
     assert_eq!(
@@ -1122,24 +1146,17 @@ fn semantic_algorithmic_stale_index_serves_labeled_hits() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
-        "labeled-stale semantic must serve the indexed hits; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("index may be stale") && err.contains("run 'grep index'"),
-        "labeled-stale semantic must warn on stderr; stderr={err:?}"
+        code, 75,
+        "stale semantic must not serve indexed hits; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    assert_eq!(v["mode"], "algorithmic");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(v["fresh"], false, "result must be labeled stale: {v:?}");
-    assert_eq!(v["freshness"]["state"], "stale");
+    assert_eq!(v["mode"], "vector");
+    assert_eq!(v["status"], "skipped_stale_index");
+    assert_eq!(v["fresh"], false);
+    assert_eq!(v["freshness"]["state"], "drift");
     assert_eq!(v["freshness"]["stale_file_count"], 1);
-    assert!(
-        !v["hits"].as_array().unwrap().is_empty(),
-        "labeled-stale semantic must serve hits from the existing index: {v:?}"
-    );
+    assert!(v["hits"].as_array().unwrap().is_empty());
 }
 
 #[test]
@@ -1369,7 +1386,7 @@ fn index_status_json_exposes_dirty_overlay_breakdown() {
 }
 
 #[test]
-fn r3_large_repo_file_limit_cli_reports_and_persists_truncation() {
+fn r3_large_repo_file_limit_does_not_publish_partial_snapshot() {
     let root = fresh_dir("r3-large-limit");
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
@@ -1383,65 +1400,21 @@ fn r3_large_repo_file_limit_cli_reports_and_persists_truncation() {
     }
     let store = root.join("store");
 
-    let (code, out, err) = run_with_env(
-        &["index", "."],
-        &repo,
-        &store,
-        &[("GREPPY_MAX_FILES", "2")],
-    );
+    let (code, out, err) =
+        run_with_env(&["index", "."], &repo, &store, &[("GREPPY_MAX_FILES", "2")]);
     assert_eq!(
-        code, 0,
-        "file-limited clean index should still succeed; stderr={err}\nstdout={out}"
+        code, 73,
+        "file-limited index is incomplete; stderr={err}\nstdout={out}"
     );
     assert!(
         out.contains("3 file-limit"),
         "CLI report must expose file-limit truncation count; stdout={out}"
     );
 
-    let (code, out, err) = run(&["diagnostics", "--json"], &repo, &store);
-    assert_eq!(
-        code, 73,
-        "diagnostics should be non-zero for partial providers, not hidden truncation; stderr={err}\nstdout={out}"
-    );
-    let v: serde_json::Value =
-        serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
-    let skips = v["projects"][0]["index_skips"]
-        .as_array()
-        .expect("index_skips array");
-    assert_eq!(skips.len(), 3, "three skipped files must be persisted");
-    assert!(skips.iter().all(|s| s["reason"] == "file_limit"));
     assert!(
-        v["projects"][0]["skip_counts_by_reason"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|row| row["reason"] == "file_limit" && row["count"] == 3),
-        "diagnostics must expose file_limit count: {v:?}"
+        find_graph_db(&store).is_none(),
+        "an incomplete first snapshot must not publish graph.db"
     );
-
-    for skip in skips {
-        let rel = skip["rel_path"].as_str().expect("rel_path");
-        let n = rel
-            .strip_prefix("src/f")
-            .and_then(|s| s.strip_suffix(".rs"))
-            .expect("fixture path shape");
-        let marker = format!("large_limit_marker_{n}");
-        // Pin the auto-reindex off: this query runs WITHOUT the
-        // GREPPY_MAX_FILES limit, so the D2 inline heal would
-        // (correctly) index the skipped files and surface the marker.
-        // Here we assert the truncated graph itself never leaks the
-        // skipped symbols.
-        let (_code, out, _err) = run_with_env(
-            &["search-symbols", &marker],
-            &repo,
-            &store,
-            &[("GREPPY_AUTO_REINDEX", "0")],
-        );
-        assert!(
-            !out.contains(&marker),
-            "file-limit skipped symbol {marker} must not leak from stale graph rows; got {out:?}"
-        );
-    }
 }
 
 #[test]
@@ -1497,7 +1470,7 @@ fn discover_scope_env_controls_index_and_query_freshness() {
         &store,
     );
     assert_eq!(
-        code, 1,
+        code, 75,
         "default query must reject a scoped index instead of emitting stale hits; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
@@ -1581,7 +1554,7 @@ fn store_dir_700_and_db_600() {
 }
 
 #[test]
-fn r3_atomic_snapshot_second_success_keeps_previous_known_good_backup() {
+fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
     let (repo, store) = make_repo("r3backup", "old_atomic_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
@@ -1600,15 +1573,7 @@ fn r3_atomic_snapshot_second_success_keeps_previous_known_good_backup() {
     .unwrap();
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "second index should succeed; stderr={err}\n{out}");
-    assert!(
-        backup.exists(),
-        "second publish must keep previous known-good snapshot at {}",
-        backup.display()
-    );
-    assert!(
-        std::fs::metadata(&backup).unwrap().len() > 0,
-        "backup snapshot must not be empty"
-    );
+    assert!(!backup.exists(), "graph.db.prev must not be retained");
 
     let (code, out, err) = run(&["search-symbols", "new_atomic_marker"], &repo, &store);
     assert_eq!(code, 0, "new active snapshot should query; stderr={err}");
@@ -1717,9 +1682,8 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
         "failed temp index must leave previous active graph.db bytes unchanged"
     );
 
-    // D2 fail-open (auto-reindex pinned off so the PRESERVED active
-    // graph is what answers): the stale-but-intact active index serves
-    // its rows, honestly labeled via stderr.
+    // The old snapshot remains physically valid but is stale relative to the
+    // worktree, so graph queries must refuse it.
     let (code, out, err) = run_with_env(
         &["search-symbols", "old_failure_marker"],
         &repo,
@@ -1727,17 +1691,10 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
-        "preserved active index must serve labeled results; stderr={err}\nstdout={out}"
+        code, 75,
+        "preserved but stale active index must be refused; stderr={err}\nstdout={out}"
     );
-    assert!(
-        err.contains("index may be stale"),
-        "labeled-stale serving must warn on stderr; stderr={err:?}"
-    );
-    assert!(
-        out.contains("old_failure_marker"),
-        "preserved active graph rows must be served (labeled); got {out:?}"
-    );
+    assert!(!out.contains("old_failure_marker"));
 
     // The failed temp graph must never become visible: its new symbol
     // is absent from the preserved active index.
@@ -1776,8 +1733,10 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
         err.contains("quarantined"),
         "corrupt active DB should be reported as quarantined; stderr={err}"
     );
-    let corrupt = corrupt_snapshot_for_db(&db).expect("corrupt active DB must be quarantined");
-    assert_eq!(std::fs::read(&corrupt).unwrap(), b"not a sqlite database");
+    assert!(
+        corrupt_snapshot_for_db(&db).is_none(),
+        "quarantine artifacts are removed after successful publication"
+    );
 
     let (code, out, err) = run(&["search-symbols", "new_corrupt_marker"], &repo, &store);
     assert_eq!(
@@ -1807,10 +1766,8 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
 
     let db = find_graph_db(&store).expect("graph.db must exist after first index");
-    let lock_path = db.with_file_name(format!(
-        "{}.lock",
-        db.file_name().unwrap().to_str().unwrap()
-    ));
+    let hash = db.parent().unwrap().file_name().unwrap().to_string_lossy();
+    let lock_path = store.join("locks").join(format!("workspace-{hash}.writer"));
     let active_before = std::fs::read(&db).unwrap();
     assert!(
         next_snapshot_paths_for_db(&db).is_empty(),
@@ -1830,6 +1787,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
         .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
         .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
         .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .env_remove("GREPPY_DISCOVER_INCLUDE")
         .env_remove("GREPPY_DISCOVER_EXCLUDE")
         .stdout(std::process::Stdio::null())
@@ -1857,7 +1815,12 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     );
     assert!(
         lock_path.exists(),
-        "paused indexer must hold the writer lock before it is killed"
+        "persistent writer lock inode must exist"
+    );
+    let (contended, _, _) = run(&["index", "."], &repo, &store);
+    assert_eq!(
+        contended, 75,
+        "paused live writer must exclude a second writer"
     );
     let temp_paths = next_snapshot_paths_for_db(&db);
     assert!(
@@ -1879,7 +1842,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     );
     assert!(
         lock_path.exists(),
-        "SIGKILL simulation should leave a stale lock for the next indexer to recover"
+        "lock inode remains, while SIGKILL releases its kernel lock"
     );
     assert!(
         !next_snapshot_paths_for_db(&db).is_empty(),
@@ -1889,11 +1852,11 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
-        "next index should take over the dead lock, clean stale temp snapshots and publish; stdout={out} stderr={err}"
+        "next index should acquire the crash-released lock, clean stale temp snapshots and publish; stdout={out} stderr={err}"
     );
     assert!(
-        !lock_path.exists(),
-        "successful recovery index must remove the stale/taken-over lock"
+        lock_path.exists(),
+        "successful recovery keeps the persistent lock inode"
     );
     assert!(
         next_snapshot_paths_for_db(&db).is_empty(),
@@ -1916,11 +1879,102 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
+    let (repo, store) = make_repo("large-drift-job", "old_large_drift_marker");
+    for index in 0..11 {
+        std::fs::write(
+            repo.join(format!("extra-{index}.rs")),
+            format!("pub fn initial_extra_{index}() -> usize {{ {index} }}\n"),
+        )
+        .unwrap();
+    }
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "initial index failed; stdout={out} stderr={err}");
+    let db = find_graph_db(&store).expect("active graph.db");
+    let active_before = std::fs::read(&db).unwrap();
+    for index in 0..11 {
+        std::fs::write(
+            repo.join(format!("extra-{index}.rs")),
+            format!(
+                "pub fn changed_extra_{index}() -> usize {{ {} }}\n",
+                index + 1
+            ),
+        )
+        .unwrap();
+    }
+
+    let ready = store.join("background-ready");
+    let ready_string = ready.to_string_lossy().into_owned();
+    let envs = [
+        ("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish"),
+        ("GREPPY_TEST_INDEX_FAILPOINT_READY", ready_string.as_str()),
+        ("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000"),
+    ];
+    let (code, out, err) = run_with_env(
+        &["search-symbols", "--json", "old_large_drift_marker"],
+        &repo,
+        &store,
+        &envs,
+    );
+    assert_eq!(code, 75, "large drift must be temporary; stderr={err}");
+    let first: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(first["freshness"]["state"], "refreshing");
+    assert!(first["hits"].as_array().unwrap().is_empty());
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "background index never reached publish failpoint"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let job_path = db.parent().unwrap().join("index.job");
+    let first_job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    let pid = first_job["pid"].as_u64().expect("background pid") as u32;
+    assert_eq!(first_job["state"], "refreshing");
+
+    let (code, out, err) = run_with_env(
+        &["search-symbols", "--json", "old_large_drift_marker"],
+        &repo,
+        &store,
+        &envs,
+    );
+    assert_eq!(
+        code, 75,
+        "second stale query must be temporary; stderr={err}"
+    );
+    let second: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(second["freshness"]["state"], "refreshing");
+    assert!(second["hits"].as_array().unwrap().is_empty());
+    let second_job: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&job_path).unwrap()).unwrap();
+    assert_eq!(second_job["pid"].as_u64(), Some(pid as u64));
+    assert_eq!(
+        std::fs::read(&db).unwrap(),
+        active_before,
+        "queries and paused background writer must not mutate active graph.db"
+    );
+
+    let status = Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("kill background index");
+    assert!(
+        status.success(),
+        "background index process must be killable"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RV-003 — a pre-held (live) lock makes a second index exit 75 without
 // running the indexer / writing.
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn held_lock_makes_second_index_exit_75_without_writing() {
     let (repo, store) = make_repo("caselock", "delta_unique_marker");
@@ -1930,19 +1984,9 @@ fn held_lock_makes_second_index_exit_75_without_writing() {
     assert_eq!(code, 0, "first index should succeed; stderr={err}");
 
     let db = find_graph_db(&store).expect("graph.db must exist");
-    let lock_path = db.with_file_name(format!(
-        "{}.lock",
-        db.file_name().unwrap().to_str().unwrap()
-    ));
-
-    // Forge a *live* lock: our own (running) PID and a current
-    // timestamp so the stale-recovery path cannot take it over.
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let live_pid = std::process::id();
-    std::fs::write(&lock_path, format!("{live_pid}\n{now}\n")).unwrap();
+    let hash = db.parent().unwrap().file_name().unwrap().to_string_lossy();
+    let lock_path = store.join("locks").join(format!("workspace-{hash}.writer"));
+    let live_lock = hold_exclusive_lock(&lock_path);
     assert!(lock_path.exists(), "lock file should be present");
 
     // Capture a fingerprint of the db before the contended index attempt
@@ -1966,7 +2010,7 @@ fn held_lock_makes_second_index_exit_75_without_writing() {
         "indexer must NOT run while the lock is held (RV-003); stdout={out}"
     );
     assert!(
-        err.contains("lock held"),
+        err.contains("another indexer is running"),
         "should report the held lock on stderr; stderr={err}"
     );
 
@@ -1983,34 +2027,23 @@ fn held_lock_makes_second_index_exit_75_without_writing() {
         );
     }
 
-    // The held lock must still belong to us — the contended run must NOT
-    // have deleted the live holder's lock (the old `_ => None` bug let the
-    // RAII drop remove it).
     assert!(
         lock_path.exists(),
-        "the live holder's lock must survive a contended index attempt"
+        "persistent OS lock inode must survive a contended attempt"
     );
-    let body = std::fs::read_to_string(&lock_path).unwrap();
-    assert!(
-        body.starts_with(&live_pid.to_string()),
-        "lock body must still be ours (pid {live_pid}); got: {body:?}"
-    );
-
-    let _ = std::fs::remove_file(&lock_path);
+    drop(live_lock);
 }
 
 #[test]
-fn r3_stale_lock_is_taken_over_by_cli_index() {
+fn r3_old_lock_contents_without_os_lock_are_harmless() {
     let (repo, store) = make_repo("r3-stale-lock", "stale_lock_marker");
 
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
 
     let db = find_graph_db(&store).expect("graph.db must exist");
-    let lock_path = db.with_file_name(format!(
-        "{}.lock",
-        db.file_name().unwrap().to_str().unwrap()
-    ));
+    let hash = db.parent().unwrap().file_name().unwrap().to_string_lossy();
+    let lock_path = store.join("locks").join(format!("workspace-{hash}.writer"));
     let stale_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -2038,8 +2071,8 @@ fn r3_stale_lock_is_taken_over_by_cli_index() {
         "indexer must run after stale-lock takeover; stdout={out}"
     );
     assert!(
-        !lock_path.exists(),
-        "RAII lock cleanup must remove the stale/taken-over lock file"
+        lock_path.exists(),
+        "OS lock files remain persistent so contenders never split across inodes"
     );
 
     let (code, out, err) = run(

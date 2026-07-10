@@ -50,14 +50,6 @@ CREATE TABLE IF NOT EXISTS edges (
     UNIQUE(source_id, target_id, edge_type)
 );
 
-CREATE TABLE IF NOT EXISTS project_summaries (
-    project     TEXT PRIMARY KEY,
-    summary     TEXT NOT NULL,
-    source_hash TEXT NOT NULL,
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS workspace_state (
     root_path        TEXT    PRIMARY KEY,
     git_dir          TEXT,

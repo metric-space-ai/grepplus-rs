@@ -81,6 +81,9 @@ fn run(root: &str, project: &str) -> Result<()> {
         greppy_freshness::FreshnessOutcome::Stale { reasons } => {
             ("Stale".to_string(), reasons.clone())
         }
+        greppy_freshness::FreshnessOutcome::Unknown { reasons } => {
+            ("Unknown".to_string(), reasons.clone())
+        }
         greppy_freshness::FreshnessOutcome::RootMismatch => ("RootMismatch".to_string(), vec![]),
     };
     let reasons_json = serde_json::to_string(&reasons).unwrap_or_else(|_| "[]".into());

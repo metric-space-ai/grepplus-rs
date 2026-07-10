@@ -52,6 +52,19 @@ pub struct VectorEmbedding {
     pub created_at: String,
 }
 
+/// Identity of an unchanged embedding chunk eligible for cross-generation
+/// reuse. Every field is part of the semantic cache contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReusableVectorEmbeddingKey<'a> {
+    pub project: &'a str,
+    pub model_id: &'a str,
+    pub prompt_version: &'a str,
+    pub task: &'a str,
+    pub qualified_name: &'a str,
+    pub chunk_idx: i64,
+    pub content_sha256: &'a str,
+}
+
 /// Scope and ranking policy for exact vector search.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VectorSearchQuery<'a> {
@@ -154,6 +167,39 @@ impl Store {
                         vector, created_at
                  FROM vector_embeddings WHERE id = ?1",
                 params![id],
+                row_to_vector_embedding,
+            )
+            .optional()
+            .map_err(Error::Sqlite)
+    }
+
+    /// Find a byte-identical chunk embedded with the same model and prompt.
+    /// Snapshot builders use this to advance unchanged rows to a new graph
+    /// generation without running inference again.
+    pub fn find_reusable_vector_embedding(
+        &self,
+        key: &ReusableVectorEmbeddingKey<'_>,
+    ) -> Result<Option<VectorEmbedding>> {
+        self.conn()
+            .query_row(
+                "SELECT id, project, model_id, prompt_version, task, node_id, chunk_idx,
+                        qualified_name, file_path, start_line, end_line,
+                        content_sha256, graph_generation, dim, vector_norm,
+                        vector, created_at
+                 FROM vector_embeddings
+                 WHERE project = ?1 AND model_id = ?2 AND prompt_version = ?3
+                   AND task = ?4 AND qualified_name = ?5 AND chunk_idx = ?6
+                   AND content_sha256 = ?7
+                 ORDER BY graph_generation DESC LIMIT 1",
+                params![
+                    key.project,
+                    key.model_id,
+                    key.prompt_version,
+                    key.task,
+                    key.qualified_name,
+                    key.chunk_idx,
+                    key.content_sha256
+                ],
                 row_to_vector_embedding,
             )
             .optional()

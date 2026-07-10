@@ -18,7 +18,7 @@
 //!   generation, so they should survive re-indexing.
 //!
 //! Keying: `model_key` is built by the caller from the logical model id,
-//! prompt version, task profile and a fingerprint (len+mtime) of the
+//! prompt version, task profile and a content digest of the
 //! model source files, so swapping the GGUF/tokenizer invalidates cached
 //! vectors. `query_text` is the normalized query (see
 //! [`normalize_query_text`]).
@@ -35,6 +35,8 @@ use crate::store_error::{Error, Result};
 
 /// File name of the cache database inside the workspace store dir.
 pub const QUERY_CACHE_DB_FILE: &str = "query_cache.db";
+pub const QUERY_CACHE_MAX_ENTRIES: i64 = 10_000;
+const QUERY_CACHE_TRIM_ENTRIES: i64 = 8_000;
 
 /// Standalone query-embedding cache connection.
 #[derive(Debug)]
@@ -62,10 +64,19 @@ impl QueryEmbeddingCache {
                 dim        INTEGER NOT NULL,
                 vector     BLOB    NOT NULL,
                 created_at TEXT    NOT NULL,
+                last_accessed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (model_key, query_text)
             );",
         )
         .map_err(|e| Error::Store(format!("create query cache schema: {e}")))?;
+        // Upgrade standalone caches created before the bounded-LRU schema.
+        if !column_exists(&conn, "query_embeddings", "last_accessed")? {
+            conn.execute(
+                "ALTER TABLE query_embeddings ADD COLUMN last_accessed INTEGER NOT NULL DEFAULT 0",
+                [],
+            )
+            .map_err(|e| Error::Store(format!("upgrade query cache schema: {e}")))?;
+        }
         Ok(Self { conn })
     }
 
@@ -84,6 +95,11 @@ impl QueryEmbeddingCache {
         let Some((dim, blob)) = row else {
             return Ok(None);
         };
+        let _ = self.conn.execute(
+            "UPDATE query_embeddings SET last_accessed = ?3
+             WHERE model_key = ?1 AND query_text = ?2",
+            rusqlite::params![model_key, query_text, unix_now_secs()],
+        );
         let dim = usize::try_from(dim)
             .map_err(|_| Error::Store(format!("query cache row has negative dim {dim}")))?;
         if blob.len() != dim * std::mem::size_of::<f32>() {
@@ -108,19 +124,96 @@ impl QueryEmbeddingCache {
         self.conn
             .execute(
                 "INSERT OR REPLACE INTO query_embeddings
-                 (model_key, query_text, dim, vector, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                 (model_key, query_text, dim, vector, created_at, last_accessed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 rusqlite::params![
                     model_key,
                     query_text,
                     vector.len() as i64,
                     blob,
                     crate::workspace_state::now_iso8601(),
+                    unix_now_secs(),
                 ],
             )
             .map_err(|e| Error::Store(format!("query cache put: {e}")))?;
+        self.prune_to_budget()
+    }
+
+    /// Bound an actively-used workspace's query cache independently of whole-
+    /// store TTL/LRU eviction. Deletes least-recently-used rows and compacts
+    /// only when a configured limit is exceeded.
+    pub fn prune_to_budget(&self) -> Result<()> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM query_embeddings", [], |r| r.get(0))
+            .map_err(|e| Error::Store(format!("query cache count: {e}")))?;
+        let page_count: i64 = self
+            .conn
+            .query_row("PRAGMA page_count", [], |r| r.get(0))
+            .unwrap_or(0);
+        let page_size: i64 = self
+            .conn
+            .query_row("PRAGMA page_size", [], |r| r.get(0))
+            .unwrap_or(4096);
+        let bytes = page_count.saturating_mul(page_size);
+        let max_mib = std::env::var("GREPPY_QUERY_CACHE_MAX_MIB")
+            .ok()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .unwrap_or(greppy_core::cache::DEFAULT_QUERY_CACHE_MAX_MIB as i64);
+        let max_bytes = max_mib.saturating_mul(1024 * 1024);
+        let over_entries = count > QUERY_CACHE_MAX_ENTRIES;
+        let over_bytes = max_bytes > 0 && bytes > max_bytes;
+        if !over_entries && !over_bytes {
+            return Ok(());
+        }
+        let mut keep = QUERY_CACHE_TRIM_ENTRIES.min(count);
+        if over_bytes && bytes > 0 {
+            let byte_target = count
+                .saturating_mul(max_bytes.saturating_mul(8) / 10)
+                .checked_div(bytes)
+                .unwrap_or(0);
+            keep = keep.min(byte_target.max(1));
+        }
+        let remove = count.saturating_sub(keep);
+        if remove > 0 {
+            self.conn
+                .execute(
+                    "DELETE FROM query_embeddings WHERE rowid IN (
+                        SELECT rowid FROM query_embeddings
+                        ORDER BY last_accessed ASC, created_at ASC, rowid ASC
+                        LIMIT ?1
+                    )",
+                    rusqlite::params![remove],
+                )
+                .map_err(|e| Error::Store(format!("prune query cache: {e}")))?;
+            // VACUUM is intentionally only paid after crossing the hard cap.
+            let _ = self.conn.execute_batch("VACUUM");
+        }
         Ok(())
     }
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let sql = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| Error::Store(format!("inspect query cache schema: {e}")))?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| Error::Store(format!("inspect query cache columns: {e}")))?;
+    for name in names {
+        if name.map_err(Error::Sqlite)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn unix_now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Normalize a query for cache keying: trim and collapse every internal
@@ -203,5 +296,29 @@ mod tests {
         assert_eq!(normalize_query_text(""), "");
         assert_eq!(normalize_query_text("   "), "");
         assert_eq!(normalize_query_text("Foo"), "Foo");
+    }
+
+    #[test]
+    fn byte_budget_prunes_least_recently_used_rows() {
+        let dir = tmp_dir();
+        std::env::set_var("GREPPY_QUERY_CACHE_MAX_MIB", "1");
+        let cache = QueryEmbeddingCache::open(&dir).unwrap();
+        let vector = vec![0.25f32; 4096];
+        for index in 0..100 {
+            cache
+                .put("model", &format!("query-{index:03}"), &vector)
+                .unwrap();
+        }
+        let count: i64 = cache
+            .conn
+            .query_row("SELECT COUNT(*) FROM query_embeddings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(count < 100, "byte cap must evict old entries");
+        assert!(cache.get("model", "query-099").unwrap().is_some());
+        std::env::remove_var("GREPPY_QUERY_CACHE_MAX_MIB");
+        drop(cache);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

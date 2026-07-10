@@ -232,7 +232,7 @@ pub(super) fn daemon_main(socket: PathBuf, cfg: super::EmbeddingModelConfig, pre
         );
     }
 
-    let mut model: Option<greppy_embed_native::EmbeddingGemma> = None;
+    let mut model: Option<super::LoadedEmbeddingModel> = None;
     let mut last_used = Instant::now();
     if prewarm {
         let t0 = Instant::now();
@@ -279,7 +279,7 @@ pub(super) fn daemon_main(socket: PathBuf, cfg: super::EmbeddingModelConfig, pre
 fn handle_connection(
     stream: UnixStream,
     cfg: &super::EmbeddingModelConfig,
-    model: &mut Option<greppy_embed_native::EmbeddingGemma>,
+    model: &mut Option<super::LoadedEmbeddingModel>,
 ) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -304,7 +304,7 @@ fn handle_connection(
 fn respond(
     raw: &str,
     cfg: &super::EmbeddingModelConfig,
-    model: &mut Option<greppy_embed_native::EmbeddingGemma>,
+    model: &mut Option<super::LoadedEmbeddingModel>,
 ) -> serde_json::Value {
     let req: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,

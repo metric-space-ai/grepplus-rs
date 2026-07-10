@@ -52,6 +52,10 @@ impl OpenOptions {
 /// concurrent reads.
 pub struct Store {
     conn: Connection,
+    // Shared lifecycle lease prevents GC from renaming/removing the workspace
+    // directory for as long as this SQLite handle is alive. In-memory and
+    // non-workspace test databases legitimately have no lease.
+    _lifecycle: Option<greppy_core::cache::FileLock>,
 }
 
 impl std::fmt::Debug for Store {
@@ -75,6 +79,10 @@ impl Store {
 
     /// Open with explicit options.
     pub fn open_with(path: &Path, opts: OpenOptions) -> Result<Self> {
+        let lifecycle = workspace_lifecycle_for_path(path).map_err(|e| Error::Io {
+            context: format!("acquire lifecycle lease for {}", path.display()),
+            source: e,
+        })?;
         let conn = if opts.read_only {
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(
                 |e| Error::Io {
@@ -88,7 +96,10 @@ impl Store {
                 source: std::io::Error::other(e.to_string()),
             })?
         };
-        Self::from_connection_with_options(conn, opts)
+        if let Some(parent) = path.parent() {
+            greppy_core::cache::touch_last_used_dir(parent);
+        }
+        Self::from_connection_with_options_and_lease(conn, opts, lifecycle)
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {
@@ -96,6 +107,14 @@ impl Store {
     }
 
     fn from_connection_with_options(conn: Connection, opts: OpenOptions) -> Result<Self> {
+        Self::from_connection_with_options_and_lease(conn, opts, None)
+    }
+
+    fn from_connection_with_options_and_lease(
+        conn: Connection,
+        opts: OpenOptions,
+        lifecycle: Option<greppy_core::cache::FileLock>,
+    ) -> Result<Self> {
         // Performance pragmas for the WRITE path (i.e. `greppy index`).
         // Default SQLite is journal_mode=DELETE + synchronous=FULL, which
         // fsyncs on every transaction commit. The indexer commits once per
@@ -128,7 +147,10 @@ impl Store {
         if !opts.read_only {
             migrate::migrate(&conn)?;
         }
-        let s = Self { conn };
+        let s = Self {
+            conn,
+            _lifecycle: lifecycle,
+        };
         // Verify integrity on WRITE opens (i.e. `greppy index`) only.
         // `PRAGMA integrity_check` is O(db-size) — hundreds of ms on a large
         // store — so running it on every READ-ONLY open (the query hotpath:
@@ -141,6 +163,18 @@ impl Store {
         // per-open integrity_check was the dominant query latency).
         if !opts.read_only && opts.integrity_check {
             s.integrity_check()?;
+        }
+        if !opts.read_only {
+            // Evidence packs are intentionally ephemeral. Prune them on every
+            // writable maintenance/open path so an actively used workspace
+            // cannot retain expired payloads indefinitely.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let _ = s
+                .conn
+                .execute("DELETE FROM expand_packs WHERE expires_at <= ?1", [now]);
         }
         Ok(s)
     }
@@ -199,6 +233,28 @@ impl Store {
         let tx = self.conn.transaction()?;
         Ok(Transaction { tx })
     }
+}
+
+fn workspace_lifecycle_for_path(
+    path: &Path,
+) -> std::io::Result<Option<greppy_core::cache::FileLock>> {
+    let Some(parent) = path.parent() else {
+        return Ok(None);
+    };
+    let Ok(manifest) = greppy_core::cache::read_store_manifest(parent) else {
+        return Ok(None);
+    };
+    greppy_core::cache::acquire_workspace_lifecycle(
+        &manifest.canonical_root,
+        greppy_core::cache::LockMode::Shared,
+        false,
+    )
+    .inspect(|lease| {
+        debug_assert!(
+            lease.is_some(),
+            "blocking lifecycle lock must return a guard"
+        );
+    })
 }
 
 /// A write transaction. Use `Store::transaction()` to acquire.

@@ -334,6 +334,8 @@ mod tests {
             abs_path: PathBuf::from(format!("/tmp/{rel}")),
             size: None,
             mtime_ns: None,
+            ctime_ns: None,
+            file_id: None,
         }
     }
 

@@ -642,6 +642,7 @@ dependencies = [
  "greppy-qwen35-native",
  "greppy-search",
  "greppy-store",
+ "rusqlite",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",

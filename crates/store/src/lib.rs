@@ -35,6 +35,7 @@ pub mod diagnostics;
 pub mod edge;
 pub mod expand_pack;
 pub mod file_content;
+pub mod file_identity;
 pub mod file_state;
 pub mod fts;
 pub mod index_skip;
@@ -42,7 +43,6 @@ pub mod maintenance;
 pub mod migrate;
 pub mod node;
 pub mod project;
-pub mod project_summary;
 pub mod provider_state;
 pub mod query_cache;
 pub mod raw_edge;
@@ -57,12 +57,12 @@ pub use diagnostics::{ProjectDiagnostics, StoreDiagnostics};
 pub use edge::{Edge, NewEdge};
 pub use expand_pack::{ExpandPack, NewExpandPack, DEFAULT_EXPAND_TTL_SECS};
 pub use file_content::{ContentRow, FileContentHit};
+pub use file_identity::FileIdentity;
 pub use file_state::FileState;
 pub use index_skip::{IndexSkip, IndexSkipReasonCount};
 pub use migrate::{Migration, MIGRATIONS};
 pub use node::{NewNode, Node};
 pub use project::Project;
-pub use project_summary::ProjectSummary;
 pub use provider_state::ProviderState;
 pub use query_cache::{normalize_query_text, QueryEmbeddingCache, QUERY_CACHE_DB_FILE};
 pub use raw_edge::{NewRawEdge, RawEdge};
@@ -70,6 +70,7 @@ pub use stats::{EdgeTypeCount, GraphStats, LabelCount};
 pub use store::{OpenOptions, Store};
 pub use store_error::{Error, Result};
 pub use vector_embedding::{
-    NewVectorEmbedding, VectorEmbedding, VectorSearchHit, VectorSearchQuery,
+    NewVectorEmbedding, ReusableVectorEmbeddingKey, VectorEmbedding, VectorSearchHit,
+    VectorSearchQuery,
 };
 pub use workspace_state::WorkspaceState;

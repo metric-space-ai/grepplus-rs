@@ -88,10 +88,15 @@ pub const MIGRATIONS: &[Migration] = &[
         name: "expand_packs",
         sql: include_str!("migrations/0013_expand_packs.sql"),
     },
+    Migration {
+        version: 14,
+        name: "file_identity",
+        sql: include_str!("migrations/0014_file_identity.sql"),
+    },
 ];
 
 /// Current schema version this crate knows about.
-pub const CURRENT_VERSION: u32 = 13;
+pub const CURRENT_VERSION: u32 = 14;
 
 /// Apply pending migrations. Returns the number of migrations applied.
 pub fn migrate(conn: &Connection) -> Result<usize, Error> {

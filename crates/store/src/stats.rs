@@ -1,11 +1,9 @@
-//! Graph statistics + summary computation + additional retrieval helpers.
+//! Graph statistics + additional retrieval helpers.
 //!
 //! This module provides the *store-only* statistics surface (the
 //! `graph_stats` / `project_summary` family) over the store. Everything
 //! here is read-only aggregation over the existing
-//! `nodes` / `edges` / `file_state` tables plus one write path
-//! (`compute_and_store_project_summary`) that reuses the
-//! `project_summaries` CRUD added earlier.
+//! `nodes` / `edges` / `file_state` tables.
 //!
 //! Determinism is a hard requirement: every list result is `ORDER BY`-ed
 //! on a total key, and the [`GraphStats`] aggregates use sorted vectors so
@@ -15,7 +13,6 @@
 use rusqlite::params;
 
 use crate::edge::{row_to_edge_pub as row_to_edge, Edge};
-use crate::file_state::sha256_hex;
 use crate::store::Store;
 use crate::store_error::Result;
 
@@ -151,29 +148,6 @@ impl Store {
             total_nodes,
             total_edges,
         })
-    }
-
-    /// Compute the current [`GraphStats`] for a project, derive a
-    /// deterministic summary + `source_hash` from them, and upsert the
-    /// `project_summaries` row so it reflects the current graph.
-    ///
-    /// The `source_hash` is `sha256(stats.canonical_string())`, so it
-    /// changes if and only if the graph's shape changes — a caller can
-    /// compare it against the stored row to detect a stale summary without
-    /// recomputing the text. The stored `summary` is the canonical string
-    /// itself, giving a faithful, deterministic default; richer summary
-    /// generation can replace the text later while keeping this hash
-    /// contract. Returns the computed [`GraphStats`] and the `source_hash`
-    /// that was stored.
-    pub fn compute_and_store_project_summary(
-        &mut self,
-        project: &str,
-    ) -> Result<(GraphStats, String)> {
-        let stats = self.stats(project)?;
-        let canonical = stats.canonical_string();
-        let source_hash = sha256_hex(canonical.as_bytes());
-        self.upsert_project_summary(project, &canonical, &source_hash)?;
-        Ok((stats, source_hash))
     }
 
     /// List edges of a given type within a project, ordered deterministically
@@ -462,44 +436,6 @@ mod tests {
         assert_eq!(other.total_nodes, 0);
         assert_eq!(other.total_edges, 0);
         assert_eq!(other.file_count, 0);
-    }
-
-    #[test]
-    fn compute_and_store_project_summary_round_trip() {
-        let (mut s, ..) = seed("p");
-        let (stats, hash) = s.compute_and_store_project_summary("p").unwrap();
-
-        // The stored row reflects the current graph.
-        let row = s.get_project_summary("p").unwrap().unwrap();
-        assert_eq!(row.project, "p");
-        assert_eq!(row.source_hash, hash);
-        assert_eq!(row.summary, stats.canonical_string());
-
-        // The hash is exactly sha256(canonical_string) — deterministic.
-        let expected = sha256_hex(stats.canonical_string().as_bytes());
-        assert_eq!(hash, expected);
-    }
-
-    #[test]
-    fn summary_hash_changes_only_when_graph_changes() {
-        let (mut s, a, b, _st) = seed("p");
-        let (_s1, hash1) = s.compute_and_store_project_summary("p").unwrap();
-
-        // Recomputing without graph changes yields the same hash.
-        let (_s2, hash2) = s.compute_and_store_project_summary("p").unwrap();
-        assert_eq!(hash1, hash2, "stable graph => stable hash");
-
-        // Add an edge => the shape changes => the hash changes.
-        s.insert_edge(&NewEdge {
-            project: "p".into(),
-            source_id: b,
-            target_id: a,
-            edge_type: "CALLS".into(),
-            properties: serde_json::json!({}),
-        })
-        .unwrap();
-        let (_s3, hash3) = s.compute_and_store_project_summary("p").unwrap();
-        assert_ne!(hash1, hash3, "graph change => hash change");
     }
 
     #[test]
