@@ -13,6 +13,7 @@ use tokenizers::Tokenizer;
 
 use crate::inventory::Qwen35Inventory;
 use crate::sampler::{sample_token, GenerationParams, SamplerRng};
+use crate::simd_math::{mul_sigmoid_in_place, mul_silu_in_place, silu_in_place, swiglu_in_place};
 use crate::{Error, Result};
 
 const RMS_EPS: f32 = 1.0e-6;
@@ -465,9 +466,7 @@ impl CpuQwen35Model {
     fn ffn(&self, layer: &LayerWeights, hidden: &[f32]) -> Result<Vec<f32>> {
         let mut gate = layer.ffn_gate.matmul(hidden, 1)?;
         let up = layer.ffn_up.matmul(hidden, 1)?;
-        for (gate, up) in gate.iter_mut().zip(up) {
-            *gate = silu(*gate) * up;
-        }
+        swiglu_in_place(&mut gate, &up);
         layer.ffn_down.matmul(&gate, 1).map_err(Into::into)
     }
 
@@ -486,9 +485,7 @@ impl CpuQwen35Model {
         let up_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
         #[cfg(test)]
         let stage_start = std::time::Instant::now();
-        for (gate, up) in gate.iter_mut().zip(up) {
-            *gate = silu(*gate) * up;
-        }
+        swiglu_in_place(&mut gate, &up);
         #[cfg(test)]
         let activation_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
         #[cfg(test)]
@@ -586,9 +583,7 @@ impl CpuQwen35Model {
                         values[value_idx] = transposed[(base + value_idx) * rows + row];
                     }
                     rms_norm_plain(values, &weights.ssm_norm);
-                    for value_idx in 0..LINEAR_HEAD_DIM {
-                        values[value_idx] *= silu(z_row[base + value_idx]);
-                    }
+                    mul_silu_in_place(values, &z_row[base..base + LINEAR_HEAD_DIM]);
                 }
             });
         #[cfg(test)]
@@ -716,9 +711,7 @@ impl CpuQwen35Model {
                     }
                     let gate = &q_gate_row
                         [head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
-                    for i in 0..self.inventory.value_dim {
-                        dst[i] *= sigmoid(gate[i]);
-                    }
+                    mul_sigmoid_in_place(dst, gate);
                 }
             });
         #[cfg(test)]
@@ -783,10 +776,8 @@ impl CpuQwen35Model {
         for head in 0..LINEAR_HEADS {
             let base = head * LINEAR_HEAD_DIM;
             rms_norm_plain(&mut out[base..base + LINEAR_HEAD_DIM], &weights.ssm_norm);
-            for i in 0..LINEAR_HEAD_DIM {
-                out[base + i] *= silu(z[base + i]);
-            }
         }
+        mul_silu_in_place(&mut out, &z);
         weights.ssm_out.matmul(&out, 1).map_err(Into::into)
     }
 
@@ -867,9 +858,7 @@ impl CpuQwen35Model {
                 }
                 let gate =
                     &q_gate[head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
-                for i in 0..self.inventory.value_dim {
-                    dst[i] *= sigmoid(gate[i]);
-                }
+                mul_sigmoid_in_place(dst, gate);
             });
         weights.attn_output.matmul(&attn_out, 1).map_err(Into::into)
     }
@@ -1154,8 +1143,9 @@ fn causal_conv1d_silu(values: &mut [f32], weights: &[f32], state: &mut [f32]) {
         for i in 0..CONV_KERNEL {
             acc += state[base + i] * weights[base + i];
         }
-        values[channel] = silu(acc);
+        values[channel] = acc;
     }
+    silu_in_place(values);
 }
 
 fn apply_rope(values: &mut [f32], position: usize, head_dim: usize, rope_dim: usize) {
@@ -1191,11 +1181,6 @@ fn softmax_in_place(values: &mut [f32]) {
             *value /= sum;
         }
     }
-}
-
-#[inline]
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
 }
 
 #[inline]

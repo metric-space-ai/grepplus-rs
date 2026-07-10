@@ -14,6 +14,7 @@ mod model;
 mod postprocess;
 mod prompt;
 mod sampler;
+mod simd_math;
 
 #[cfg(feature = "cuda")]
 pub mod cuda;
