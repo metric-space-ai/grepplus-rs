@@ -107,6 +107,29 @@ pub(crate) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) {
     }
 }
 
+pub(crate) fn exp_sum_shifted_in_place(values: &mut [f32], shift: f32) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        unsafe {
+            return exp_sum_shifted_in_place_avx2(values, shift);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        return exp_sum_shifted_in_place_neon(values, shift);
+    }
+
+    #[allow(unreachable_code)]
+    values
+        .iter_mut()
+        .map(|value| {
+            *value = (*value - shift).exp();
+            *value
+        })
+        .sum()
+}
+
 #[inline]
 fn silu_scalar(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
@@ -263,6 +286,30 @@ unsafe fn mul_sigmoid_in_place_avx2(values: &mut [f32], gate: &[f32]) {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn exp_sum_shifted_in_place_avx2(values: &mut [f32], shift: f32) -> f32 {
+    let vector_len = values.len() & !7;
+    let shift_vector = _mm256_set1_ps(shift);
+    let mut sum = _mm256_setzero_ps();
+    for idx in (0..vector_len).step_by(8) {
+        let value = _mm256_loadu_ps(values.as_ptr().add(idx));
+        let exponential = exp_approx_avx2(_mm256_sub_ps(value, shift_vector));
+        _mm256_storeu_ps(values.as_mut_ptr().add(idx), exponential);
+        sum = _mm256_add_ps(sum, exponential);
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum::<f32>()
+        + values[vector_len..]
+            .iter_mut()
+            .map(|value| {
+                *value = (*value - shift).exp();
+                *value
+            })
+            .sum::<f32>()
+}
+
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 unsafe fn exp_approx_neon(value: float32x4_t) -> float32x4_t {
     let round = vdupq_n_f32(EXP_ROUND);
@@ -374,6 +421,29 @@ unsafe fn mul_sigmoid_in_place_neon(values: &mut [f32], gate: &[f32]) {
     }
 }
 
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn exp_sum_shifted_in_place_neon(values: &mut [f32], shift: f32) -> f32 {
+    let vector_len = values.len() & !3;
+    let shift_vector = vdupq_n_f32(shift);
+    let mut sum = vdupq_n_f32(0.0);
+    for idx in (0..vector_len).step_by(4) {
+        let value = vld1q_f32(values.as_ptr().add(idx));
+        let exponential = exp_approx_neon(vsubq_f32(value, shift_vector));
+        vst1q_f32(values.as_mut_ptr().add(idx), exponential);
+        sum = vaddq_f32(sum, exponential);
+    }
+    let mut lanes = [0.0f32; 4];
+    vst1q_f32(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum::<f32>()
+        + values[vector_len..]
+            .iter_mut()
+            .map(|value| {
+                *value = (*value - shift).exp();
+                *value
+            })
+            .sum::<f32>()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +507,23 @@ mod tests {
             .collect::<Vec<_>>();
         mul_sigmoid_in_place(&mut sigmoid_gate, &gate);
         assert_close(&sigmoid_gate, &expected_sigmoid_gate, "sigmoid gate");
+    }
+
+    #[test]
+    fn simd_shifted_exp_sum_stays_close_to_scalar() {
+        let mut actual = values();
+        let shift = 3.25;
+        let expected = actual
+            .iter()
+            .map(|value| (*value - shift).exp())
+            .collect::<Vec<_>>();
+        let expected_sum = expected.iter().sum::<f32>();
+        let actual_sum = exp_sum_shifted_in_place(&mut actual, shift);
+        assert_close(&actual, &expected, "shifted exp");
+        let tolerance = 3.0e-6 * expected_sum.abs().max(1.0);
+        assert!(
+            (actual_sum - expected_sum).abs() <= tolerance,
+            "shifted exp sum drift: actual={actual_sum:.8e} expected={expected_sum:.8e} tolerance={tolerance:.8e}",
+        );
     }
 }

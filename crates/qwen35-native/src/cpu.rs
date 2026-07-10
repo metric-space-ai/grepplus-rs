@@ -13,7 +13,10 @@ use tokenizers::Tokenizer;
 
 use crate::inventory::Qwen35Inventory;
 use crate::sampler::{sample_token, GenerationParams, SamplerRng};
-use crate::simd_math::{mul_sigmoid_in_place, mul_silu_in_place, silu_in_place, swiglu_in_place};
+use crate::simd_math::{
+    exp_sum_shifted_in_place, mul_sigmoid_in_place, mul_silu_in_place, silu_in_place,
+    swiglu_in_place,
+};
 use crate::{Error, Result};
 
 const RMS_EPS: f32 = 1.0e-6;
@@ -891,7 +894,63 @@ fn add_rows(dst: &mut [f32], lhs: &[f32], rhs: &[f32]) {
 }
 
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
-    lhs.iter().zip(rhs).map(|(a, b)| a * b).sum()
+    debug_assert_eq!(lhs.len(), rhs.len());
+
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe {
+            return dot_avx2(lhs, rhs);
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe {
+        return dot_neon(lhs, rhs);
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        lhs.iter().zip(rhs).map(|(a, b)| a * b).sum()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dot_avx2(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let vector_len = lhs.len() & !7;
+    let mut sum = _mm256_setzero_ps();
+    for idx in (0..vector_len).step_by(8) {
+        let left = _mm256_loadu_ps(lhs.as_ptr().add(idx));
+        let right = _mm256_loadu_ps(rhs.as_ptr().add(idx));
+        sum = _mm256_add_ps(sum, _mm256_mul_ps(left, right));
+    }
+    let mut lanes = [0.0f32; 8];
+    _mm256_storeu_ps(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum::<f32>()
+        + lhs[vector_len..]
+            .iter()
+            .zip(&rhs[vector_len..])
+            .map(|(left, right)| left * right)
+            .sum::<f32>()
+}
+
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+unsafe fn dot_neon(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let vector_len = lhs.len() & !3;
+    let mut sum = vdupq_n_f32(0.0);
+    for idx in (0..vector_len).step_by(4) {
+        let left = vld1q_f32(lhs.as_ptr().add(idx));
+        let right = vld1q_f32(rhs.as_ptr().add(idx));
+        sum = vaddq_f32(sum, vmulq_f32(left, right));
+    }
+    let mut lanes = [0.0f32; 4];
+    vst1q_f32(lanes.as_mut_ptr(), sum);
+    lanes.iter().sum::<f32>()
+        + lhs[vector_len..]
+            .iter()
+            .zip(&rhs[vector_len..])
+            .map(|(left, right)| left * right)
+            .sum::<f32>()
 }
 
 #[inline]
@@ -1171,11 +1230,7 @@ fn softmax_in_place(values: &mut [f32]) {
         .iter()
         .copied()
         .fold(f32::NEG_INFINITY, |a, b| a.max(b));
-    let mut sum = 0.0f32;
-    for value in values.iter_mut() {
-        *value = (*value - max).exp();
-        sum += *value;
-    }
+    let sum = exp_sum_shifted_in_place(values, max);
     if sum > 0.0 {
         for value in values {
             *value /= sum;
@@ -1194,6 +1249,28 @@ fn softplus(x: f32) -> f32 {
         x
     } else {
         (1.0 + x.exp()).ln()
+    }
+}
+
+#[cfg(test)]
+mod math_tests {
+    use super::*;
+
+    #[test]
+    fn simd_dot_stays_close_to_scalar() {
+        let lhs = (0..259)
+            .map(|idx| ((idx * 29 % 101) as f32 - 50.0) / 37.0)
+            .collect::<Vec<_>>();
+        let rhs = (0..259)
+            .map(|idx| ((idx * 17 % 89) as f32 - 44.0) / 41.0)
+            .collect::<Vec<_>>();
+        let expected = lhs.iter().zip(&rhs).map(|(a, b)| a * b).sum::<f32>();
+        let actual = dot(&lhs, &rhs);
+        let tolerance = 3.0e-5 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "SIMD dot drift: actual={actual:.8e} expected={expected:.8e} tolerance={tolerance:.8e}",
+        );
     }
 }
 
