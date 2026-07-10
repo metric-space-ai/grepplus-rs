@@ -309,6 +309,7 @@ impl CpuQwen35Model {
             .saturating_add(1)
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
+        let vocab_size = self.inventory.vocab_size;
         let mut perf = crate::MtpPerfTimer::new();
         let mut target_state = self.new_state(max_context);
         let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
@@ -442,6 +443,7 @@ impl CpuQwen35Model {
                 pending_target_hidden = output.hidden;
                 continue;
             }
+            debug_assert!(draft_tokens.len() <= MTP_DRAFT_MAX);
             drafted_total += draft_tokens.len();
             if mtp_debug {
                 eprintln!("qwen35-mtp-debug cycle={cycles} input={next} drafts={draft_tokens:?}");
@@ -455,41 +457,100 @@ impl CpuQwen35Model {
             perf.finish_stage(crate::MtpPerfStage::TargetStateCopy, stage);
             let stage = perf.begin_stage();
             let mut committed_hidden = Vec::with_capacity(verification_tokens.len() * hidden_size);
-            let mut verify_input = next;
             let mut accepted = 0usize;
             let mut mismatch = None;
             let mut finished = false;
-            for (draft_index, &draft_token) in draft_tokens.iter().enumerate() {
-                let mut output =
-                    self.forward_token_logits_hidden(verify_input, &mut speculative_target_state)?;
-                committed_hidden.extend_from_slice(&output.hidden);
-                let Some(target_token) =
-                    sample_token(&mut output.logits, &generated, params, &mut rng)
-                else {
-                    finished = true;
-                    break;
-                };
-                if target_token == self.eos_token_id {
-                    finished = true;
-                    break;
-                }
-                if mtp_debug {
-                    eprintln!(
-                        "qwen35-mtp-debug cycle={cycles} pos={draft_index} target={target_token} draft={draft_token}"
-                    );
-                }
-                generated.push(target_token);
-                if target_token != draft_token {
-                    mismatch = Some(target_token);
-                    break;
-                }
-                accepted += 1;
+            let mut first =
+                self.forward_token_logits_hidden(next, &mut speculative_target_state)?;
+            committed_hidden.extend_from_slice(&first.hidden);
+            let Some(first_target) = sample_token(&mut first.logits, &generated, params, &mut rng)
+            else {
+                break;
+            };
+            if first_target == self.eos_token_id {
+                break;
+            }
+            if mtp_debug {
+                eprintln!(
+                    "qwen35-mtp-debug cycle={cycles} pos=0 target={first_target} draft={}",
+                    draft_tokens[0]
+                );
+            }
+            generated.push(first_target);
+            if first_target != draft_tokens[0] {
+                mismatch = Some(first_target);
+            } else {
+                accepted = 1;
                 accepted_total += 1;
                 if generated.len() == params.max_tokens {
                     finished = true;
-                    break;
+                } else if draft_tokens.len() == 1 {
+                    let mut bonus = self.forward_token_logits_hidden(
+                        draft_tokens[0],
+                        &mut speculative_target_state,
+                    )?;
+                    committed_hidden.extend_from_slice(&bonus.hidden);
+                    let Some(target_token) =
+                        sample_token(&mut bonus.logits, &generated, params, &mut rng)
+                    else {
+                        perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                        break;
+                    };
+                    if target_token == self.eos_token_id {
+                        finished = true;
+                    } else {
+                        generated.push(target_token);
+                        next = target_token;
+                    }
+                } else {
+                    let mut tail = self.forward_tokens_logits_hidden(
+                        &draft_tokens,
+                        &mut speculative_target_state,
+                    )?;
+                    let Some(second_target) =
+                        sample_token(&mut tail.logits[..vocab_size], &generated, params, &mut rng)
+                    else {
+                        perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                        break;
+                    };
+                    if second_target == self.eos_token_id {
+                        finished = true;
+                    } else {
+                        if mtp_debug {
+                            eprintln!(
+                                "qwen35-mtp-debug cycle={cycles} pos=1 target={second_target} draft={}",
+                                draft_tokens[1]
+                            );
+                        }
+                        generated.push(second_target);
+                        if second_target != draft_tokens[1] {
+                            mismatch = Some(second_target);
+                        } else {
+                            accepted = 2;
+                            accepted_total += 1;
+                            if generated.len() == params.max_tokens {
+                                finished = true;
+                            } else {
+                                committed_hidden.extend_from_slice(&tail.hidden);
+                                let Some(target_token) = sample_token(
+                                    &mut tail.logits[vocab_size..vocab_size * 2],
+                                    &generated,
+                                    params,
+                                    &mut rng,
+                                ) else {
+                                    perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
+                                    break;
+                                };
+                                if target_token == self.eos_token_id {
+                                    finished = true;
+                                } else {
+                                    generated.push(target_token);
+                                    next = target_token;
+                                }
+                            }
+                        }
+                    }
                 }
-                verify_input = draft_token;
             }
             perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
             if finished {
@@ -498,21 +559,6 @@ impl CpuQwen35Model {
             mtp_fallback = crate::mtp_should_fallback(drafted_total, accepted_total);
 
             if accepted == draft_tokens.len() {
-                let stage = perf.begin_stage();
-                let mut output =
-                    self.forward_token_logits_hidden(verify_input, &mut speculative_target_state)?;
-                perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
-                committed_hidden.extend_from_slice(&output.hidden);
-                let Some(target_token) =
-                    sample_token(&mut output.logits, &generated, params, &mut rng)
-                else {
-                    break;
-                };
-                if target_token == self.eos_token_id {
-                    break;
-                }
-                generated.push(target_token);
-                next = target_token;
                 std::mem::swap(&mut target_state, &mut speculative_target_state);
                 pending_target_hidden =
                     last_hidden_row(&committed_hidden, verification_tokens.len(), hidden_size)?
@@ -530,7 +576,14 @@ impl CpuQwen35Model {
                 let target_token = mismatch.expect("non-accepted draft must have mismatch token");
                 let commit_count = accepted + 1;
                 let commit_tokens = &verification_tokens[..commit_count];
-                std::mem::swap(&mut target_state, &mut speculative_target_state);
+                if accepted == 0 {
+                    std::mem::swap(&mut target_state, &mut speculative_target_state);
+                } else {
+                    let stage = perf.begin_stage();
+                    committed_hidden =
+                        self.prefill_tokens_hidden(commit_tokens, &mut target_state)?;
+                    perf.finish_stage(crate::MtpPerfStage::TargetReplay, stage);
+                }
                 let conditioning = mtp_conditioning_rows(
                     &previous_hidden,
                     &committed_hidden,
