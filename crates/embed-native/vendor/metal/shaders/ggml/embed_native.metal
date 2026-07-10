@@ -606,6 +606,56 @@ kernel void embed_native_qwen_add_rms_norm_f32(
     }
 }
 
+// Qwen fixed-width normalization. One SIMDgroup owns a row, avoiding the
+// 256-thread scratch reduction and its barriers on Apple GPUs.
+kernel void embed_native_qwen_rms_norm_simd32_f32(
+        constant embed_native_kargs_qwen_norm & args [[buffer(0)]],
+        device const float * src    [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        device       float * dst    [[buffer(3)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= (uint) args.rows) {
+        return;
+    }
+    const uint64_t base = (uint64_t) row * args.dim;
+    float sumf = 0.0f;
+    for (uint i = lane; i < (uint) args.dim; i += 32u) {
+        const float v = src[base + i];
+        sumf += v * v;
+    }
+    const float inv = rsqrt(simd_sum(sumf) / float(args.dim) + args.eps);
+    for (uint i = lane; i < (uint) args.dim; i += 32u) {
+        dst[base + i] = src[base + i] * inv * weight[i];
+    }
+}
+
+kernel void embed_native_qwen_add_rms_norm_simd32_f32(
+        constant embed_native_kargs_qwen_norm & args [[buffer(0)]],
+        device const float * lhs      [[buffer(1)]],
+        device const float * rhs      [[buffer(2)]],
+        device const float * weight   [[buffer(3)]],
+        device       float * sum_out  [[buffer(4)]],
+        device       float * norm_out [[buffer(5)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    if (row >= (uint) args.rows) {
+        return;
+    }
+    const uint64_t base = (uint64_t) row * args.dim;
+    float sumf = 0.0f;
+    for (uint i = lane; i < (uint) args.dim; i += 32u) {
+        const float v = lhs[base + i] + rhs[base + i];
+        sumf += v * v;
+    }
+    const float inv = rsqrt(simd_sum(sumf) / float(args.dim) + args.eps);
+    for (uint i = lane; i < (uint) args.dim; i += 32u) {
+        const float v = lhs[base + i] + rhs[base + i];
+        sum_out[base + i] = v;
+        norm_out[base + i] = v * inv * weight[i];
+    }
+}
+
 kernel void embed_native_qwen_swiglu_f32(
         constant embed_native_kargs_qwen_add & args [[buffer(0)]],
         device const float * gate [[buffer(1)]],
@@ -786,6 +836,61 @@ kernel void embed_native_qwen_normalize_linear_qk_rows_f32(
     }
 }
 
+kernel void embed_native_qwen_normalize_linear_qk_simd32_f32(
+        constant embed_native_kargs_qwen_heads & args [[buffer(0)]],
+        device float * q [[buffer(1)]],
+        device float * k [[buffer(2)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    if (head >= (uint) args.heads) {
+        return;
+    }
+    const uint64_t base = (uint64_t) head * args.head_dim;
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    for (uint i = lane; i < (uint) args.head_dim; i += 32u) {
+        const float qv = q[base + i];
+        const float kv = k[base + i];
+        sum_q += qv * qv;
+        sum_k += kv * kv;
+    }
+    const float q_scale = rsqrt(simd_sum(sum_q) + args.eps) * rsqrt(float(args.head_dim));
+    const float k_scale = rsqrt(simd_sum(sum_k) + args.eps);
+    for (uint i = lane; i < (uint) args.head_dim; i += 32u) {
+        q[base + i] *= q_scale;
+        k[base + i] *= k_scale;
+    }
+}
+
+kernel void embed_native_qwen_normalize_linear_qk_rows_simd32_f32(
+        constant embed_native_kargs_qwen_heads_rows & args [[buffer(0)]],
+        device float * q [[buffer(1)]],
+        device float * k [[buffer(2)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg_pos.x;
+    const uint head = tg_pos.y;
+    if (row >= (uint) args.rows || head >= (uint) args.heads) {
+        return;
+    }
+    const uint64_t q_base = (uint64_t) row * args.q_stride + (uint64_t) head * args.head_dim;
+    const uint64_t k_base = (uint64_t) row * args.k_stride + (uint64_t) head * args.head_dim;
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    for (uint i = lane; i < (uint) args.head_dim; i += 32u) {
+        const float qv = q[q_base + i];
+        const float kv = k[k_base + i];
+        sum_q += qv * qv;
+        sum_k += kv * kv;
+    }
+    const float q_scale = rsqrt(simd_sum(sum_q) + args.eps) * rsqrt(float(args.head_dim));
+    const float k_scale = rsqrt(simd_sum(sum_k) + args.eps);
+    for (uint i = lane; i < (uint) args.head_dim; i += 32u) {
+        q[q_base + i] *= q_scale;
+        k[k_base + i] *= k_scale;
+    }
+}
+
 kernel void embed_native_qwen_deinterleave_q_gate_rows_f32(
         constant embed_native_kargs_qwen_heads_rows & args [[buffer(0)]],
         device const float * packed [[buffer(1)]],
@@ -839,6 +944,29 @@ kernel void embed_native_qwen_rms_norm_strided_rows_f32(
     }
     const float scale = rsqrt(shmem[0] / float(args.head_dim) + args.eps);
     for (uint i = tid; i < (uint) args.head_dim; i += nthreads) {
+        values[base + i] *= scale * weight[i];
+    }
+}
+
+kernel void embed_native_qwen_rms_norm_strided_rows_simd32_f32(
+        constant embed_native_kargs_qwen_heads_rows & args [[buffer(0)]],
+        device float * values [[buffer(1)]],
+        device const float * weight [[buffer(2)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_simdgroup]]) {
+    const uint row = tg_pos.x;
+    const uint head = tg_pos.y;
+    if (row >= (uint) args.rows || head >= (uint) args.heads) {
+        return;
+    }
+    const uint64_t base = (uint64_t) row * args.q_stride + (uint64_t) head * args.head_dim;
+    float sumf = 0.0f;
+    for (uint i = lane; i < (uint) args.head_dim; i += 32u) {
+        const float v = values[base + i];
+        sumf += v * v;
+    }
+    const float scale = rsqrt(simd_sum(sumf) / float(args.head_dim) + args.eps);
+    for (uint i = lane; i < (uint) args.head_dim; i += 32u) {
         values[base + i] *= scale * weight[i];
     }
 }

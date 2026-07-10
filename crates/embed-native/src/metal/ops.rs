@@ -899,7 +899,7 @@ pub fn op_qwen_rms_norm_f32(
     eps: f32,
     qwen_scale: bool,
 ) -> bool {
-    let name = "embed_native_qwen_rms_norm_f32";
+    let name = "embed_native_qwen_rms_norm_simd32_f32";
     let Some(pso) = dev.pipeline(name) else {
         set_last_error(format!("op_qwen_rms_norm_f32: pipeline `{name}` not found"));
         return false;
@@ -915,8 +915,7 @@ pub fn op_qwen_rms_norm_f32(
     enc.set_buffer(1, src, 0);
     enc.set_buffer(2, weight, weight_offset);
     enc.set_buffer(3, dst, 0);
-    enc.set_threadgroup_memory_size(256 * 4, 0);
-    enc.dispatch_threadgroups((rows as usize, 1, 1), (256, 1, 1));
+    enc.dispatch_threadgroups((rows as usize, 1, 1), (32, 1, 1));
     true
 }
 
@@ -934,7 +933,7 @@ pub fn op_qwen_add_rms_norm_f32(
     dim: i32,
     eps: f32,
 ) -> bool {
-    let name = "embed_native_qwen_add_rms_norm_f32";
+    let name = "embed_native_qwen_add_rms_norm_simd32_f32";
     let Some(pso) = dev.pipeline(name) else {
         set_last_error(format!(
             "op_qwen_add_rms_norm_f32: pipeline `{name}` not found"
@@ -954,8 +953,7 @@ pub fn op_qwen_add_rms_norm_f32(
     enc.set_buffer(3, weight, weight_offset);
     enc.set_buffer(4, sum_out, 0);
     enc.set_buffer(5, norm_out, 0);
-    enc.set_threadgroup_memory_size(256 * 4, 0);
-    enc.dispatch_threadgroups((rows as usize, 1, 1), (256, 1, 1));
+    enc.dispatch_threadgroups((rows as usize, 1, 1), (32, 1, 1));
     true
 }
 
@@ -1129,7 +1127,7 @@ pub fn op_qwen_normalize_linear_qk_f32(
     head_dim: i32,
     eps: f32,
 ) -> bool {
-    let name = "embed_native_qwen_normalize_linear_qk_f32";
+    let name = "embed_native_qwen_normalize_linear_qk_simd32_f32";
     let Some(pso) = dev.pipeline(name) else {
         set_last_error(format!(
             "op_qwen_normalize_linear_qk_f32: pipeline `{name}` not found"
@@ -1146,8 +1144,7 @@ pub fn op_qwen_normalize_linear_qk_f32(
     enc.set_bytes(0, &args);
     enc.set_buffer(1, q, q_offset);
     enc.set_buffer(2, k, k_offset);
-    enc.set_threadgroup_memory_size(2 * 256 * 4, 0);
-    enc.dispatch_threadgroups((heads as usize, 1, 1), (256, 1, 1));
+    enc.dispatch_threadgroups((heads as usize, 1, 1), (32, 1, 1));
     true
 }
 
@@ -1166,7 +1163,7 @@ pub fn op_qwen_normalize_linear_qk_rows_f32(
     k_stride: i32,
     eps: f32,
 ) -> bool {
-    let name = "embed_native_qwen_normalize_linear_qk_rows_f32";
+    let name = "embed_native_qwen_normalize_linear_qk_rows_simd32_f32";
     let Some(pso) = dev.pipeline(name) else {
         set_last_error(format!(
             "op_qwen_normalize_linear_qk_rows_f32: pipeline `{name}` not found"
@@ -1187,8 +1184,7 @@ pub fn op_qwen_normalize_linear_qk_rows_f32(
     enc.set_bytes(0, &args);
     enc.set_buffer(1, q, q_offset);
     enc.set_buffer(2, k, k_offset);
-    enc.set_threadgroup_memory_size(2 * 256 * 4, 0);
-    enc.dispatch_threadgroups((rows as usize, heads as usize, 1), (256, 1, 1));
+    enc.dispatch_threadgroups((rows as usize, heads as usize, 1), (32, 1, 1));
     true
 }
 
@@ -1249,7 +1245,7 @@ pub fn op_qwen_rms_norm_strided_rows_f32(
     stride: i32,
     eps: f32,
 ) -> bool {
-    let name = "embed_native_qwen_rms_norm_strided_rows_f32";
+    let name = "embed_native_qwen_rms_norm_strided_rows_simd32_f32";
     let Some(pso) = dev.pipeline(name) else {
         set_last_error(format!(
             "op_qwen_rms_norm_strided_rows_f32: pipeline `{name}` not found"
@@ -1270,8 +1266,7 @@ pub fn op_qwen_rms_norm_strided_rows_f32(
     enc.set_bytes(0, &args);
     enc.set_buffer(1, values, values_offset);
     enc.set_buffer(2, weight, weight_offset);
-    enc.set_threadgroup_memory_size(256 * 4, 0);
-    enc.dispatch_threadgroups((rows as usize, heads as usize, 1), (256, 1, 1));
+    enc.dispatch_threadgroups((rows as usize, heads as usize, 1), (32, 1, 1));
     true
 }
 
