@@ -34,7 +34,7 @@ pub use sampler::{
     TRIAGE_GENERATION_PARAMS,
 };
 
-pub const MODEL_ID: &str = "lmstudio-community/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M";
+pub const MODEL_ID: &str = "unsloth/Qwen3.5-0.8B-MTP-GGUF/Qwen3.5-0.8B-MTP-Q4_K_M";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

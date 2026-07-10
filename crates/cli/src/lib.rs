@@ -11655,6 +11655,14 @@ mod embeddinggemma_assets {
         bytes: &[u8],
     ) -> Option<String> {
         let model = root.file_name()?.to_str()?.to_owned();
+        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
+        let dest = root.join(name);
+        let marker = root.join(format!("{name}.sha256"));
+        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            greppy_core::cache::touch_last_used_dir(&root);
+            return Some(dest.to_string_lossy().into_owned());
+        }
+
         let _lease = greppy_core::cache::acquire_model_lifecycle(
             expected_sha,
             greppy_core::cache::LockMode::Exclusive,
@@ -11666,10 +11674,6 @@ mod embeddinggemma_assets {
         let marker = root.join(format!("{name}.sha256"));
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
             greppy_core::cache::touch_last_used_dir(&root);
-            return Some(dest.to_string_lossy().into_owned());
-        }
-
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
             return Some(dest.to_string_lossy().into_owned());
         }
 
@@ -11749,6 +11753,42 @@ mod embeddinggemma_assets {
             ),
         ))
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cached_asset_resolves_while_model_has_shared_lease() {
+            const MODEL: &str = "embeddinggemma-asset-lock-test";
+            const SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+            const NAME: &str = "asset.bin";
+            const BYTES: &[u8] = b"cached embedding asset";
+
+            let root = std::path::Path::new(MODEL);
+            assert!(extract(root, SHA, NAME, BYTES).is_some());
+            let lease = greppy_core::cache::acquire_model_lifecycle(
+                SHA,
+                greppy_core::cache::LockMode::Shared,
+                false,
+            )
+            .expect("shared model lease")
+            .expect("model lease available");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let result = extract(std::path::Path::new(MODEL), SHA, NAME, BYTES);
+                let _ = tx.send(result.clone());
+                result
+            });
+            let resolved = rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("cached asset lookup must not wait for an exclusive lease");
+            drop(lease);
+            assert!(resolved.is_some());
+            assert!(waiter.join().expect("asset lookup thread").is_some());
+            let _ = std::fs::remove_dir_all(greppy_core::cache::models_root().join(MODEL));
+        }
+    }
 }
 
 mod qwen35_assets {
@@ -11757,10 +11797,11 @@ mod qwen35_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
-        static GGUF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/Qwen3.5-0.8B-Q4_K_M.gguf"));
+        static GGUF: &[u8] =
+            include_bytes!(concat!(env!("OUT_DIR"), "/Qwen3.5-0.8B-MTP-Q4_K_M.gguf"));
         static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35-tokenizer.json"));
-        let root = greppy_core::cache::models_root().join("qwen35-0.8b-q4km");
-        let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-Q4_K_M.gguf", GGUF)?;
+        let root = greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km");
+        let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
         let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
         Some((gguf, tok))
     }
@@ -11772,6 +11813,14 @@ mod qwen35_assets {
         bytes: &[u8],
     ) -> Option<String> {
         let model = root.file_name()?.to_str()?.to_owned();
+        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
+        let dest = root.join(name);
+        let marker = root.join(format!("{name}.sha256"));
+        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
+            greppy_core::cache::touch_last_used_dir(&root);
+            return Some(dest.to_string_lossy().into_owned());
+        }
+
         let _lease = greppy_core::cache::acquire_model_lifecycle(
             expected_sha,
             greppy_core::cache::LockMode::Exclusive,
@@ -11783,10 +11832,6 @@ mod qwen35_assets {
         let marker = root.join(format!("{name}.sha256"));
         if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
             greppy_core::cache::touch_last_used_dir(&root);
-            return Some(dest.to_string_lossy().into_owned());
-        }
-
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
             return Some(dest.to_string_lossy().into_owned());
         }
 
@@ -11860,6 +11905,42 @@ mod qwen35_assets {
                 path.display()
             ),
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn cached_asset_resolves_while_model_has_shared_lease() {
+            const MODEL: &str = "qwen35-asset-lock-test";
+            const SHA: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+            const NAME: &str = "asset.bin";
+            const BYTES: &[u8] = b"cached qwen asset";
+
+            let root = std::path::Path::new(MODEL);
+            assert!(extract(root, SHA, NAME, BYTES).is_some());
+            let lease = greppy_core::cache::acquire_model_lifecycle(
+                SHA,
+                greppy_core::cache::LockMode::Shared,
+                false,
+            )
+            .expect("shared model lease")
+            .expect("model lease available");
+            let (tx, rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let result = extract(std::path::Path::new(MODEL), SHA, NAME, BYTES);
+                let _ = tx.send(result.clone());
+                result
+            });
+            let resolved = rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("cached asset lookup must not wait for an exclusive lease");
+            drop(lease);
+            assert!(resolved.is_some());
+            assert!(waiter.join().expect("asset lookup thread").is_some());
+            let _ = std::fs::remove_dir_all(greppy_core::cache::models_root().join(MODEL));
+        }
     }
 }
 

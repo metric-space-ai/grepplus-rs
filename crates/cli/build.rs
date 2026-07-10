@@ -3,7 +3,7 @@
 //! Owner rule: greppy works OUT OF THE BOX — semantic search must ALWAYS
 //! work, so the model ships INSIDE the binary and the model files live IN THIS
 //! REPO (`crates/cli/assets/embeddinggemma-300m-q4k/` and
-//! `crates/cli/assets/qwen35-0.8b-q4km/`, tracked via Git LFS). No download,
+//! `crates/cli/assets/qwen35-0.8b-mtp-q4km/`, tracked via Git LFS). No download,
 //! external path, feature switch, or environment variable is required.
 //!
 //! A plain `cargo build` copies the in-repo assets into `OUT_DIR` (where
@@ -17,7 +17,7 @@ const GGUF_NAME: &str = "embeddinggemma-300M-Q4_K.gguf";
 const GGUF_SHA: &str = "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2";
 const TOK_NAME: &str = "tokenizer.json";
 const TOK_SHA: &str = "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e";
-const QWEN_GGUF_NAME: &str = "Qwen3.5-0.8B-Q4_K_M.gguf";
+const QWEN_GGUF_NAME: &str = "Qwen3.5-0.8B-MTP-Q4_K_M.gguf";
 const QWEN_TOK_NAME: &str = "tokenizer.json";
 
 fn main() {
@@ -38,7 +38,7 @@ fn main() {
         TOK_NAME,
         TOK_SHA,
     );
-    let qwen_assets = manifest.join("assets").join("qwen35-0.8b-q4km");
+    let qwen_assets = manifest.join("assets").join("qwen35-0.8b-mtp-q4km");
     let qwen_gguf_sha = read_sha256_sidecar(&qwen_assets.join(format!("{QWEN_GGUF_NAME}.sha256")));
     let qwen_tok_sha = read_sha256_sidecar(&qwen_assets.join(format!("{QWEN_TOK_NAME}.sha256")));
     println!("cargo:rustc-env=GREPPY_EMBEDDED_QWEN35_GGUF_SHA={qwen_gguf_sha}");
