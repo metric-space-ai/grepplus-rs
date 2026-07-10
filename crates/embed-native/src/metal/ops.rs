@@ -1348,7 +1348,12 @@ pub fn op_qwen_deltanet_decode_rows_f32(
     alpha_stride: i32,
     out_stride: i32,
 ) -> bool {
-    let name = "embed_native_qwen_deltanet_decode_rows_f32";
+    let specialized = heads == 16 && head_dim == 128;
+    let name = if specialized {
+        "embed_native_qwen_deltanet_prefill_rowcache_block32_f32"
+    } else {
+        "embed_native_qwen_deltanet_decode_rows_f32"
+    };
     let Some(pso) = dev.pipeline(name) else {
         set_last_error(format!(
             "op_qwen_deltanet_decode_rows_f32: pipeline `{name}` not found"
@@ -1380,8 +1385,12 @@ pub fn op_qwen_deltanet_decode_rows_f32(
     enc.set_buffer(7, dt_bias, dt_bias_offset);
     enc.set_buffer(8, state, 0);
     enc.set_buffer(9, out, 0);
-    enc.set_threadgroup_memory_size(2 * 256 * 4, 0);
-    enc.dispatch_threadgroups((heads as usize, head_dim as usize, 1), (256, 1, 1));
+    if specialized {
+        enc.dispatch_threadgroups((4, heads as usize, 1), (32, 1, 1));
+    } else {
+        enc.set_threadgroup_memory_size(2 * 256 * 4, 0);
+        enc.dispatch_threadgroups((heads as usize, head_dim as usize, 1), (256, 1, 1));
+    }
     true
 }
 
@@ -1785,6 +1794,141 @@ pub fn op_qwen_attention_values_rows_f32(
         (rows as usize, q_heads as usize, value_dim as usize),
         (256, 1, 1),
     );
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_qwen_attention_scores_rows_simd32_f32(
+    enc: &ComputeEncoder,
+    dev: &Device,
+    q: &Buffer,
+    q_offset: usize,
+    k_cache: &Buffer,
+    scores: &Buffer,
+    rows: i32,
+    position: i32,
+    q_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    max_context: i32,
+    q_stride: i32,
+    score_stride: i32,
+    scale: f32,
+) -> bool {
+    let name = "embed_native_qwen_attention_scores_rows_simd32_f32";
+    let Some(pso) = dev.pipeline(name) else {
+        set_last_error(format!(
+            "op_qwen_attention_scores_rows_simd32_f32: pipeline `{name}` not found"
+        ));
+        return false;
+    };
+    let args = QwenAttentionRowsArgs {
+        rows,
+        position,
+        q_heads,
+        kv_heads,
+        dim: head_dim,
+        max_context,
+        q_stride,
+        score_stride,
+        scale,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    };
+    enc.set_pipeline(&pso);
+    enc.set_bytes(0, &args);
+    enc.set_buffer(1, q, q_offset);
+    enc.set_buffer(2, k_cache, 0);
+    enc.set_buffer(3, scores, 0);
+    enc.dispatch_threadgroups((rows as usize, q_heads as usize, 1), (32, 1, 1));
+    true
+}
+
+pub fn op_qwen_softmax_rows_simd32_f32(
+    enc: &ComputeEncoder,
+    dev: &Device,
+    scores: &Buffer,
+    rows: i32,
+    position: i32,
+    heads: i32,
+    max_context: i32,
+    score_stride: i32,
+) -> bool {
+    let name = "embed_native_qwen_softmax_rows_simd32_f32";
+    let Some(pso) = dev.pipeline(name) else {
+        set_last_error(format!(
+            "op_qwen_softmax_rows_simd32_f32: pipeline `{name}` not found"
+        ));
+        return false;
+    };
+    let args = QwenAttentionRowsArgs {
+        rows,
+        position,
+        q_heads: heads,
+        kv_heads: 1,
+        dim: 0,
+        max_context,
+        q_stride: 0,
+        score_stride,
+        scale: 1.0,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    };
+    enc.set_pipeline(&pso);
+    enc.set_bytes(0, &args);
+    enc.set_buffer(1, scores, 0);
+    enc.dispatch_threadgroups((rows as usize, heads as usize, 1), (32, 1, 1));
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn op_qwen_attention_values_gate_rows_simd32_f32(
+    enc: &ComputeEncoder,
+    dev: &Device,
+    scores: &Buffer,
+    v_cache: &Buffer,
+    gate: &Buffer,
+    gate_offset: usize,
+    out: &Buffer,
+    rows: i32,
+    position: i32,
+    q_heads: i32,
+    kv_heads: i32,
+    value_dim: i32,
+    max_context: i32,
+    gate_stride: i32,
+    score_stride: i32,
+) -> bool {
+    let name = "embed_native_qwen_attention_values_gate_rows_simd32_f32";
+    let Some(pso) = dev.pipeline(name) else {
+        set_last_error(format!(
+            "op_qwen_attention_values_gate_rows_simd32_f32: pipeline `{name}` not found"
+        ));
+        return false;
+    };
+    let args = QwenAttentionRowsArgs {
+        rows,
+        position,
+        q_heads,
+        kv_heads,
+        dim: value_dim,
+        max_context,
+        q_stride: gate_stride,
+        score_stride,
+        scale: 1.0,
+        pad0: 0,
+        pad1: 0,
+        pad2: 0,
+    };
+    enc.set_pipeline(&pso);
+    enc.set_bytes(0, &args);
+    enc.set_buffer(1, scores, 0);
+    enc.set_buffer(2, v_cache, 0);
+    enc.set_buffer(3, gate, gate_offset);
+    enc.set_buffer(4, out, 0);
+    enc.dispatch_threadgroups((rows as usize, q_heads as usize, 1), (32, 1, 1));
     true
 }
 

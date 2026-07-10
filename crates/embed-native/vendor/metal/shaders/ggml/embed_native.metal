@@ -983,6 +983,81 @@ kernel void embed_native_qwen_deltanet_decode_rows_f32(
     }
 }
 
+// Qwen3.5 H16xD128 prefill scan. One SIMDgroup owns 32 value rows and
+// keeps each complete recurrent row local across the token sequence.
+kernel void embed_native_qwen_deltanet_prefill_rowcache_block32_f32(
+        constant embed_native_kargs_qwen_deltanet_rows & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k       [[buffer(2)]],
+        device const float * v       [[buffer(3)]],
+        device const float * beta    [[buffer(4)]],
+        device const float * alpha   [[buffer(5)]],
+        device const float * a_log   [[buffer(6)]],
+        device const float * dt_bias [[buffer(7)]],
+        device       float * state   [[buffer(8)]],
+        device       float * out     [[buffer(9)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint2 tid_pos [[thread_position_in_threadgroup]]) {
+    constexpr uint head_dim = 128;
+    constexpr uint rows_per_tg = 32;
+    const uint lane = tid_pos.x;
+    const uint row_block = tg_pos.x;
+    const uint head = tg_pos.y;
+    const uint value_idx = row_block * rows_per_tg + lane;
+    if (head >= (uint) args.heads || value_idx >= head_dim) {
+        return;
+    }
+
+    threadgroup float q_s[head_dim];
+    threadgroup float k_s[head_dim];
+    threadgroup float beta_s;
+    threadgroup float decay_s;
+    thread float row_state[head_dim];
+
+    const uint64_t head_base = (uint64_t) head * head_dim;
+    const uint64_t state_base = ((uint64_t) head * head_dim + value_idx) * head_dim;
+    for (uint col = 0; col < head_dim; ++col) {
+        row_state[col] = state[state_base + col];
+    }
+
+    for (int token = 0; token < args.rows; ++token) {
+        const uint64_t q_base = (uint64_t) token * args.q_stride + head_base;
+        const uint64_t k_base = (uint64_t) token * args.k_stride + head_base;
+        const uint64_t v_base = (uint64_t) token * args.v_stride + head_base;
+        for (uint col = lane; col < head_dim; col += rows_per_tg) {
+            q_s[col] = q[q_base + col];
+            k_s[col] = k[k_base + col];
+        }
+        if (lane == 0) {
+            const uint64_t beta_base = (uint64_t) token * args.beta_stride;
+            const uint64_t alpha_base = (uint64_t) token * args.alpha_stride;
+            beta_s = 1.0f / (1.0f + exp(-beta[beta_base + head]));
+            const float x = alpha[alpha_base + head] + dt_bias[head];
+            const float sp = x > 20.0f ? x : log(1.0f + exp(x));
+            decay_s = clamp(exp(-exp(a_log[head]) * sp), 0.0f, 1.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float prior = 0.0f;
+        for (uint col = 0; col < head_dim; ++col) {
+            prior += row_state[col] * k_s[col];
+        }
+        const float delta = (v[v_base + value_idx] - decay_s * prior) * beta_s;
+        float attn = 0.0f;
+        for (uint col = 0; col < head_dim; ++col) {
+            const float updated = decay_s * row_state[col] + k_s[col] * delta;
+            row_state[col] = updated;
+            attn += updated * q_s[col];
+        }
+        out[(uint64_t) token * args.out_stride + head_base + value_idx] = attn;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint col = 0; col < head_dim; ++col) {
+        state[state_base + col] = row_state[col];
+    }
+}
+
 kernel void embed_native_qwen_rope_decode_f32(
         constant embed_native_kargs_qwen_rope & args [[buffer(0)]],
         device float * values [[buffer(1)]],
@@ -1304,6 +1379,106 @@ kernel void embed_native_qwen_attention_values_rows_f32(
     if (tid == 0) {
         out[(uint64_t) row * args.q_heads * args.dim + (uint64_t) q_head * args.dim + value_idx] =
             shmem[0];
+    }
+}
+
+// Qwen3.5 H8/KV2/D256 prefill attention. Each query head is owned by one
+// SIMDgroup; every lane accumulates eight head dimensions without cross-SIMD
+// reductions or threadgroup scratch.
+kernel void embed_native_qwen_attention_scores_rows_simd32_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device const float * q       [[buffer(1)]],
+        device const float * k_cache [[buffer(2)]],
+        device       float * scores  [[buffer(3)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint2 tid_pos [[thread_position_in_threadgroup]]) {
+    const uint row = tg_pos.x;
+    const uint q_head = tg_pos.y;
+    const uint lane = tid_pos.x;
+    if (row >= (uint) args.rows || q_head >= (uint) args.q_heads) {
+        return;
+    }
+    const uint gqa = (uint) args.q_heads / (uint) args.kv_heads;
+    const uint kv_head = q_head / gqa;
+    const uint position = (uint) args.position + row;
+    const uint64_t q_base = (uint64_t) row * args.q_stride + q_head * args.dim;
+    const uint64_t score_base = (uint64_t) row * args.score_stride +
+        (uint64_t) q_head * args.max_context;
+
+    for (uint pos = 0; pos <= position; ++pos) {
+        const uint64_t k_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+        float dot = 0.0f;
+        for (uint dim = lane; dim < (uint) args.dim; dim += 32u) {
+            dot += q[q_base + dim] * k_cache[k_base + dim];
+        }
+        const float score = simd_sum(dot) * args.scale;
+        if (lane == 0u) {
+            scores[score_base + pos] = score;
+        }
+    }
+}
+
+kernel void embed_native_qwen_softmax_rows_simd32_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device float * scores [[buffer(1)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint2 tid_pos [[thread_position_in_threadgroup]]) {
+    const uint row = tg_pos.x;
+    const uint head = tg_pos.y;
+    const uint lane = tid_pos.x;
+    if (row >= (uint) args.rows || head >= (uint) args.q_heads) {
+        return;
+    }
+    const uint position = (uint) args.position + row;
+    const uint64_t base = (uint64_t) row * args.score_stride +
+        (uint64_t) head * args.max_context;
+    float local_max = -INFINITY;
+    for (uint pos = lane; pos <= position; pos += 32u) {
+        local_max = max(local_max, scores[base + pos]);
+    }
+    const float max_value = simd_max(local_max);
+    float local_sum = 0.0f;
+    for (uint pos = lane; pos <= position; pos += 32u) {
+        const float value = exp(scores[base + pos] - max_value);
+        scores[base + pos] = value;
+        local_sum += value;
+    }
+    const float inv_sum = 1.0f / max(simd_sum(local_sum), 1.0e-20f);
+    for (uint pos = lane; pos <= position; pos += 32u) {
+        scores[base + pos] *= inv_sum;
+    }
+}
+
+kernel void embed_native_qwen_attention_values_gate_rows_simd32_f32(
+        constant embed_native_kargs_qwen_attn_rows & args [[buffer(0)]],
+        device const float * scores  [[buffer(1)]],
+        device const float * v_cache [[buffer(2)]],
+        device const float * gate    [[buffer(3)]],
+        device       float * out     [[buffer(4)]],
+        uint2 tg_pos [[threadgroup_position_in_grid]],
+        uint2 tid_pos [[thread_position_in_threadgroup]]) {
+    const uint row = tg_pos.x;
+    const uint q_head = tg_pos.y;
+    const uint lane = tid_pos.x;
+    if (row >= (uint) args.rows || q_head >= (uint) args.q_heads) {
+        return;
+    }
+    const uint gqa = (uint) args.q_heads / (uint) args.kv_heads;
+    const uint kv_head = q_head / gqa;
+    const uint position = (uint) args.position + row;
+    const uint64_t score_base = (uint64_t) row * args.score_stride +
+        (uint64_t) q_head * args.max_context;
+    const uint64_t gate_base = (uint64_t) row * args.q_stride + q_head * args.dim;
+    const uint64_t out_base = ((uint64_t) row * args.q_heads + q_head) * args.dim;
+
+    for (uint dim = lane; dim < (uint) args.dim; dim += 32u) {
+        float value = 0.0f;
+        for (uint pos = 0; pos <= position; ++pos) {
+            const uint64_t v_base = ((uint64_t) pos * args.kv_heads + kv_head) * args.dim;
+            value += scores[score_base + pos] * v_cache[v_base + dim];
+        }
+        const float gate_value = gate[gate_base + dim];
+        out[out_base + dim] = value / (1.0f + exp(-gate_value));
     }
 }
 

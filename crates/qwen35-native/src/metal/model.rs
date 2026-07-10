@@ -365,7 +365,7 @@ impl MetalQwen35Model {
         }
         let cb = self.command_buffer()?;
         let enc = cb
-            .compute()
+            .compute_concurrent()
             .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
         self.encode_embed_tokens(&enc, &ws.token_ids, &ws.hidden, rows)?;
         enc.memory_barrier_buffers();
@@ -2037,62 +2037,115 @@ impl MetalQwen35Model {
         enc.memory_barrier_buffers();
         let scale = 1.0 / (self.inventory.head_dim as f32).sqrt();
         let score_stride = self.inventory.attention_heads * max_context;
-        ok(ops::op_qwen_attention_scores_rows_f32(
-            enc,
-            self.dev,
-            &ws.qkv,
-            0,
-            k_cache,
-            &ws.scores,
-            checked_i32(rows, "attention rows")?,
-            checked_i32(position, "attention position")?,
-            checked_i32(self.inventory.attention_heads, "attention heads")?,
-            checked_i32(self.inventory.kv_heads, "kv heads")?,
-            checked_i32(self.inventory.head_dim, "attention head dim")?,
-            checked_i32(max_context, "attention context")?,
-            checked_i32(q_dim * 2, "attention q stride")?,
-            checked_i32(score_stride, "attention score stride")?,
-            scale,
-        ))?;
-        enc.memory_barrier_buffers();
-        ok(ops::op_qwen_softmax_rows_f32(
-            enc,
-            self.dev,
-            &ws.scores,
-            checked_i32(rows, "attention rows")?,
-            checked_i32(position, "attention position")?,
-            checked_i32(self.inventory.attention_heads, "attention heads")?,
-            checked_i32(max_context, "attention context")?,
-            checked_i32(score_stride, "attention score stride")?,
-        ))?;
-        enc.memory_barrier_buffers();
-        ok(ops::op_qwen_attention_values_rows_f32(
-            enc,
-            self.dev,
-            &ws.scores,
-            v_cache,
-            &ws.raw,
-            checked_i32(rows, "attention rows")?,
-            checked_i32(position, "attention position")?,
-            checked_i32(self.inventory.attention_heads, "attention heads")?,
-            checked_i32(self.inventory.kv_heads, "kv heads")?,
-            checked_i32(self.inventory.value_dim, "attention value dim")?,
-            checked_i32(max_context, "attention context")?,
-            checked_i32(score_stride, "attention score stride")?,
-        ))?;
-        enc.memory_barrier_buffers();
-        ok(ops::op_qwen_apply_sigmoid_gate_rows_f32(
-            enc,
-            self.dev,
-            &ws.raw,
-            0,
-            &ws.qkv,
-            q_dim * std::mem::size_of::<f32>(),
-            checked_i32(rows, "attention rows")?,
-            checked_i32(q_dim, "attention gate width")?,
-            checked_i32(q_dim, "attention value stride")?,
-            checked_i32(q_dim * 2, "attention gate stride")?,
-        ))?;
+        let simd32_attention = self.inventory.attention_heads == 8
+            && self.inventory.kv_heads == 2
+            && self.inventory.head_dim == 256
+            && self.inventory.value_dim == 256;
+        if simd32_attention {
+            ok(ops::op_qwen_attention_scores_rows_simd32_f32(
+                enc,
+                self.dev,
+                &ws.qkv,
+                0,
+                k_cache,
+                &ws.scores,
+                checked_i32(rows, "attention rows")?,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(self.inventory.kv_heads, "kv heads")?,
+                checked_i32(self.inventory.head_dim, "attention head dim")?,
+                checked_i32(max_context, "attention context")?,
+                checked_i32(q_dim * 2, "attention q stride")?,
+                checked_i32(score_stride, "attention score stride")?,
+                scale,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_softmax_rows_simd32_f32(
+                enc,
+                self.dev,
+                &ws.scores,
+                checked_i32(rows, "attention rows")?,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(max_context, "attention context")?,
+                checked_i32(score_stride, "attention score stride")?,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_attention_values_gate_rows_simd32_f32(
+                enc,
+                self.dev,
+                &ws.scores,
+                v_cache,
+                &ws.qkv,
+                q_dim * std::mem::size_of::<f32>(),
+                &ws.raw,
+                checked_i32(rows, "attention rows")?,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(self.inventory.kv_heads, "kv heads")?,
+                checked_i32(self.inventory.value_dim, "attention value dim")?,
+                checked_i32(max_context, "attention context")?,
+                checked_i32(q_dim * 2, "attention gate stride")?,
+                checked_i32(score_stride, "attention score stride")?,
+            ))?;
+        } else {
+            ok(ops::op_qwen_attention_scores_rows_f32(
+                enc,
+                self.dev,
+                &ws.qkv,
+                0,
+                k_cache,
+                &ws.scores,
+                checked_i32(rows, "attention rows")?,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(self.inventory.kv_heads, "kv heads")?,
+                checked_i32(self.inventory.head_dim, "attention head dim")?,
+                checked_i32(max_context, "attention context")?,
+                checked_i32(q_dim * 2, "attention q stride")?,
+                checked_i32(score_stride, "attention score stride")?,
+                scale,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_softmax_rows_f32(
+                enc,
+                self.dev,
+                &ws.scores,
+                checked_i32(rows, "attention rows")?,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(max_context, "attention context")?,
+                checked_i32(score_stride, "attention score stride")?,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_attention_values_rows_f32(
+                enc,
+                self.dev,
+                &ws.scores,
+                v_cache,
+                &ws.raw,
+                checked_i32(rows, "attention rows")?,
+                checked_i32(position, "attention position")?,
+                checked_i32(self.inventory.attention_heads, "attention heads")?,
+                checked_i32(self.inventory.kv_heads, "kv heads")?,
+                checked_i32(self.inventory.value_dim, "attention value dim")?,
+                checked_i32(max_context, "attention context")?,
+                checked_i32(score_stride, "attention score stride")?,
+            ))?;
+            enc.memory_barrier_buffers();
+            ok(ops::op_qwen_apply_sigmoid_gate_rows_f32(
+                enc,
+                self.dev,
+                &ws.raw,
+                0,
+                &ws.qkv,
+                q_dim * std::mem::size_of::<f32>(),
+                checked_i32(rows, "attention rows")?,
+                checked_i32(q_dim, "attention gate width")?,
+                checked_i32(q_dim, "attention value stride")?,
+                checked_i32(q_dim * 2, "attention gate stride")?,
+            ))?;
+        }
         enc.memory_barrier_buffers();
         self.encode_matmul_rows_to(
             enc,
@@ -2496,6 +2549,27 @@ mod tests {
     use super::*;
     use greppy_embed_native::matmul::QuantMatrix;
 
+    fn profile_stage(
+        metal: &MetalQwen35Model,
+        stage: &str,
+        encode: impl FnOnce(&greppy_embed_native::metal::ffi::ComputeEncoder) -> Result<()>,
+    ) -> greppy_embed_native::metal::ffi::CommandBufferTiming {
+        let dispatch_start = greppy_embed_native::metal::ffi::dispatch_count_snapshot();
+        let cb = metal.command_buffer().expect("Metal profile command");
+        let enc = cb.compute().expect("Metal profile encoder");
+        encode(&enc).expect("Metal profile encode");
+        enc.end();
+        let timing = cb.commit_and_wait_timed().expect("Metal profile wait");
+        eprintln!(
+            "metal_stage_profile stage={stage} kernel_ms={:.3} gpu_ms={:.3} wait_ms={:.3} dispatches={}",
+            timing.kernel_secs * 1.0e3,
+            timing.gpu_secs * 1.0e3,
+            timing.submit_wait_secs * 1.0e3,
+            greppy_embed_native::metal::ffi::dispatch_count_snapshot() - dispatch_start,
+        );
+        timing
+    }
+
     #[test]
     fn qwen35_metal_embedding_matches_cpu_for_real_model_when_env_set() {
         let Some(path) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
@@ -2678,6 +2752,200 @@ mod tests {
                 rel <= 0.20,
                 "batched prefill len={len} logits relative RMS too high: cosine={cosine:.8}, rms_rel={rel:.6e}, max_abs={max_abs:.6e}"
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "diagnostic Metal layer profile"]
+    fn qwen35_metal_prefill_layer_profile_when_env_set() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
+            eprintln!("skipping qwen35 Metal layer profile: QWEN35_NATIVE_GGUF unset");
+            return;
+        };
+        let gguf = GgufModel::open(&path).expect("open Qwen3.5 GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 inventory");
+        inventory
+            .validate_core_tensors(&gguf)
+            .expect("Qwen3.5 core tensors");
+        let metal =
+            MetalQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044).expect("Metal Qwen");
+        let rows = std::env::var("QWEN35_NATIVE_METAL_PROFILE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(511)
+            .clamp(1, METAL_PREFILL_BATCH_ROWS);
+        let tokens = (0..rows)
+            .map(|row| ((row * 997 + 42) % inventory.vocab_size) as u32)
+            .collect::<Vec<_>>();
+        let mut state = metal
+            .new_forward_state(rows + 1)
+            .expect("Metal profile state");
+        let ws = metal
+            .new_prefill_workspace(rows, rows + 1)
+            .expect("Metal profile workspace");
+        unsafe {
+            ws.token_ids.write(0, &tokens);
+        }
+
+        let dispatch_start = greppy_embed_native::metal::ffi::dispatch_count_snapshot();
+        let cb = metal.command_buffer().expect("Metal profile embed command");
+        let enc = cb.compute().expect("Metal profile embed encoder");
+        metal
+            .encode_embed_tokens(&enc, &ws.token_ids, &ws.hidden, rows)
+            .expect("Metal profile embedding");
+        enc.end();
+        let timing = cb
+            .commit_and_wait_timed()
+            .expect("Metal profile embed wait");
+        eprintln!(
+            "metal_prefill_profile stage=embed rows={rows} kernel_ms={:.3} gpu_ms={:.3} wait_ms={:.3} dispatches={}",
+            timing.kernel_secs * 1.0e3,
+            timing.gpu_secs * 1.0e3,
+            timing.submit_wait_secs * 1.0e3,
+            greppy_embed_native::metal::ffi::dispatch_count_snapshot() - dispatch_start,
+        );
+
+        let mut kernel_secs = timing.kernel_secs;
+        let mut gpu_secs = timing.gpu_secs;
+        for layer in 0..inventory.block_count {
+            let kind = if inventory.is_full_attention_layer(layer) {
+                "full"
+            } else {
+                "delta"
+            };
+            let dispatch_start = greppy_embed_native::metal::ffi::dispatch_count_snapshot();
+            let cb = metal.command_buffer().expect("Metal profile layer command");
+            let enc = cb.compute().expect("Metal profile layer encoder");
+            let final_layer = metal
+                .encode_prefill_layer(&enc, layer, &mut state, rows, &ws)
+                .expect("Metal profile layer encode");
+            enc.end();
+            let timing = cb
+                .commit_and_wait_timed()
+                .expect("Metal profile layer wait");
+            kernel_secs += timing.kernel_secs;
+            gpu_secs += timing.gpu_secs;
+            eprintln!(
+                "metal_prefill_profile stage=layer layer={layer} kind={kind} final={final_layer} kernel_ms={:.3} gpu_ms={:.3} wait_ms={:.3} dispatches={}",
+                timing.kernel_secs * 1.0e3,
+                timing.gpu_secs * 1.0e3,
+                timing.submit_wait_secs * 1.0e3,
+                greppy_embed_native::metal::ffi::dispatch_count_snapshot() - dispatch_start,
+            );
+            if final_layer {
+                break;
+            }
+        }
+        eprintln!(
+            "metal_prefill_profile stage=total rows={rows} kernel_ms={:.3} gpu_ms={:.3} kernel_tok_s={:.2} gpu_tok_s={:.2}",
+            kernel_secs * 1.0e3,
+            gpu_secs * 1.0e3,
+            rows as f64 / kernel_secs.max(1.0e-9),
+            rows as f64 / gpu_secs.max(1.0e-9),
+        );
+    }
+
+    #[test]
+    #[ignore = "diagnostic Metal stage profile"]
+    fn qwen35_metal_prefill_stage_profile_when_env_set() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
+            eprintln!("skipping qwen35 Metal stage profile: QWEN35_NATIVE_GGUF unset");
+            return;
+        };
+        let gguf = GgufModel::open(&path).expect("open Qwen3.5 GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 inventory");
+        inventory
+            .validate_core_tensors(&gguf)
+            .expect("Qwen3.5 core tensors");
+        let metal =
+            MetalQwen35Model::from_gguf(&gguf, inventory.clone(), 248_044).expect("Metal Qwen");
+        let rows = std::env::var("QWEN35_NATIVE_METAL_PROFILE_ROWS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(511)
+            .clamp(1, METAL_PREFILL_BATCH_ROWS);
+        let tokens = (0..rows)
+            .map(|row| ((row * 997 + 42) % inventory.vocab_size) as u32)
+            .collect::<Vec<_>>();
+
+        let mut warm_state = metal.new_forward_state(33).expect("Metal warm state");
+        metal
+            .prefill_tokens(&tokens[..rows.min(32)], &mut warm_state)
+            .expect("Metal profile warmup");
+
+        let mut state = metal
+            .new_forward_state(rows + 1)
+            .expect("Metal profile state");
+        let ws = metal
+            .new_prefill_workspace(rows, rows + 1)
+            .expect("Metal profile workspace");
+        unsafe {
+            ws.token_ids.write(0, &tokens);
+        }
+        profile_stage(&metal, "embed", |enc| {
+            metal.encode_embed_tokens(enc, &ws.token_ids, &ws.hidden, rows)
+        });
+
+        for layer in [0usize, inventory.full_attention_interval - 1] {
+            let kind = if inventory.is_full_attention_layer(layer) {
+                "full"
+            } else {
+                "delta"
+            };
+            profile_stage(&metal, &format!("{kind}.attn_norm"), |enc| {
+                metal.encode_rms_norm(
+                    enc,
+                    &format!("blk.{layer}.attn_norm.weight"),
+                    &ws.hidden,
+                    &ws.normed,
+                    rows,
+                    inventory.hidden_size,
+                    true,
+                )
+            });
+            profile_stage(
+                &metal,
+                &format!("{kind}.attention"),
+                |enc| match &mut state.layer_states[layer] {
+                    MetalLayerState::Delta { recurrent, conv } => metal
+                        .encode_delta_attention_block_rows(enc, layer, recurrent, conv, rows, &ws),
+                    MetalLayerState::Full { k_cache, v_cache } => metal
+                        .encode_full_attention_block_rows(
+                            enc,
+                            layer,
+                            k_cache,
+                            v_cache,
+                            state.position,
+                            rows,
+                            state.max_context,
+                            &ws,
+                        ),
+                },
+            );
+            profile_stage(&metal, &format!("{kind}.post_attn_norm"), |enc| {
+                metal.encode_add_rms_norm(
+                    enc,
+                    &format!("blk.{layer}.post_attention_norm.weight"),
+                    &ws.hidden,
+                    &ws.attn_out,
+                    &ws.hidden,
+                    &ws.normed,
+                    rows,
+                    inventory.hidden_size,
+                )
+            });
+            profile_stage(&metal, &format!("{kind}.ffn"), |enc| {
+                metal.encode_ffn_block_rows(enc, layer, rows, &ws)
+            });
+            profile_stage(&metal, &format!("{kind}.residual"), |enc| {
+                metal.encode_add(
+                    enc,
+                    &ws.hidden,
+                    &ws.attn_out,
+                    &ws.hidden,
+                    rows * inventory.hidden_size,
+                )
+            });
         }
     }
 

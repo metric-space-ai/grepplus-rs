@@ -881,6 +881,15 @@ mod metal_perf_tests {
                 let Backend::Metal(model) = &summarizer.backend else {
                     panic!("expected Metal backend");
                 };
+                let warm_rows = prompt_ids.len().saturating_sub(1).min(32);
+                if warm_rows > 0 {
+                    let mut warm_state = model
+                        .new_forward_state(warm_rows + 1)
+                        .expect("Metal perf warm state");
+                    model
+                        .prefill_tokens(&prompt_ids[..warm_rows], &mut warm_state)
+                        .expect("Metal perf warm prefill");
+                }
                 let mut state = model
                     .new_forward_state(max_context)
                     .expect("Metal perf state");
