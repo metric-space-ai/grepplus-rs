@@ -437,7 +437,14 @@ impl QuantMatrix {
                     } else {
                         false
                     };
-                    #[cfg(not(target_arch = "aarch64"))]
+                    #[cfg(target_arch = "x86_64")]
+                    let used_x8 = if let Some(x8_vnni) = x8_vnni {
+                        out = matvec_x8(x8_vnni, lhs, self.rows, self.cols, dot8x4_q4k_q8k_avxvnni);
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                     let used_x8 = false;
                     if !used_x8 {
                         out.par_chunks_mut(64)
@@ -534,17 +541,35 @@ impl QuantMatrix {
                         out = matmul_q5k_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
                     }
                 } else if lhs_rows == 1 {
-                    let xq = quantize_q8k(lhs);
-                    out.par_chunks_mut(64)
-                        .enumerate()
-                        .for_each(|(chunk_idx, dst)| {
-                            let first = chunk_idx * 64;
-                            for (local, value) in dst.iter_mut().enumerate() {
-                                let out_col = first + local;
-                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                                *value = dot_q5k_q8k(y, &xq);
-                            }
-                        });
+                    #[cfg(target_arch = "x86_64")]
+                    let used_x8 = if let Some(x8) = x8 {
+                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x4_q5k_q8k_avxvnni);
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(target_arch = "aarch64")]
+                    let used_x8 = if let Some(x8) = x8 {
+                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x4_q5k_q8k_i8mm);
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                    let used_x8 = false;
+                    if !used_x8 {
+                        let xq = quantize_q8k(lhs);
+                        out.par_chunks_mut(64)
+                            .enumerate()
+                            .for_each(|(chunk_idx, dst)| {
+                                let first = chunk_idx * 64;
+                                for (local, value) in dst.iter_mut().enumerate() {
+                                    let out_col = first + local;
+                                    let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                    *value = dot_q5k_q8k(y, &xq);
+                                }
+                            });
+                    }
                 } else {
                     out.par_chunks_mut(self.rows)
                         .enumerate()
@@ -582,33 +607,51 @@ impl QuantMatrix {
                         out = matmul_q6k_batched(rhs, lhs, lhs_rows, self.rows, self.cols);
                     }
                 } else if lhs_rows == 1 {
-                    let xq = quantize_q8k(lhs);
-                    out.par_chunks_mut(64)
-                        .enumerate()
-                        .for_each(|(chunk_idx, dst)| {
-                            let first = chunk_idx * 64;
-                            let n_quad = dst.len() & !3;
-                            for local in (0..n_quad).step_by(4) {
-                                let out_col = first + local;
-                                let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                                let y1 =
-                                    &rhs[(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
-                                let y2 =
-                                    &rhs[(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
-                                let y3 =
-                                    &rhs[(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
-                                let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, &xq);
-                                dst[local] = d0;
-                                dst[local + 1] = d1;
-                                dst[local + 2] = d2;
-                                dst[local + 3] = d3;
-                            }
-                            for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
-                                let out_col = first + local;
-                                let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
-                                *value = dot_q6k_q8k(y, &xq);
-                            }
-                        });
+                    #[cfg(target_arch = "x86_64")]
+                    let used_x8 = if let Some(x8) = x8 {
+                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x4_q6k_q8k_avxvnni);
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(target_arch = "aarch64")]
+                    let used_x8 = if let Some(x8) = x8 {
+                        out = matvec_x8(x8, lhs, self.rows, self.cols, dot8x4_q6k_q8k_i8mm);
+                        true
+                    } else {
+                        false
+                    };
+                    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+                    let used_x8 = false;
+                    if !used_x8 {
+                        let xq = quantize_q8k(lhs);
+                        out.par_chunks_mut(64)
+                            .enumerate()
+                            .for_each(|(chunk_idx, dst)| {
+                                let first = chunk_idx * 64;
+                                let n_quad = dst.len() & !3;
+                                for local in (0..n_quad).step_by(4) {
+                                    let out_col = first + local;
+                                    let y0 = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                    let y1 = &rhs
+                                        [(out_col + 1) * row_blocks..(out_col + 2) * row_blocks];
+                                    let y2 = &rhs
+                                        [(out_col + 2) * row_blocks..(out_col + 3) * row_blocks];
+                                    let y3 = &rhs
+                                        [(out_col + 3) * row_blocks..(out_col + 4) * row_blocks];
+                                    let (d0, d1, d2, d3) = dot4_q6k_q8k(y0, y1, y2, y3, &xq);
+                                    dst[local] = d0;
+                                    dst[local + 1] = d1;
+                                    dst[local + 2] = d2;
+                                    dst[local + 3] = d3;
+                                }
+                                for (local, value) in dst.iter_mut().enumerate().skip(n_quad) {
+                                    let out_col = first + local;
+                                    let y = &rhs[out_col * row_blocks..(out_col + 1) * row_blocks];
+                                    *value = dot_q6k_q8k(y, &xq);
+                                }
+                            });
+                    }
                 } else {
                     out.par_chunks_mut(self.rows)
                         .enumerate()
@@ -927,6 +970,32 @@ fn matmul_q4k_batched_avxvnni(
             }
         });
     transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+fn matvec_x8<T: Sync>(
+    rhs: &[T],
+    lhs: &[f32],
+    matrix_rows: usize,
+    matrix_cols: usize,
+    kernel: unsafe fn(&[T], &[BlockQ8Kx4]) -> [[f32; 8]; 4],
+) -> Vec<f32> {
+    debug_assert_eq!(matrix_rows % 8, 0);
+    let row_blocks = matrix_cols / QK_K;
+    let quantized = quantize_q8k(lhs);
+    let input = pack_q8kx4_repeated(&quantized);
+    let mut out = vec![0.0f32; matrix_rows];
+    out.par_chunks_mut(64)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first_group = chunk_idx * 8;
+            for (local_group, dst) in chunk.chunks_exact_mut(8).enumerate() {
+                let group = first_group + local_group;
+                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+                dst.copy_from_slice(&unsafe { kernel(weights, &input) }[0]);
+            }
+        });
+    out
 }
 
 #[cfg(target_arch = "aarch64")]
