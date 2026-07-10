@@ -986,8 +986,8 @@ impl CpuQwen35Model {
             };
             let layer_start = std::time::Instant::now();
             let stage_start = std::time::Instant::now();
-            let residual = hidden.clone();
-            let mut x = hidden;
+            let mut residual = hidden;
+            let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.attn_norm);
             let norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
@@ -1004,12 +1004,13 @@ impl CpuQwen35Model {
             let attention_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
             let stage_start = std::time::Instant::now();
-            hidden = add(&residual, &attn);
+            add_in_place(&mut residual, &attn);
+            hidden = residual;
             let residual_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
             let stage_start = std::time::Instant::now();
-            let residual = hidden.clone();
-            let mut x = hidden;
+            let mut residual = hidden;
+            let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.post_attention_norm);
             let post_norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
@@ -1018,7 +1019,8 @@ impl CpuQwen35Model {
             let ffn_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
 
             let stage_start = std::time::Instant::now();
-            hidden = add(&residual, &ffn);
+            add_in_place(&mut residual, &ffn);
+            hidden = residual;
             let ffn_add_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
             eprintln!(
                 "cpu_decode_profile stage=layer layer={idx} kind={kind} total_ms={:.3} norm_ms={norm_ms:.3} attention_ms={attention_ms:.3} residual_ms={residual_ms:.3} post_norm_ms={post_norm_ms:.3} ffn_ms={ffn_ms:.3} ffn_add_ms={ffn_add_ms:.3}",
@@ -1050,8 +1052,8 @@ impl CpuQwen35Model {
         }
         let mut hidden = self.token_embd.embedding_rows(&[token])?;
         for (idx, layer) in self.layers.iter().enumerate() {
-            let residual = hidden.clone();
-            let mut x = hidden;
+            let mut residual = hidden;
+            let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.attn_norm);
             let attn = match (&layer.kind, &mut state.layer_states[idx]) {
                 (LayerKind::Delta(weights), LayerState::Delta(runtime)) => {
@@ -1062,13 +1064,15 @@ impl CpuQwen35Model {
                 }
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
             };
-            hidden = add(&residual, &attn);
+            add_in_place(&mut residual, &attn);
+            hidden = residual;
 
-            let residual = hidden.clone();
-            let mut x = hidden;
+            let mut residual = hidden;
+            let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.post_attention_norm);
             let ffn = self.ffn(layer, &x)?;
-            hidden = add(&residual, &ffn);
+            add_in_place(&mut residual, &ffn);
+            hidden = residual;
         }
         state.position += 1;
         Ok(hidden)
@@ -1598,8 +1602,11 @@ fn prompt_seed(prompt: &str) -> u64 {
     h.finish()
 }
 
-fn add(lhs: &[f32], rhs: &[f32]) -> Vec<f32> {
-    lhs.iter().zip(rhs).map(|(a, b)| a + b).collect()
+fn add_in_place(lhs: &mut [f32], rhs: &[f32]) {
+    debug_assert_eq!(lhs.len(), rhs.len());
+    for (lhs, rhs) in lhs.iter_mut().zip(rhs) {
+        *lhs += *rhs;
+    }
 }
 
 fn add_rows(dst: &mut [f32], lhs: &[f32], rhs: &[f32]) {
