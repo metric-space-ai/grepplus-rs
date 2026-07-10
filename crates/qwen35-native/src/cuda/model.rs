@@ -7,16 +7,25 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use greppy_embed_native::cuda::ffi::{
-    check, gp_embed_q4k, gp_embed_q6k, gp_mmvq_matvec, gp_qwen_add, gp_qwen_add_rms_norm,
+    check, gp_embed_q4k, gp_embed_q6k, gp_mmq_matmul, gp_mmq_matmul_q8, gp_mmq_quantize,
+    gp_mmvq_matvec, gp_mmvq_matvec_q8, gp_qwen_add, gp_qwen_add_rms_norm, gp_qwen_add_rms_norm_q8,
     gp_qwen_apply_sigmoid_gate, gp_qwen_apply_silu_gate, gp_qwen_argmax,
-    gp_qwen_attention_scores_decode, gp_qwen_attention_values_decode, gp_qwen_cache_write,
-    gp_qwen_causal_conv1d_silu, gp_qwen_deinterleave_q_gate, gp_qwen_deltanet_decode,
-    gp_qwen_normalize_linear_qk, gp_qwen_rms_norm, gp_qwen_rope_decode, gp_qwen_softmax_decode,
-    gp_qwen_swiglu, gp_rms_norm, CudaDevice, DeviceBuffer,
+    gp_qwen_attention_rows_fused, gp_qwen_attention_scores_decode,
+    gp_qwen_attention_scores_decode_position, gp_qwen_attention_values_decode,
+    gp_qwen_attention_values_decode_position, gp_qwen_cache_write, gp_qwen_cache_write_position,
+    gp_qwen_cache_write_rows, gp_qwen_causal_conv1d_silu, gp_qwen_causal_conv1d_silu_rows_parallel,
+    gp_qwen_deinterleave_q_gate, gp_qwen_deltanet_decode, gp_qwen_deltanet_decode_rows,
+    gp_qwen_increment_position, gp_qwen_normalize_linear_qk, gp_qwen_normalize_linear_qk_rows,
+    gp_qwen_rms_norm, gp_qwen_rms_norm_q8, gp_qwen_rope_decode, gp_qwen_rope_decode_position,
+    gp_qwen_rope_rows, gp_qwen_softmax_decode, gp_qwen_softmax_decode_position, gp_qwen_swiglu,
+    gp_rms_norm, CudaDevice, CudaGraph, DeviceBuffer,
 };
 use greppy_embed_native::cuda::weights::CudaWeights;
 use greppy_embed_native::{GgmlDType, GgufModel};
 use tokenizers::Tokenizer;
+
+#[cfg(test)]
+use greppy_embed_native::cuda::ffi::gp_mmvq_quantize;
 
 use crate::inventory::Qwen35Inventory;
 use crate::sampler::{sample_token, GenerationParams, SamplerRng};
@@ -32,6 +41,11 @@ pub struct CudaQwen35Model {
 pub struct CudaForwardState {
     position: usize,
     max_context: usize,
+    position_device: DeviceBuffer,
+    decode_graph: Option<CudaGraph>,
+    graph_unavailable: bool,
+    graph_token: Option<u32>,
+    prefill_workspace: Option<CudaPrefillWorkspace>,
     layer_states: Vec<CudaLayerState>,
 }
 
@@ -49,6 +63,7 @@ enum CudaLayerState {
 pub(crate) struct CudaForwardWorkspace {
     token_id: DeviceBuffer,
     hidden: DeviceBuffer,
+    #[cfg(test)]
     normed: DeviceBuffer,
     attn_out: DeviceBuffer,
     qkv: DeviceBuffer,
@@ -66,6 +81,29 @@ pub(crate) struct CudaForwardWorkspace {
     argmax_indices: DeviceBuffer,
     scores: DeviceBuffer,
     q8_scratch: DeviceBuffer,
+}
+
+struct CudaPrefillWorkspace {
+    mmq_rows: usize,
+    token_ids: DeviceBuffer,
+    hidden: DeviceBuffer,
+    normed: DeviceBuffer,
+    attn_out: DeviceBuffer,
+    qkv: DeviceBuffer,
+    conv_out: DeviceBuffer,
+    z: DeviceBuffer,
+    beta: DeviceBuffer,
+    alpha: DeviceBuffer,
+    raw: DeviceBuffer,
+    q_fused: DeviceBuffer,
+    q: DeviceBuffer,
+    gate: DeviceBuffer,
+    k: DeviceBuffer,
+    v: DeviceBuffer,
+    ffn_gate: DeviceBuffer,
+    ffn_up: DeviceBuffer,
+    q8_scratch: DeviceBuffer,
+    fixup_scratch: DeviceBuffer,
 }
 
 impl CudaQwen35Model {
@@ -122,8 +160,9 @@ impl CudaQwen35Model {
             .min(self.inventory.context_length);
         let mut state = self.new_forward_state(max_context)?;
         let mut workspace = self.new_forward_workspace(max_context)?;
-        for &token in &prompt_ids[..prompt_ids.len().saturating_sub(1)] {
-            self.prefill_token(token, &mut state, &mut workspace)?;
+        let prefill_ids = &prompt_ids[..prompt_ids.len().saturating_sub(1)];
+        for chunk in prefill_ids.chunks(CUDA_PREFILL_BATCH_ROWS) {
+            self.prefill_tokens(chunk, &mut state)?;
         }
 
         let mut next = *prompt_ids.last().expect("checked non-empty above");
@@ -157,6 +196,11 @@ impl CudaQwen35Model {
     }
 
     pub fn new_forward_state(&self, max_context: usize) -> Result<CudaForwardState> {
+        let prefill_rows = max_context
+            .min(CUDA_PREFILL_BATCH_ROWS)
+            .max(1)
+            .div_ceil(CUDA_MMQ_ROW_TILE)
+            * CUDA_MMQ_ROW_TILE;
         let mut layer_states = Vec::with_capacity(self.inventory.block_count);
         for layer in 0..self.inventory.block_count {
             if self.inventory.is_full_attention_layer(layer) {
@@ -178,6 +222,11 @@ impl CudaQwen35Model {
         Ok(CudaForwardState {
             position: 0,
             max_context,
+            position_device: self.new_bytes(std::mem::size_of::<i32>())?,
+            decode_graph: None,
+            graph_unavailable: false,
+            graph_token: None,
+            prefill_workspace: Some(self.new_prefill_workspace(prefill_rows)?),
             layer_states,
         })
     }
@@ -193,6 +242,7 @@ impl CudaQwen35Model {
         Ok(CudaForwardWorkspace {
             token_id: self.new_bytes(std::mem::size_of::<u32>())?,
             hidden: self.new_f32(self.inventory.hidden_size)?,
+            #[cfg(test)]
             normed: self.new_f32(self.inventory.hidden_size)?,
             attn_out: self.new_f32(self.inventory.hidden_size)?,
             qkv: self.new_f32(self.inventory.ssm_inner_size * 3)?,
@@ -217,25 +267,181 @@ impl CudaQwen35Model {
         })
     }
 
+    fn new_prefill_workspace(&self, rows: usize) -> Result<CudaPrefillWorkspace> {
+        let hidden = self.inventory.hidden_size;
+        let inner = self.inventory.ssm_inner_size;
+        let q_dim = self.inventory.attention_heads * self.inventory.head_dim;
+        let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
+        let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
+        let max_mmq_cols = self
+            .inventory
+            .feed_forward_size
+            .max(inner)
+            .max(q_dim)
+            .max(hidden);
+        Ok(CudaPrefillWorkspace {
+            mmq_rows: rows,
+            token_ids: self.new_bytes(rows * std::mem::size_of::<u32>())?,
+            hidden: self.new_f32(rows * hidden)?,
+            normed: self.new_f32(rows * hidden)?,
+            attn_out: self.new_f32(rows * hidden)?,
+            qkv: self.new_f32(rows * inner * 3)?,
+            conv_out: self.new_f32(rows * inner * 3)?,
+            z: self.new_f32(rows * inner)?,
+            beta: self.new_f32(rows * self.inventory.ssm_group_count)?,
+            alpha: self.new_f32(rows * self.inventory.ssm_time_step_rank)?,
+            raw: self.new_f32(rows * inner.max(q_dim))?,
+            q_fused: self.new_f32(rows * q_dim * 2)?,
+            q: self.new_f32(rows * q_dim)?,
+            gate: self.new_f32(rows * q_dim)?,
+            k: self.new_f32(rows * kv_k_dim)?,
+            v: self.new_f32(rows * kv_v_dim)?,
+            ffn_gate: self.new_f32(rows * self.inventory.feed_forward_size)?,
+            ffn_up: self.new_f32(rows * self.inventory.feed_forward_size)?,
+            q8_scratch: self.new_bytes(q8_1_scratch_bytes(max_mmq_cols, rows))?,
+            fixup_scratch: self.new_bytes(MMQ_FIXUP_SCRATCH_BYTES)?,
+        })
+    }
+
     pub(crate) fn forward_token_logits(
         &self,
         token: u32,
         state: &mut CudaForwardState,
         ws: &mut CudaForwardWorkspace,
     ) -> Result<Vec<f32>> {
+        state.decode_graph = None;
+        state.graph_token = None;
         self.forward_token_logits_device(token, state, ws)?;
         let mut logits = vec![0.0f32; self.inventory.vocab_size];
         self.dev.copy_d2h(&mut logits, &ws.logits)?;
         Ok(logits)
     }
 
+    #[cfg(test)]
     pub(crate) fn prefill_token(
         &self,
         token: u32,
         state: &mut CudaForwardState,
         ws: &mut CudaForwardWorkspace,
     ) -> Result<()> {
+        state.decode_graph = None;
+        state.graph_token = None;
         self.forward_token_prefill_device(token, state, ws)
+    }
+
+    pub(crate) fn prefill_tokens(
+        &self,
+        tokens: &[u32],
+        state: &mut CudaForwardState,
+    ) -> Result<()> {
+        state.decode_graph = None;
+        state.graph_token = None;
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        let rows = tokens.len();
+        if state.position.saturating_add(rows) > state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+        for &token in tokens {
+            if token as usize >= self.inventory.vocab_size {
+                return Err(Error::InvalidRequest(format!(
+                    "token id {token} out of range for vocab {}",
+                    self.inventory.vocab_size
+                )));
+            }
+        }
+
+        let mmq_rows = rows.div_ceil(CUDA_MMQ_ROW_TILE) * CUDA_MMQ_ROW_TILE;
+        let mut ws = state.prefill_workspace.take().ok_or_else(|| {
+            Error::GenerationUnavailable("CUDA prefill workspace is already in use".into())
+        })?;
+        if mmq_rows > ws.mmq_rows {
+            ws = self.new_prefill_workspace(mmq_rows)?;
+        }
+        let result = (|| -> Result<()> {
+            self.dev.copy_h2d(&ws.token_ids, tokens)?;
+            self.embed_tokens_device(ws.token_ids.as_u32(), ws.hidden.as_f32(), rows)?;
+
+            let final_layer = self.inventory.block_count.saturating_sub(1);
+            for layer in 0..self.inventory.block_count {
+                self.rms_norm_device(
+                    &format!("blk.{layer}.attn_norm.weight"),
+                    ws.hidden.as_f32(),
+                    ws.normed.as_f32(),
+                    rows,
+                    self.inventory.hidden_size,
+                    true,
+                )?;
+                if layer == final_layer {
+                    match &mut state.layer_states[layer] {
+                        CudaLayerState::Full { k_cache, v_cache } => {
+                            self.full_attention_cache_only_rows_device(
+                                layer,
+                                k_cache,
+                                v_cache,
+                                state.position,
+                                rows,
+                                state.max_context,
+                                &mut ws,
+                            )?;
+                        }
+                        CudaLayerState::Delta { recurrent, conv } => {
+                            self.delta_attention_block_rows_device(
+                                layer, recurrent, conv, rows, &mut ws,
+                            )?;
+                        }
+                    }
+                    self.dev.sync()?;
+                    state.position += rows;
+                    return Ok(());
+                }
+
+                match &mut state.layer_states[layer] {
+                    CudaLayerState::Delta { recurrent, conv } => {
+                        self.delta_attention_block_rows_device(
+                            layer, recurrent, conv, rows, &mut ws,
+                        )?;
+                    }
+                    CudaLayerState::Full { k_cache, v_cache } => {
+                        self.full_attention_block_rows_device(
+                            layer,
+                            k_cache,
+                            v_cache,
+                            state.position,
+                            rows,
+                            state.max_context,
+                            &mut ws,
+                        )?;
+                    }
+                }
+                self.add_rms_norm_device(
+                    &format!("blk.{layer}.post_attention_norm.weight"),
+                    ws.hidden.as_f32(),
+                    ws.attn_out.as_f32(),
+                    ws.hidden.as_f32(),
+                    ws.normed.as_f32(),
+                    rows,
+                    self.inventory.hidden_size,
+                )?;
+                self.ffn_block_rows_device(layer, rows, &mut ws)?;
+                self.add_device(
+                    ws.hidden.as_f32(),
+                    ws.attn_out.as_f32(),
+                    ws.hidden.as_f32(),
+                    rows * self.inventory.hidden_size,
+                )?;
+            }
+
+            self.dev.sync()?;
+            state.position += rows;
+            Ok(())
+        })();
+        state.prefill_workspace = Some(ws);
+        result
     }
 
     pub(crate) fn forward_token_greedy(
@@ -244,7 +450,47 @@ impl CudaQwen35Model {
         state: &mut CudaForwardState,
         ws: &mut CudaForwardWorkspace,
     ) -> Result<u32> {
-        self.forward_token_logits_device(token, state, ws)?;
+        if state.position >= state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+        if token as usize >= self.inventory.vocab_size {
+            return Err(Error::InvalidRequest(format!(
+                "token id {token} out of range for vocab {}",
+                self.inventory.vocab_size
+            )));
+        }
+        if state.decode_graph.is_none() && !state.graph_unavailable {
+            if self.capture_greedy_graph(token, state, ws).is_err() {
+                state.graph_unavailable = true;
+            }
+        }
+        if state.graph_unavailable {
+            self.forward_token_logits_device(token, state, ws)?;
+            self.argmax_token_device(ws)?;
+            let mut output = [0_u32; 1];
+            self.dev.copy_d2h(&mut output, &ws.token_id)?;
+            return Ok(output[0]);
+        } else if state.graph_token != Some(token) {
+            self.dev
+                .copy_h2d(&ws.token_id, std::slice::from_ref(&token))?;
+            state.graph_token = Some(token);
+        }
+        state
+            .decode_graph
+            .as_ref()
+            .expect("graph captured above")
+            .launch(&self.dev)?;
+        let mut output = [0_u32; 1];
+        self.dev.copy_d2h(&mut output, &ws.token_id)?;
+        state.position += 1;
+        state.graph_token = Some(output[0]);
+        Ok(output[0])
+    }
+
+    fn argmax_token_device(&self, ws: &CudaForwardWorkspace) -> Result<()> {
         check(
             unsafe {
                 gp_qwen_argmax(
@@ -262,9 +508,99 @@ impl CudaQwen35Model {
             },
             "qwen35 cuda argmax logits",
         )?;
-        let mut token = [0_u32; 1];
-        self.dev.copy_d2h(&mut token, &ws.token_id)?;
-        Ok(token[0])
+        Ok(())
+    }
+
+    fn capture_greedy_graph(
+        &self,
+        token: u32,
+        state: &mut CudaForwardState,
+        ws: &mut CudaForwardWorkspace,
+    ) -> Result<()> {
+        self.dev
+            .copy_h2d(&ws.token_id, std::slice::from_ref(&token))?;
+        let position = [checked_i32(state.position, "graph position")?];
+        self.dev.copy_h2d(&state.position_device, &position)?;
+        self.dev.sync()?;
+        self.dev.begin_graph_capture()?;
+        if let Err(err) = self.forward_token_greedy_graph_device(state, ws) {
+            self.dev.abort_graph_capture();
+            return Err(err);
+        }
+        state.decode_graph = Some(self.dev.end_graph_capture()?);
+        state.graph_token = Some(token);
+        Ok(())
+    }
+
+    fn forward_token_greedy_graph_device(
+        &self,
+        state: &mut CudaForwardState,
+        ws: &mut CudaForwardWorkspace,
+    ) -> Result<()> {
+        self.embed_tokens_device(ws.token_id.as_u32(), ws.hidden.as_f32(), 1)?;
+        let position_ptr = state.position_device.ptr() as *const i32;
+        for layer in 0..self.inventory.block_count {
+            self.rms_norm_q8_device(
+                &format!("blk.{layer}.attn_norm.weight"),
+                ws.hidden.as_f32(),
+                self.inventory.hidden_size,
+                &ws.q8_scratch,
+            )?;
+            match &mut state.layer_states[layer] {
+                CudaLayerState::Delta { recurrent, conv } => {
+                    self.delta_attention_block_device(layer, recurrent, conv, ws)?;
+                }
+                CudaLayerState::Full { k_cache, v_cache } => {
+                    self.full_attention_block_device(
+                        layer,
+                        k_cache,
+                        v_cache,
+                        state.position,
+                        Some(position_ptr),
+                        ws,
+                    )?;
+                }
+            }
+            self.add_rms_norm_q8_device(
+                &format!("blk.{layer}.post_attention_norm.weight"),
+                ws.hidden.as_f32(),
+                ws.attn_out.as_f32(),
+                ws.hidden.as_f32(),
+                self.inventory.hidden_size,
+                &ws.q8_scratch,
+            )?;
+            self.ffn_block_device(layer, ws)?;
+            self.add_device(
+                ws.hidden.as_f32(),
+                ws.attn_out.as_f32(),
+                ws.hidden.as_f32(),
+                self.inventory.hidden_size,
+            )?;
+        }
+        self.rms_norm_q8_device(
+            "output_norm.weight",
+            ws.hidden.as_f32(),
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+        )?;
+        self.matvec_q8_device_to(
+            "token_embd.weight",
+            self.inventory.hidden_size,
+            ws.logits.as_f32(),
+            self.inventory.vocab_size,
+            &ws.q8_scratch,
+        )?;
+        self.argmax_token_device(ws)?;
+        check(
+            unsafe {
+                gp_qwen_increment_position(
+                    state.position_device.ptr() as *mut i32,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda increment graph position",
+        )?;
+        Ok(())
     }
 
     fn forward_token_logits_device(
@@ -274,17 +610,14 @@ impl CudaQwen35Model {
         ws: &mut CudaForwardWorkspace,
     ) -> Result<()> {
         self.forward_token_hidden_device(token, state, ws)?;
-        self.rms_norm_device(
+        self.rms_norm_q8_device(
             "output_norm.weight",
             ws.hidden.as_f32(),
-            ws.normed.as_f32(),
-            1,
             self.inventory.hidden_size,
-            true,
+            &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             "token_embd.weight",
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.logits.as_f32(),
             self.inventory.vocab_size,
@@ -316,30 +649,34 @@ impl CudaQwen35Model {
         self.embed_tokens_device(ws.token_id.as_u32(), ws.hidden.as_f32(), 1)?;
 
         for layer in 0..self.inventory.block_count {
-            self.rms_norm_device(
+            self.rms_norm_q8_device(
                 &format!("blk.{layer}.attn_norm.weight"),
                 ws.hidden.as_f32(),
-                ws.normed.as_f32(),
-                1,
                 self.inventory.hidden_size,
-                true,
+                &ws.q8_scratch,
             )?;
             match &mut state.layer_states[layer] {
                 CudaLayerState::Delta { recurrent, conv } => {
                     self.delta_attention_block_device(layer, recurrent, conv, ws)?;
                 }
                 CudaLayerState::Full { k_cache, v_cache } => {
-                    self.full_attention_block_device(layer, k_cache, v_cache, state.position, ws)?;
+                    self.full_attention_block_device(
+                        layer,
+                        k_cache,
+                        v_cache,
+                        state.position,
+                        None,
+                        ws,
+                    )?;
                 }
             }
-            self.add_rms_norm_device(
+            self.add_rms_norm_q8_device(
                 &format!("blk.{layer}.post_attention_norm.weight"),
                 ws.hidden.as_f32(),
                 ws.attn_out.as_f32(),
                 ws.hidden.as_f32(),
-                ws.normed.as_f32(),
-                1,
                 self.inventory.hidden_size,
+                &ws.q8_scratch,
             )?;
             self.ffn_block_device(layer, ws)?;
             self.add_device(
@@ -354,6 +691,7 @@ impl CudaQwen35Model {
         Ok(())
     }
 
+    #[cfg(test)]
     fn forward_token_prefill_device(
         &self,
         token: u32,
@@ -379,13 +717,11 @@ impl CudaQwen35Model {
         let final_layer = self.inventory.block_count.saturating_sub(1);
         for layer in 0..self.inventory.block_count {
             if layer == final_layer {
-                self.rms_norm_device(
+                self.rms_norm_q8_device(
                     &format!("blk.{layer}.attn_norm.weight"),
                     ws.hidden.as_f32(),
-                    ws.normed.as_f32(),
-                    1,
                     self.inventory.hidden_size,
-                    true,
+                    &ws.q8_scratch,
                 )?;
                 match &mut state.layer_states[layer] {
                     CudaLayerState::Full { k_cache, v_cache } => {
@@ -405,30 +741,34 @@ impl CudaQwen35Model {
                 return Ok(());
             }
 
-            self.rms_norm_device(
+            self.rms_norm_q8_device(
                 &format!("blk.{layer}.attn_norm.weight"),
                 ws.hidden.as_f32(),
-                ws.normed.as_f32(),
-                1,
                 self.inventory.hidden_size,
-                true,
+                &ws.q8_scratch,
             )?;
             match &mut state.layer_states[layer] {
                 CudaLayerState::Delta { recurrent, conv } => {
                     self.delta_attention_block_device(layer, recurrent, conv, ws)?;
                 }
                 CudaLayerState::Full { k_cache, v_cache } => {
-                    self.full_attention_block_device(layer, k_cache, v_cache, state.position, ws)?;
+                    self.full_attention_block_device(
+                        layer,
+                        k_cache,
+                        v_cache,
+                        state.position,
+                        None,
+                        ws,
+                    )?;
                 }
             }
-            self.add_rms_norm_device(
+            self.add_rms_norm_q8_device(
                 &format!("blk.{layer}.post_attention_norm.weight"),
                 ws.hidden.as_f32(),
                 ws.attn_out.as_f32(),
                 ws.hidden.as_f32(),
-                ws.normed.as_f32(),
-                1,
                 self.inventory.hidden_size,
+                &ws.q8_scratch,
             )?;
             self.ffn_block_device(layer, ws)?;
             self.add_device(
@@ -975,6 +1315,180 @@ impl CudaQwen35Model {
         Ok(())
     }
 
+    #[cfg(test)]
+    fn quantize_matvec_input(
+        &self,
+        src: *const f32,
+        cols: usize,
+        q8_scratch: &DeviceBuffer,
+    ) -> Result<()> {
+        check(
+            unsafe {
+                gp_mmvq_quantize(
+                    src,
+                    q8_scratch.ptr(),
+                    checked_i64(cols, "matvec quantize cols")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda MMVQ input quantize",
+        )?;
+        Ok(())
+    }
+
+    fn matvec_q8_device_to(
+        &self,
+        tensor_name: &str,
+        cols: usize,
+        dst: *mut f32,
+        rows: usize,
+        q8_scratch: &DeviceBuffer,
+    ) -> Result<()> {
+        let tensor = self.weights.require(tensor_name)?;
+        let tensor_cols = tensor.cols()?;
+        let tensor_rows = tensor.rows()?;
+        if tensor_cols != cols || tensor_rows != rows {
+            return Err(Error::InvalidRequest(format!(
+                "{tensor_name} matvec shape [{tensor_rows}, {tensor_cols}], expected [{rows}, {cols}]"
+            )));
+        }
+        check(
+            unsafe {
+                gp_mmvq_matvec_q8(
+                    tensor.ggml_type_id()?,
+                    tensor.buffer.ptr(),
+                    dst,
+                    q8_scratch.ptr(),
+                    checked_i64(cols, "matvec q8 cols")?,
+                    checked_i64(tensor.row_stride_blocks(), "matvec q8 row stride blocks")?,
+                    checked_i64(rows, "matvec q8 rows")?,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda MMVQ q8 matvec {tensor_name}"),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_rows_device_to(
+        &self,
+        tensor_name: &str,
+        src: *const f32,
+        input_rows: usize,
+        cols: usize,
+        dst: *mut f32,
+        rows: usize,
+        q8_scratch: &DeviceBuffer,
+        fixup_scratch: &DeviceBuffer,
+    ) -> Result<()> {
+        let tensor = self.weights.require(tensor_name)?;
+        let tensor_cols = tensor.cols()?;
+        let tensor_rows = tensor.rows()?;
+        if tensor_cols != cols || tensor_rows != rows {
+            return Err(Error::InvalidRequest(format!(
+                "{tensor_name} matmul shape [{tensor_rows}, {tensor_cols}], expected [{rows}, {cols}]"
+            )));
+        }
+        check(
+            unsafe {
+                gp_mmq_matmul(
+                    tensor.ggml_type_id()?,
+                    tensor.buffer.ptr(),
+                    src,
+                    dst,
+                    q8_scratch.ptr(),
+                    fixup_scratch.ptr(),
+                    checked_i64(cols, "matmul cols")?,
+                    checked_i64(tensor.row_stride_blocks(), "matmul row stride blocks")?,
+                    checked_i64(rows, "matmul output rows")?,
+                    checked_i64(input_rows, "matmul input rows")?,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda MMQ matmul {tensor_name}"),
+        )?;
+        Ok(())
+    }
+
+    fn quantize_mmq_rows_device(
+        &self,
+        tensor_name: &str,
+        src: *const f32,
+        input_rows: usize,
+        cols: usize,
+        q8_scratch: &DeviceBuffer,
+    ) -> Result<GgmlDType> {
+        let tensor = self.weights.require(tensor_name)?;
+        if tensor.cols()? != cols {
+            return Err(Error::InvalidRequest(format!(
+                "{tensor_name} input width {}, expected {cols}",
+                tensor.cols()?
+            )));
+        }
+        mmq_activation_layout(tensor.dtype)?;
+        check(
+            unsafe {
+                gp_mmq_quantize(
+                    tensor.ggml_type_id()?,
+                    src,
+                    q8_scratch.ptr(),
+                    checked_i64(cols, "MMQ quantize cols")?,
+                    checked_i64(input_rows, "MMQ quantize rows")?,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda MMQ quantize for {tensor_name}"),
+        )?;
+        Ok(tensor.dtype)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_rows_q8_device_to(
+        &self,
+        tensor_name: &str,
+        q8_dtype: GgmlDType,
+        input_rows: usize,
+        cols: usize,
+        dst: *mut f32,
+        rows: usize,
+        q8_scratch: &DeviceBuffer,
+        fixup_scratch: &DeviceBuffer,
+    ) -> Result<()> {
+        let tensor = self.weights.require(tensor_name)?;
+        let tensor_cols = tensor.cols()?;
+        let tensor_rows = tensor.rows()?;
+        if tensor_cols != cols || tensor_rows != rows {
+            return Err(Error::InvalidRequest(format!(
+                "{tensor_name} matmul shape [{tensor_rows}, {tensor_cols}], expected [{rows}, {cols}]"
+            )));
+        }
+        if mmq_activation_layout(tensor.dtype)? != mmq_activation_layout(q8_dtype)? {
+            return Err(Error::InvalidRequest(format!(
+                "{tensor_name} {} MMQ activation layout is incompatible with {}",
+                tensor.dtype, q8_dtype
+            )));
+        }
+        check(
+            unsafe {
+                gp_mmq_matmul_q8(
+                    tensor.ggml_type_id()?,
+                    tensor.buffer.ptr(),
+                    dst,
+                    q8_scratch.ptr(),
+                    fixup_scratch.ptr(),
+                    checked_i64(cols, "q8 matmul cols")?,
+                    checked_i64(tensor.row_stride_blocks(), "q8 matmul row stride blocks")?,
+                    checked_i64(rows, "q8 matmul output rows")?,
+                    checked_i64(input_rows, "q8 matmul input rows")?,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda MMQ q8 matmul {tensor_name}"),
+        )?;
+        Ok(())
+    }
+
     fn rms_norm_device(
         &self,
         tensor_name: &str,
@@ -1015,6 +1529,36 @@ impl CudaQwen35Model {
             }
         };
         check(rc, &format!("qwen35 cuda RMSNorm {tensor_name}"))?;
+        Ok(())
+    }
+
+    fn rms_norm_q8_device(
+        &self,
+        tensor_name: &str,
+        src: *const f32,
+        dim: usize,
+        q8_scratch: &DeviceBuffer,
+    ) -> Result<()> {
+        let weight = self.weights.require(tensor_name)?;
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+            return Err(Error::Gguf(format!(
+                "{tensor_name} RMSNorm-Q8 weight shape {:?} dtype {}, expected F32 [{dim}]",
+                weight.shape, weight.dtype
+            )));
+        }
+        check(
+            unsafe {
+                gp_qwen_rms_norm_q8(
+                    src,
+                    weight.buffer.as_f32(),
+                    q8_scratch.ptr(),
+                    checked_i32(dim, "RMSNorm-Q8 dim")?,
+                    RMS_EPS,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda RMSNorm-Q8 {tensor_name}"),
+        )?;
         Ok(())
     }
 
@@ -1076,19 +1620,51 @@ impl CudaQwen35Model {
         Ok(())
     }
 
+    fn add_rms_norm_q8_device(
+        &self,
+        tensor_name: &str,
+        lhs: *const f32,
+        rhs: *const f32,
+        sum_dst: *mut f32,
+        dim: usize,
+        q8_scratch: &DeviceBuffer,
+    ) -> Result<()> {
+        let weight = self.weights.require(tensor_name)?;
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+            return Err(Error::Gguf(format!(
+                "{tensor_name} add_rms_norm-Q8 weight shape {:?} dtype {}, expected F32 [{dim}]",
+                weight.shape, weight.dtype
+            )));
+        }
+        check(
+            unsafe {
+                gp_qwen_add_rms_norm_q8(
+                    lhs,
+                    rhs,
+                    weight.buffer.as_f32(),
+                    sum_dst,
+                    q8_scratch.ptr(),
+                    checked_i32(dim, "add_rms_norm-Q8 dim")?,
+                    RMS_EPS,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda add_rms_norm-Q8 {tensor_name}"),
+        )?;
+        Ok(())
+    }
+
     fn ffn_block_device(&self, layer: usize, ws: &mut CudaForwardWorkspace) -> Result<()> {
         let prefix = format!("blk.{layer}");
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.ffn_gate.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.ffn_gate.as_f32(),
             self.inventory.feed_forward_size,
             &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.ffn_up.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.ffn_up.as_f32(),
             self.inventory.feed_forward_size,
@@ -1116,6 +1692,64 @@ impl CudaQwen35Model {
         )
     }
 
+    fn ffn_block_rows_device(
+        &self,
+        layer: usize,
+        rows: usize,
+        ws: &mut CudaPrefillWorkspace,
+    ) -> Result<()> {
+        let prefix = format!("blk.{layer}");
+        let q8_dtype = self.quantize_mmq_rows_device(
+            &format!("{prefix}.ffn_gate.weight"),
+            ws.normed.as_f32(),
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.ffn_gate.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.ffn_gate.as_f32(),
+            self.inventory.feed_forward_size,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.ffn_up.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.ffn_up.as_f32(),
+            self.inventory.feed_forward_size,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        check(
+            unsafe {
+                gp_qwen_swiglu(
+                    ws.ffn_gate.as_f32(),
+                    ws.ffn_up.as_f32(),
+                    ws.ffn_gate.as_f32(),
+                    checked_i32(rows * self.inventory.feed_forward_size, "SwiGLU rows total")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row FFN SwiGLU",
+        )?;
+        self.matmul_rows_device_to(
+            &format!("{prefix}.ffn_down.weight"),
+            ws.ffn_gate.as_f32(),
+            ws.mmq_rows,
+            self.inventory.feed_forward_size,
+            ws.attn_out.as_f32(),
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )
+    }
+
     fn delta_attention_block_device(
         &self,
         layer: usize,
@@ -1127,9 +1761,8 @@ impl CudaQwen35Model {
         let inner = self.inventory.ssm_inner_size;
         let heads = self.inventory.ssm_group_count;
         let head_dim = inner / heads;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_qkv.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.qkv.as_f32(),
             inner * 3,
@@ -1162,25 +1795,22 @@ impl CudaQwen35Model {
             },
             &format!("qwen35 cuda causal_conv1d_silu {prefix}"),
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_gate.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.z.as_f32(),
             inner,
             &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.ssm_beta.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.beta.as_f32(),
             heads,
             &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.ssm_alpha.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.alpha.as_f32(),
             self.inventory.ssm_time_step_rank,
@@ -1265,37 +1895,205 @@ impl CudaQwen35Model {
         )
     }
 
+    fn delta_attention_block_rows_device(
+        &self,
+        layer: usize,
+        recurrent: &DeviceBuffer,
+        conv: &DeviceBuffer,
+        rows: usize,
+        ws: &mut CudaPrefillWorkspace,
+    ) -> Result<()> {
+        let prefix = format!("blk.{layer}");
+        let inner = self.inventory.ssm_inner_size;
+        let heads = self.inventory.ssm_group_count;
+        let head_dim = inner / heads;
+        let qkv_stride = inner * 3;
+        let q8_dtype = self.quantize_mmq_rows_device(
+            &format!("{prefix}.attn_qkv.weight"),
+            ws.normed.as_f32(),
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.attn_qkv.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.qkv.as_f32(),
+            inner * 3,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        let conv_weight = self
+            .weights
+            .require(&format!("{prefix}.ssm_conv1d.weight"))?;
+        if conv_weight.dtype != GgmlDType::F32
+            || conv_weight.shape.as_slice() != [inner * 3, CONV_KERNEL]
+        {
+            return Err(Error::Gguf(format!(
+                "{prefix}.ssm_conv1d.weight shape {:?} dtype {}, expected F32 [{}, {}]",
+                conv_weight.shape,
+                conv_weight.dtype,
+                inner * 3,
+                CONV_KERNEL
+            )));
+        }
+        check(
+            unsafe {
+                gp_qwen_causal_conv1d_silu_rows_parallel(
+                    ws.qkv.as_f32(),
+                    conv_weight.buffer.as_f32(),
+                    conv.as_f32(),
+                    ws.conv_out.as_f32(),
+                    checked_i32(rows, "Delta rows")?,
+                    checked_i32(inner * 3, "Delta conv channels")?,
+                    checked_i32(CONV_KERNEL, "Delta conv kernel")?,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda row causal_conv1d_silu {prefix}"),
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.attn_gate.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.z.as_f32(),
+            inner,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.ssm_beta.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.beta.as_f32(),
+            heads,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.ssm_alpha.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.alpha.as_f32(),
+            self.inventory.ssm_time_step_rank,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+
+        let q = ws.conv_out.as_f32();
+        let k = unsafe { ws.conv_out.as_f32().add(inner) };
+        let v = unsafe { ws.conv_out.as_f32().add(inner * 2) };
+        check(
+            unsafe {
+                gp_qwen_normalize_linear_qk_rows(
+                    q,
+                    k,
+                    checked_i32(rows, "Delta qk rows")?,
+                    checked_i32(heads, "Delta heads")?,
+                    checked_i32(head_dim, "Delta head dim")?,
+                    checked_i32(qkv_stride, "Delta q stride")?,
+                    checked_i32(qkv_stride, "Delta k stride")?,
+                    RMS_EPS,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row normalize_linear_qk",
+        )?;
+        let a_log = self.weights.require(&format!("{prefix}.ssm_a"))?;
+        let dt_bias = self.weights.require(&format!("{prefix}.ssm_dt.bias"))?;
+        check(
+            unsafe {
+                gp_qwen_deltanet_decode_rows(
+                    q,
+                    k,
+                    v,
+                    ws.beta.as_f32(),
+                    ws.alpha.as_f32(),
+                    a_log.buffer.as_f32(),
+                    dt_bias.buffer.as_f32(),
+                    recurrent.as_f32(),
+                    ws.raw.as_f32(),
+                    checked_i32(rows, "Delta rows")?,
+                    checked_i32(heads, "Delta heads")?,
+                    checked_i32(head_dim, "Delta head dim")?,
+                    checked_i32(qkv_stride, "Delta q stride")?,
+                    checked_i32(qkv_stride, "Delta k stride")?,
+                    checked_i32(qkv_stride, "Delta v stride")?,
+                    checked_i32(heads, "Delta beta stride")?,
+                    checked_i32(self.inventory.ssm_time_step_rank, "Delta alpha stride")?,
+                    checked_i32(inner, "Delta output stride")?,
+                    self.dev.stream(),
+                )
+            },
+            &format!("qwen35 cuda row deltanet layer {layer}"),
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.ssm_norm.weight"),
+            ws.raw.as_f32(),
+            ws.raw.as_f32(),
+            rows * heads,
+            head_dim,
+            false,
+        )?;
+        check(
+            unsafe {
+                gp_qwen_apply_silu_gate(
+                    ws.raw.as_f32(),
+                    ws.z.as_f32(),
+                    checked_i32(rows * inner, "Delta row gate total")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row Delta gate",
+        )?;
+        self.matmul_rows_device_to(
+            &format!("{prefix}.ssm_out.weight"),
+            ws.raw.as_f32(),
+            ws.mmq_rows,
+            inner,
+            ws.attn_out.as_f32(),
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )
+    }
+
     fn full_attention_block_device(
         &self,
         layer: usize,
         k_cache: &DeviceBuffer,
         v_cache: &DeviceBuffer,
         position: usize,
+        position_ptr: Option<*const i32>,
         ws: &mut CudaForwardWorkspace,
     ) -> Result<()> {
         let prefix = format!("blk.{layer}");
         let q_dim = self.inventory.attention_heads * self.inventory.head_dim;
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
-        self.matvec_device_to(
+        let max_context =
+            state_context_len(k_cache, self.inventory.kv_heads, self.inventory.head_dim);
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_q.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.q_fused.as_f32(),
             q_dim * 2,
             &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_k.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.k.as_f32(),
             kv_k_dim,
             &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_v.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.v.as_f32(),
             kv_v_dim,
@@ -1333,8 +2131,18 @@ impl CudaQwen35Model {
             self.inventory.head_dim,
             true,
         )?;
-        check(
-            unsafe {
+        let q_rope = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_rope_decode_position(
+                    ws.qkv.as_f32(),
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(self.inventory.head_dim, "attention head dim")?,
+                    checked_i32(self.inventory.rope_dim, "attention rope dim")?,
+                    position_ptr,
+                    ROPE_THETA,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_rope_decode(
                     ws.qkv.as_f32(),
                     checked_i32(self.inventory.attention_heads, "attention heads")?,
@@ -1344,11 +2152,21 @@ impl CudaQwen35Model {
                     ROPE_THETA,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda q RoPE",
-        )?;
-        check(
-            unsafe {
+            }
+        };
+        check(q_rope, "qwen35 cuda q RoPE")?;
+        let k_rope = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_rope_decode_position(
+                    ws.k.as_f32(),
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "kv head dim")?,
+                    checked_i32(self.inventory.rope_dim, "kv rope dim")?,
+                    position_ptr,
+                    ROPE_THETA,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_rope_decode(
                     ws.k.as_f32(),
                     checked_i32(self.inventory.kv_heads, "kv heads")?,
@@ -1358,56 +2176,73 @@ impl CudaQwen35Model {
                     ROPE_THETA,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda k RoPE",
-        )?;
-        check(
-            unsafe {
+            }
+        };
+        check(k_rope, "qwen35 cuda k RoPE")?;
+        let k_write = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_cache_write_position(
+                    ws.k.as_f32(),
+                    k_cache.as_f32(),
+                    position_ptr,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "kv head dim")?,
+                    checked_i32(max_context, "k cache context")?,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_cache_write(
                     ws.k.as_f32(),
                     k_cache.as_f32(),
                     checked_i32(position, "k cache position")?,
                     checked_i32(self.inventory.kv_heads, "kv heads")?,
                     checked_i32(self.inventory.head_dim, "kv head dim")?,
-                    checked_i32(
-                        state_context_len(
-                            k_cache,
-                            self.inventory.kv_heads,
-                            self.inventory.head_dim,
-                        ),
-                        "k cache context",
-                    )?,
+                    checked_i32(max_context, "k cache context")?,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda k cache write",
-        )?;
-        check(
-            unsafe {
+            }
+        };
+        check(k_write, "qwen35 cuda k cache write")?;
+        let v_write = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_cache_write_position(
+                    ws.v.as_f32(),
+                    v_cache.as_f32(),
+                    position_ptr,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.value_dim, "value dim")?,
+                    checked_i32(max_context, "v cache context")?,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_cache_write(
                     ws.v.as_f32(),
                     v_cache.as_f32(),
                     checked_i32(position, "v cache position")?,
                     checked_i32(self.inventory.kv_heads, "kv heads")?,
                     checked_i32(self.inventory.value_dim, "value dim")?,
-                    checked_i32(
-                        state_context_len(
-                            v_cache,
-                            self.inventory.kv_heads,
-                            self.inventory.value_dim,
-                        ),
-                        "v cache context",
-                    )?,
+                    checked_i32(max_context, "v cache context")?,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda v cache write",
-        )?;
-        let max_context =
-            state_context_len(k_cache, self.inventory.kv_heads, self.inventory.head_dim);
+            }
+        };
+        check(v_write, "qwen35 cuda v cache write")?;
         let scale = 1.0 / (self.inventory.head_dim as f32).sqrt();
-        check(
-            unsafe {
+        let score_attention = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_attention_scores_decode_position(
+                    ws.qkv.as_f32(),
+                    k_cache.as_f32(),
+                    ws.scores.as_f32(),
+                    position_ptr,
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "attention head dim")?,
+                    checked_i32(max_context, "attention context")?,
+                    scale,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_attention_scores_decode(
                     ws.qkv.as_f32(),
                     k_cache.as_f32(),
@@ -1420,11 +2255,19 @@ impl CudaQwen35Model {
                     scale,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda attention scores",
-        )?;
-        check(
-            unsafe {
+            }
+        };
+        check(score_attention, "qwen35 cuda attention scores")?;
+        let softmax_attention = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_softmax_decode_position(
+                    ws.scores.as_f32(),
+                    position_ptr,
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(max_context, "attention context")?,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_softmax_decode(
                     ws.scores.as_f32(),
                     checked_i32(position, "attention position")?,
@@ -1432,11 +2275,23 @@ impl CudaQwen35Model {
                     checked_i32(max_context, "attention context")?,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda attention softmax",
-        )?;
-        check(
-            unsafe {
+            }
+        };
+        check(softmax_attention, "qwen35 cuda attention softmax")?;
+        let value_attention = unsafe {
+            if let Some(position_ptr) = position_ptr {
+                gp_qwen_attention_values_decode_position(
+                    ws.scores.as_f32(),
+                    v_cache.as_f32(),
+                    ws.raw.as_f32(),
+                    position_ptr,
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.value_dim, "value dim")?,
+                    checked_i32(max_context, "attention context")?,
+                    self.dev.stream(),
+                )
+            } else {
                 gp_qwen_attention_values_decode(
                     ws.scores.as_f32(),
                     v_cache.as_f32(),
@@ -1448,9 +2303,9 @@ impl CudaQwen35Model {
                     checked_i32(max_context, "attention context")?,
                     self.dev.stream(),
                 )
-            },
-            "qwen35 cuda attention values",
-        )?;
+            }
+        };
+        check(value_attention, "qwen35 cuda attention values")?;
         let q_gate = unsafe { ws.qkv.as_f32().add(q_dim) };
         check(
             unsafe {
@@ -1476,6 +2331,204 @@ impl CudaQwen35Model {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn full_attention_block_rows_device(
+        &self,
+        layer: usize,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        position: usize,
+        rows: usize,
+        max_context: usize,
+        ws: &mut CudaPrefillWorkspace,
+    ) -> Result<()> {
+        let prefix = format!("blk.{layer}");
+        let q_dim = self.inventory.attention_heads * self.inventory.head_dim;
+        let value_width = self.inventory.attention_heads * self.inventory.value_dim;
+        let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
+        let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
+        if q_dim != value_width {
+            return Err(Error::GenerationUnavailable(format!(
+                "CUDA fused row attention requires q width {q_dim} == value width {value_width}"
+            )));
+        }
+        let q8_dtype = self.quantize_mmq_rows_device(
+            &format!("{prefix}.attn_q.weight"),
+            ws.normed.as_f32(),
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.attn_q.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.q_fused.as_f32(),
+            q_dim * 2,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.matmul_rows_q8_device_to(
+            &format!("{prefix}.attn_k.weight"),
+            q8_dtype,
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.k.as_f32(),
+            kv_k_dim,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.matmul_rows_device_to(
+            &format!("{prefix}.attn_v.weight"),
+            ws.normed.as_f32(),
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.v.as_f32(),
+            kv_v_dim,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        check(
+            unsafe {
+                gp_qwen_deinterleave_q_gate(
+                    ws.q_fused.as_f32(),
+                    ws.q.as_f32(),
+                    ws.gate.as_f32(),
+                    checked_i32(rows, "attention rows")?,
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(self.inventory.head_dim, "attention head dim")?,
+                    checked_i32(q_dim * 2, "packed q stride")?,
+                    checked_i32(q_dim, "q output stride")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row deinterleave q gate",
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.attn_q_norm.weight"),
+            ws.q.as_f32(),
+            ws.q.as_f32(),
+            rows * self.inventory.attention_heads,
+            self.inventory.head_dim,
+            true,
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.attn_k_norm.weight"),
+            ws.k.as_f32(),
+            ws.k.as_f32(),
+            rows * self.inventory.kv_heads,
+            self.inventory.head_dim,
+            true,
+        )?;
+        check(
+            unsafe {
+                gp_qwen_rope_rows(
+                    ws.q.as_f32(),
+                    checked_i32(rows, "attention rows")?,
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(self.inventory.head_dim, "attention head dim")?,
+                    checked_i32(self.inventory.rope_dim, "attention rope dim")?,
+                    checked_i32(position, "attention position")?,
+                    checked_i32(q_dim, "attention q stride")?,
+                    ROPE_THETA,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row q RoPE",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_rope_rows(
+                    ws.k.as_f32(),
+                    checked_i32(rows, "kv rows")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "kv head dim")?,
+                    checked_i32(self.inventory.rope_dim, "kv rope dim")?,
+                    checked_i32(position, "kv position")?,
+                    checked_i32(kv_k_dim, "kv row stride")?,
+                    ROPE_THETA,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row k RoPE",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_cache_write_rows(
+                    ws.k.as_f32(),
+                    k_cache.as_f32(),
+                    checked_i32(rows, "k cache rows")?,
+                    checked_i32(position, "k cache position")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "kv head dim")?,
+                    checked_i32(max_context, "k cache context")?,
+                    checked_i32(kv_k_dim, "k cache src stride")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row k cache write",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_cache_write_rows(
+                    ws.v.as_f32(),
+                    v_cache.as_f32(),
+                    checked_i32(rows, "v cache rows")?,
+                    checked_i32(position, "v cache position")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.value_dim, "value dim")?,
+                    checked_i32(max_context, "v cache context")?,
+                    checked_i32(kv_v_dim, "v cache src stride")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row v cache write",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_attention_rows_fused(
+                    ws.q.as_f32(),
+                    k_cache.as_f32(),
+                    v_cache.as_f32(),
+                    ws.raw.as_f32(),
+                    checked_i32(rows, "attention rows")?,
+                    checked_i32(position, "attention position")?,
+                    checked_i32(self.inventory.attention_heads, "attention heads")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "attention head dim")?,
+                    checked_i32(self.inventory.value_dim, "attention value dim")?,
+                    checked_i32(max_context, "attention context")?,
+                    checked_i32(q_dim, "attention q stride")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda fused row attention",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_apply_sigmoid_gate(
+                    ws.raw.as_f32(),
+                    ws.gate.as_f32(),
+                    checked_i32(rows * value_width, "attention row gate total")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda row attention gate",
+        )?;
+        self.matmul_rows_device_to(
+            &format!("{prefix}.attn_output.weight"),
+            ws.raw.as_f32(),
+            ws.mmq_rows,
+            value_width,
+            ws.attn_out.as_f32(),
+            self.inventory.hidden_size,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )
+    }
+
+    #[cfg(test)]
     fn full_attention_cache_only_device(
         &self,
         layer: usize,
@@ -1487,17 +2540,15 @@ impl CudaQwen35Model {
         let prefix = format!("blk.{layer}");
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_k.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.k.as_f32(),
             kv_k_dim,
             &ws.q8_scratch,
         )?;
-        self.matvec_device_to(
+        self.matvec_q8_device_to(
             &format!("{prefix}.attn_v.weight"),
-            ws.normed.as_f32(),
             self.inventory.hidden_size,
             ws.v.as_f32(),
             kv_v_dim,
@@ -1570,6 +2621,99 @@ impl CudaQwen35Model {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn full_attention_cache_only_rows_device(
+        &self,
+        layer: usize,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        position: usize,
+        rows: usize,
+        max_context: usize,
+        ws: &mut CudaPrefillWorkspace,
+    ) -> Result<()> {
+        let prefix = format!("blk.{layer}");
+        let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
+        let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
+        self.matmul_rows_device_to(
+            &format!("{prefix}.attn_k.weight"),
+            ws.normed.as_f32(),
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.k.as_f32(),
+            kv_k_dim,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.matmul_rows_device_to(
+            &format!("{prefix}.attn_v.weight"),
+            ws.normed.as_f32(),
+            ws.mmq_rows,
+            self.inventory.hidden_size,
+            ws.v.as_f32(),
+            kv_v_dim,
+            &ws.q8_scratch,
+            &ws.fixup_scratch,
+        )?;
+        self.rms_norm_device(
+            &format!("{prefix}.attn_k_norm.weight"),
+            ws.k.as_f32(),
+            ws.k.as_f32(),
+            rows * self.inventory.kv_heads,
+            self.inventory.head_dim,
+            true,
+        )?;
+        check(
+            unsafe {
+                gp_qwen_rope_rows(
+                    ws.k.as_f32(),
+                    checked_i32(rows, "kv rows")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "kv head dim")?,
+                    checked_i32(self.inventory.rope_dim, "kv rope dim")?,
+                    checked_i32(position, "kv position")?,
+                    checked_i32(kv_k_dim, "kv stride")?,
+                    ROPE_THETA,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda cache-only row k RoPE",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_cache_write_rows(
+                    ws.k.as_f32(),
+                    k_cache.as_f32(),
+                    checked_i32(rows, "k cache rows")?,
+                    checked_i32(position, "k cache position")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.head_dim, "kv head dim")?,
+                    checked_i32(max_context, "k cache context")?,
+                    checked_i32(kv_k_dim, "k cache src stride")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda cache-only row k cache write",
+        )?;
+        check(
+            unsafe {
+                gp_qwen_cache_write_rows(
+                    ws.v.as_f32(),
+                    v_cache.as_f32(),
+                    checked_i32(rows, "v cache rows")?,
+                    checked_i32(position, "v cache position")?,
+                    checked_i32(self.inventory.kv_heads, "kv heads")?,
+                    checked_i32(self.inventory.value_dim, "value dim")?,
+                    checked_i32(max_context, "v cache context")?,
+                    checked_i32(kv_v_dim, "v cache src stride")?,
+                    self.dev.stream(),
+                )
+            },
+            "qwen35 cuda cache-only row v cache write",
+        )?;
+        Ok(())
+    }
+
     fn upload_pod<T>(&self, values: &[T]) -> Result<DeviceBuffer> {
         let buf = self.dev.alloc(std::mem::size_of_val(values).max(1))?;
         self.dev.copy_h2d(&buf, values)?;
@@ -1592,6 +2736,19 @@ impl CudaQwen35Model {
 const RMS_EPS: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 10_000_000.0;
 const CONV_KERNEL: usize = 4;
+const MMQ_FIXUP_SCRATCH_BYTES: usize = 128 * 128 * 128 * std::mem::size_of::<f32>();
+const CUDA_PREFILL_BATCH_ROWS: usize = 512;
+const CUDA_MMQ_ROW_TILE: usize = 128;
+
+fn mmq_activation_layout(dtype: GgmlDType) -> Result<u8> {
+    match dtype {
+        GgmlDType::Q4K | GgmlDType::Q5K => Ok(1),
+        GgmlDType::Q6K | GgmlDType::Q8_0 | GgmlDType::Q5_0 => Ok(0),
+        other => Err(Error::GenerationUnavailable(format!(
+            "CUDA MMQ activation reuse does not support {other}"
+        ))),
+    }
+}
 
 fn q8_1_scratch_bytes(cols: usize, rows: usize) -> usize {
     const QK8_1: usize = 32;
@@ -2144,9 +3301,11 @@ mod tests {
             cuda.dev
                 .copy_h2d(&ws.normed, &hidden)
                 .expect("upload hidden");
+            cuda.quantize_matvec_input(ws.normed.as_f32(), inventory.hidden_size, &ws.q8_scratch)
+                .expect("quantize full attention input");
             match &mut state.layer_states[layer] {
                 CudaLayerState::Full { k_cache, v_cache } => cuda
-                    .full_attention_block_device(layer, k_cache, v_cache, position, &mut ws)
+                    .full_attention_block_device(layer, k_cache, v_cache, position, None, &mut ws)
                     .expect("CUDA full attention block"),
                 _ => panic!("expected full attention layer state"),
             }
@@ -2220,28 +3379,36 @@ mod tests {
         let mut logits_ws = cuda
             .new_forward_workspace(8)
             .expect("CUDA logits workspace");
-        let logits = cuda
-            .forward_token_logits(42, &mut logits_state, &mut logits_ws)
-            .expect("CUDA forward token logits");
-        let expected = logits
-            .iter()
-            .enumerate()
-            .max_by(|(ai, a), (bi, b)| {
-                a.partial_cmp(b)
-                    .unwrap_or(std::cmp::Ordering::Less)
-                    .then_with(|| bi.cmp(ai))
-            })
-            .map(|(idx, _)| idx as u32)
-            .expect("non-empty logits");
-
         let mut greedy_state = cuda.new_forward_state(8).expect("CUDA greedy state");
         let mut greedy_ws = cuda
             .new_forward_workspace(8)
             .expect("CUDA greedy workspace");
-        let actual = cuda
-            .forward_token_greedy(42, &mut greedy_state, &mut greedy_ws)
-            .expect("CUDA greedy token");
-        assert_eq!(actual, expected);
+        let mut input = 42;
+        for step in 0..3 {
+            let logits = cuda
+                .forward_token_logits(input, &mut logits_state, &mut logits_ws)
+                .expect("CUDA forward token logits");
+            let expected = logits
+                .iter()
+                .enumerate()
+                .max_by(|(ai, a), (bi, b)| {
+                    a.partial_cmp(b)
+                        .unwrap_or(std::cmp::Ordering::Less)
+                        .then_with(|| bi.cmp(ai))
+                })
+                .map(|(idx, _)| idx as u32)
+                .expect("non-empty logits");
+            let actual = cuda
+                .forward_token_greedy(input, &mut greedy_state, &mut greedy_ws)
+                .expect("CUDA greedy token");
+            assert_eq!(actual, expected, "greedy graph token drift at step {step}");
+            input = actual;
+        }
+        assert_eq!(greedy_state.position, 3);
+        assert!(
+            greedy_state.decode_graph.is_some(),
+            "CUDA greedy path did not retain a captured graph"
+        );
     }
 
     #[test]
@@ -2293,6 +3460,77 @@ mod tests {
         assert!(
             max_abs <= 1.0e-6,
             "CUDA prefill state drift too high: {max_abs:.6e}"
+        );
+    }
+
+    #[test]
+    fn qwen35_cuda_batched_prefill_matches_tokenwise_when_env_set() {
+        let Some(path) = std::env::var_os("QWEN35_NATIVE_GGUF") else {
+            eprintln!("skipping qwen35 CUDA batched prefill parity: QWEN35_NATIVE_GGUF unset");
+            return;
+        };
+        let gguf = GgufModel::open(&path).expect("open Qwen3.5 GGUF");
+        let inventory = Qwen35Inventory::from_gguf(&gguf).expect("Qwen3.5 inventory");
+        inventory
+            .validate_core_tensors(&gguf)
+            .expect("Qwen3.5 core tensors");
+        let cuda = CudaQwen35Model::from_gguf(&gguf, inventory, 248_044).expect("CUDA Qwen model");
+        let prompt = [42_u32, 314, 2718, 99];
+        let final_token = 1234_u32;
+
+        let mut tokenwise_state = cuda.new_forward_state(16).expect("tokenwise state");
+        let mut tokenwise_ws = cuda.new_forward_workspace(16).expect("tokenwise workspace");
+        for &token in &prompt {
+            cuda.prefill_token(token, &mut tokenwise_state, &mut tokenwise_ws)
+                .expect("tokenwise prefill");
+        }
+        let expected = cuda
+            .forward_token_logits(final_token, &mut tokenwise_state, &mut tokenwise_ws)
+            .expect("tokenwise final logits");
+
+        let mut batched_state = cuda.new_forward_state(16).expect("batched state");
+        cuda.prefill_tokens(&prompt, &mut batched_state)
+            .expect("batched prefill");
+        let mut batched_ws = cuda.new_forward_workspace(16).expect("batched workspace");
+        let actual = cuda
+            .forward_token_logits(final_token, &mut batched_state, &mut batched_ws)
+            .expect("batched final logits");
+
+        let cosine = cosine(&actual, &expected);
+        let rms_rel = rms_diff(&actual, &expected) / rms_norm(&expected).max(1.0e-6);
+        let max_abs = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let actual_argmax = actual
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| {
+                a.partial_cmp(b)
+                    .unwrap_or(std::cmp::Ordering::Less)
+                    .then_with(|| bi.cmp(ai))
+            })
+            .map(|(idx, _)| idx)
+            .expect("actual logits");
+        let expected_argmax = expected
+            .iter()
+            .enumerate()
+            .max_by(|(ai, a), (bi, b)| {
+                a.partial_cmp(b)
+                    .unwrap_or(std::cmp::Ordering::Less)
+                    .then_with(|| bi.cmp(ai))
+            })
+            .map(|(idx, _)| idx)
+            .expect("expected logits");
+        eprintln!(
+            "CUDA batched prefill parity cosine={cosine:.8} rms_rel={rms_rel:.6e} max_abs={max_abs:.6e} argmax={actual_argmax}/{expected_argmax}"
+        );
+        assert!(cosine >= 0.995, "CUDA batched prefill cosine too low");
+        assert!(rms_rel <= 0.1, "CUDA batched prefill rms_rel too high");
+        assert_eq!(
+            actual_argmax, expected_argmax,
+            "CUDA batched prefill argmax drift"
         );
     }
 

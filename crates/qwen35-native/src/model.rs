@@ -1037,10 +1037,10 @@ mod tests {
             .expect("CUDA perf workspace");
         let prefill_count = prompt_ids.len() - 1;
         let t0 = std::time::Instant::now();
-        for &token in &prompt_ids[..prefill_count] {
+        for chunk in prompt_ids[..prefill_count].chunks(512) {
             model
-                .prefill_token(token, &mut state, &mut ws)
-                .expect("CUDA perf prefill forward");
+                .prefill_tokens(chunk, &mut state)
+                .expect("CUDA perf batched prefill forward");
         }
         let input_elapsed = t0.elapsed();
 

@@ -146,6 +146,46 @@ GP_CUDA_EXPORT int gp_cuda_init(int device, void ** stream_out, void ** blas_out
     return 0;
 }
 
+GP_CUDA_EXPORT int gp_cuda_graph_begin(void * stream) {
+    return (int)cudaStreamBeginCapture((cudaStream_t)stream, cudaStreamCaptureModeThreadLocal);
+}
+
+GP_CUDA_EXPORT int gp_cuda_graph_end(void * stream, void ** graph_out, void ** exec_out) {
+    cudaGraph_t graph = nullptr;
+    cudaError_t err = cudaStreamEndCapture((cudaStream_t)stream, &graph);
+    if (err != cudaSuccess) return (int)err;
+    cudaGraphExec_t exec = nullptr;
+    err = cudaGraphInstantiateWithFlags(&exec, graph, 0);
+    if (err != cudaSuccess) {
+        cudaGraphDestroy(graph);
+        return (int)err;
+    }
+    *graph_out = (void *)graph;
+    *exec_out = (void *)exec;
+    return 0;
+}
+
+GP_CUDA_EXPORT int gp_cuda_graph_abort(void * stream) {
+    cudaGraph_t graph = nullptr;
+    const cudaError_t err = cudaStreamEndCapture((cudaStream_t)stream, &graph);
+    if (graph != nullptr) cudaGraphDestroy(graph);
+    return err == cudaErrorStreamCaptureInvalidated ? 0 : (int)err;
+}
+
+GP_CUDA_EXPORT int gp_cuda_graph_launch(void * exec, void * stream) {
+    return (int)cudaGraphLaunch((cudaGraphExec_t)exec, (cudaStream_t)stream);
+}
+
+GP_CUDA_EXPORT int gp_cuda_graph_destroy(void * graph, void * exec) {
+    cudaError_t first = cudaSuccess;
+    if (exec != nullptr) first = cudaGraphExecDestroy((cudaGraphExec_t)exec);
+    if (graph != nullptr) {
+        const cudaError_t err = cudaGraphDestroy((cudaGraph_t)graph);
+        if (first == cudaSuccess) first = err;
+    }
+    return (int)first;
+}
+
 extern "C" int64_t ggml_blck_size(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
@@ -492,6 +532,77 @@ GP_CUDA_EXPORT int gp_qwen_add_rms_norm(
     return (int) cudaPeekAtLastError();
 }
 
+template <bool add_residual>
+__global__ void gp_qwen_rms_norm_q8_kernel(
+        const float * __restrict__ src,
+        const float * __restrict__ residual,
+        const float * __restrict__ weight,
+        float * __restrict__ sum_out,
+        void * __restrict__ q8_out,
+        int dim,
+        float eps) {
+    extern __shared__ float reduce[];
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float value = src[i];
+        if constexpr (add_residual) {
+            value += residual[i];
+            sum_out[i] = value;
+        }
+        sum_sq += value * value;
+    }
+    reduce[threadIdx.x] = sum_sq;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(reduce[0] / (float)dim + eps);
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    block_q8_1 * q8 = (block_q8_1 *)q8_out;
+    for (int block = warp; block < dim / QK8_1; block += blockDim.x / 32) {
+        const int index = block * QK8_1 + lane;
+        const float input = add_residual ? sum_out[index] : src[index];
+        const float value = input * inv * weight[index];
+        float amax = warp_reduce_max<QK8_1>(fabsf(value));
+        float sum = warp_reduce_sum<QK8_1>(value);
+        const float d = amax / 127.0f;
+        q8[block].qs[lane] = amax == 0.0f ? 0 : roundf(value / d);
+        if (lane == 0) q8[block].ds = make_half2(d, sum);
+    }
+}
+
+GP_CUDA_EXPORT int gp_qwen_rms_norm_q8(
+        const float * src,
+        const float * weight,
+        void * q8_out,
+        int dim,
+        float eps,
+        void * stream) {
+    if (dim <= 0 || dim % 256 != 0) return (int)cudaErrorInvalidValue;
+    gp_qwen_rms_norm_q8_kernel<false><<<1, 256, 256 * sizeof(float),
+        (cudaStream_t)stream>>>(src, nullptr, weight, nullptr, q8_out, dim, eps);
+    return (int)cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_qwen_add_rms_norm_q8(
+        const float * lhs,
+        const float * rhs,
+        const float * weight,
+        float * sum_out,
+        void * q8_out,
+        int dim,
+        float eps,
+        void * stream) {
+    if (dim <= 0 || dim % 256 != 0) return (int)cudaErrorInvalidValue;
+    gp_qwen_rms_norm_q8_kernel<true><<<1, 256, 256 * sizeof(float),
+        (cudaStream_t)stream>>>(lhs, rhs, weight, sum_out, q8_out, dim, eps);
+    return (int)cudaPeekAtLastError();
+}
+
 __global__ void gp_qwen_causal_conv1d_silu_kernel(
         float * __restrict__ values,
         const float * __restrict__ weights,
@@ -524,6 +635,128 @@ GP_CUDA_EXPORT int gp_qwen_causal_conv1d_silu(
     const int grid = (channels + block - 1) / block;
     gp_qwen_causal_conv1d_silu_kernel<<<grid, block, 0, (cudaStream_t) stream>>>(
         values, weights, state, channels, kernel);
+    return (int) cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_causal_conv1d_silu_rows_kernel(
+        float * __restrict__ values,
+        const float * __restrict__ weights,
+        float * __restrict__ state,
+        int rows,
+        int channels,
+        int kernel) {
+    const int ch = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (ch >= channels) return;
+    const int64_t base = (int64_t) ch * kernel;
+    for (int row = 0; row < rows; ++row) {
+        const int64_t value_idx = (int64_t) row * channels + ch;
+        for (int i = 0; i < kernel - 1; ++i) {
+            state[base + i] = state[base + i + 1];
+        }
+        state[base + kernel - 1] = values[value_idx];
+        float acc = 0.0f;
+        for (int i = 0; i < kernel; ++i) {
+            acc += state[base + i] * weights[base + i];
+        }
+        values[value_idx] = acc / (1.0f + expf(-acc));
+    }
+}
+
+GP_CUDA_EXPORT int gp_qwen_causal_conv1d_silu_rows(
+        float * values,
+        const float * weights,
+        float * state,
+        int rows,
+        int channels,
+        int kernel,
+        void * stream) {
+    if (rows <= 0 || channels <= 0 || kernel <= 0) return (int) cudaErrorInvalidValue;
+    const int block = 256;
+    const int grid = (channels + block - 1) / block;
+    gp_qwen_causal_conv1d_silu_rows_kernel<<<grid, block, 0, (cudaStream_t) stream>>>(
+        values, weights, state, rows, channels, kernel);
+    return (int) cudaPeekAtLastError();
+}
+
+template <int kernel, int rows_per_block>
+__global__ void gp_qwen_causal_conv1d_silu_rows_parallel_kernel(
+        const float * __restrict__ values,
+        const float * __restrict__ weights,
+        const float * __restrict__ state,
+        float * __restrict__ out,
+        int rows,
+        int channels) {
+    const int ch = (int)(blockIdx.y * blockDim.x + threadIdx.x);
+    if (ch >= channels) return;
+    const int row_begin = (int)blockIdx.x * rows_per_block;
+    const int row_end = min(row_begin + rows_per_block, rows);
+    const int64_t state_base = (int64_t)ch * kernel;
+    float old_state[kernel];
+    float w[kernel];
+#pragma unroll
+    for (int tap = 0; tap < kernel; ++tap) {
+        old_state[tap] = state[state_base + tap];
+        w[tap] = weights[state_base + tap];
+    }
+    for (int row = row_begin; row < row_end; ++row) {
+        float acc = 0.0f;
+#pragma unroll
+        for (int tap = 0; tap < kernel; ++tap) {
+            const int source_row = row + tap - (kernel - 1);
+            const float x = source_row < 0
+                ? old_state[source_row + kernel]
+                : values[(int64_t)source_row * channels + ch];
+            acc += x * w[tap];
+        }
+        out[(int64_t)row * channels + ch] = acc / (1.0f + expf(-acc));
+    }
+}
+
+template <int kernel>
+__global__ void gp_qwen_causal_conv1d_update_state_kernel(
+        const float * __restrict__ values,
+        float * __restrict__ state,
+        int rows,
+        int channels) {
+    const int ch = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (ch >= channels) return;
+    const int64_t state_base = (int64_t)ch * kernel;
+    float old_state[kernel];
+#pragma unroll
+    for (int tap = 0; tap < kernel; ++tap) {
+        old_state[tap] = state[state_base + tap];
+    }
+#pragma unroll
+    for (int tap = 0; tap < kernel; ++tap) {
+        const int source_row = rows + tap - kernel;
+        state[state_base + tap] = source_row < 0
+            ? old_state[source_row + kernel]
+            : values[(int64_t)source_row * channels + ch];
+    }
+}
+
+GP_CUDA_EXPORT int gp_qwen_causal_conv1d_silu_rows_parallel(
+        const float * values,
+        const float * weights,
+        float * state,
+        float * out,
+        int rows,
+        int channels,
+        int kernel,
+        void * stream) {
+    if (rows <= 0 || channels <= 0 || kernel != 4) return (int) cudaErrorInvalidValue;
+    constexpr int threads = 128;
+    constexpr int rows_per_block = 32;
+    const dim3 grid((rows + rows_per_block - 1) / rows_per_block,
+                    (channels + threads - 1) / threads, 1);
+    gp_qwen_causal_conv1d_silu_rows_parallel_kernel<4, rows_per_block>
+        <<<grid, threads, 0, (cudaStream_t) stream>>>(
+            values, weights, state, out, rows, channels);
+    cudaError_t err = cudaPeekAtLastError();
+    if (err != cudaSuccess) return (int) err;
+    gp_qwen_causal_conv1d_update_state_kernel<4>
+        <<<(channels + threads - 1) / threads, threads, 0, (cudaStream_t) stream>>>(
+            values, state, rows, channels);
     return (int) cudaPeekAtLastError();
 }
 
@@ -575,6 +808,70 @@ GP_CUDA_EXPORT int gp_qwen_normalize_linear_qk(
     if (heads <= 0 || head_dim <= 0) return (int) cudaErrorInvalidValue;
     gp_qwen_normalize_linear_qk_kernel<<<heads, 256, 2*256*sizeof(float), (cudaStream_t) stream>>>(
         q, k, heads, head_dim, eps);
+    return (int) cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_normalize_linear_qk_rows_kernel(
+        float * __restrict__ q,
+        float * __restrict__ k,
+        int rows,
+        int heads,
+        int head_dim,
+        int q_stride,
+        int k_stride,
+        float eps) {
+    extern __shared__ float s[];
+    float * sq = s;
+    float * sk = s + blockDim.x;
+    const int row = blockIdx.x;
+    const int head = blockIdx.y;
+    if (row >= rows || head >= heads) return;
+    const int64_t q_base = (int64_t) row * q_stride + (int64_t) head * head_dim;
+    const int64_t k_base = (int64_t) row * k_stride + (int64_t) head * head_dim;
+    float sum_q = 0.0f;
+    float sum_k = 0.0f;
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        const float qv = q[q_base + i];
+        const float kv = k[k_base + i];
+        sum_q += qv*qv;
+        sum_k += kv*kv;
+    }
+    sq[threadIdx.x] = sum_q;
+    sk[threadIdx.x] = sum_k;
+    __syncthreads();
+    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            sq[threadIdx.x] += sq[threadIdx.x + stride];
+            sk[threadIdx.x] += sk[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    const float q_scale = rsqrtf(sq[0] + eps) * rsqrtf((float) head_dim);
+    const float k_scale = rsqrtf(sk[0] + eps);
+    for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+        q[q_base + i] *= q_scale;
+        k[k_base + i] *= k_scale;
+    }
+}
+
+GP_CUDA_EXPORT int gp_qwen_normalize_linear_qk_rows(
+        float * q,
+        float * k,
+        int rows,
+        int heads,
+        int head_dim,
+        int q_stride,
+        int k_stride,
+        float eps,
+        void * stream) {
+    if (rows <= 0 || heads <= 0 || head_dim <= 0 ||
+        q_stride < heads * head_dim || k_stride < heads * head_dim) {
+        return (int) cudaErrorInvalidValue;
+    }
+    const int block = 128;
+    gp_qwen_normalize_linear_qk_rows_kernel<<<dim3(rows, heads, 1), block,
+        2*block*sizeof(float), (cudaStream_t) stream>>>(
+        q, k, rows, heads, head_dim, q_stride, k_stride, eps);
     return (int) cudaPeekAtLastError();
 }
 
@@ -805,6 +1102,13 @@ GP_CUDA_EXPORT int gp_qwen_argmax(
     return (int) cudaPeekAtLastError();
 }
 
+static __device__ __forceinline__ float gp_qwen_warp_sum(float value) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    return value;
+}
+
 __global__ void gp_qwen_deltanet_decode_kernel(
         const float * __restrict__ q,
         const float * __restrict__ k,
@@ -817,11 +1121,8 @@ __global__ void gp_qwen_deltanet_decode_kernel(
         float * __restrict__ out,
         int heads,
         int head_dim) {
-    extern __shared__ float smem[];
-    float * sprior = smem;
-    float * sattn = smem + blockDim.x;
     const int head = blockIdx.x;
-    const int value_idx = blockIdx.y;
+    const int value_idx = blockIdx.y * blockDim.y + threadIdx.y;
     if (head >= heads || value_idx >= head_dim) return;
 
     const int64_t head_base = (int64_t) head * head_dim;
@@ -836,13 +1137,9 @@ __global__ void gp_qwen_deltanet_decode_kernel(
     for (int key_idx = threadIdx.x; key_idx < head_dim; key_idx += blockDim.x) {
         prior += state[row_base + key_idx] * k[head_base + key_idx];
     }
-    sprior[threadIdx.x] = prior;
-    __syncthreads();
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) sprior[threadIdx.x] += sprior[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float delta = (v[head_base + value_idx] - decay * sprior[0]) * beta_h;
+    prior = gp_qwen_warp_sum(prior);
+    const float prior_sum = __shfl_sync(0xffffffffu, prior, 0);
+    const float delta = (v[head_base + value_idx] - decay * prior_sum) * beta_h;
 
     float attn = 0.0f;
     for (int key_idx = threadIdx.x; key_idx < head_dim; key_idx += blockDim.x) {
@@ -851,14 +1148,9 @@ __global__ void gp_qwen_deltanet_decode_kernel(
         state[idx] = updated;
         attn += updated * q[head_base + key_idx];
     }
-    sattn[threadIdx.x] = attn;
-    __syncthreads();
-    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride) sattn[threadIdx.x] += sattn[threadIdx.x + stride];
-        __syncthreads();
-    }
+    attn = gp_qwen_warp_sum(attn);
     if (threadIdx.x == 0) {
-        out[head_base + value_idx] = sattn[0];
+        out[head_base + value_idx] = attn;
     }
 }
 
@@ -876,10 +1168,248 @@ GP_CUDA_EXPORT int gp_qwen_deltanet_decode(
         int head_dim,
         void * stream) {
     if (heads <= 0 || head_dim <= 0) return (int) cudaErrorInvalidValue;
-    const dim3 grid(heads, head_dim, 1);
-    const int block = 256;
-    gp_qwen_deltanet_decode_kernel<<<grid, block, 2*block*sizeof(float), (cudaStream_t) stream>>>(
+    constexpr int warps_per_block = 4;
+    const dim3 grid(heads, (head_dim + warps_per_block - 1) / warps_per_block, 1);
+    const dim3 block(32, warps_per_block, 1);
+    gp_qwen_deltanet_decode_kernel<<<grid, block, 0, (cudaStream_t) stream>>>(
         q, k, v, beta, alpha, a_log, dt_bias, state, out, heads, head_dim);
+    return (int) cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_deltanet_decode_rows_kernel(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ beta,
+        const float * __restrict__ decay,
+        float * __restrict__ state,
+        float * __restrict__ out,
+        int rows,
+        int heads,
+        int head_dim,
+        int q_stride,
+        int k_stride,
+        int v_stride,
+        int beta_stride,
+        int decay_stride,
+        int out_stride) {
+    const int head = blockIdx.x;
+    const int value_idx = blockIdx.y * blockDim.y + threadIdx.y;
+    if (head >= heads || value_idx >= head_dim) return;
+
+    const int64_t head_base = (int64_t) head * head_dim;
+    const int64_t state_base = ((int64_t) head * head_dim + value_idx) * head_dim;
+    for (int row = 0; row < rows; ++row) {
+        const int64_t q_base = (int64_t) row * q_stride + head_base;
+        const int64_t k_base = (int64_t) row * k_stride + head_base;
+        const int64_t v_base = (int64_t) row * v_stride + head_base;
+        const float beta_h = beta[(int64_t) row * beta_stride + head];
+        const float decay_h = decay[(int64_t) row * decay_stride + head];
+
+        if (head_dim == 128 && blockDim.x == 32) {
+            float state_v[4];
+            float key_v[4];
+            float query_v[4];
+            float prior = 0.0f;
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const int key_idx = threadIdx.x + item * 32;
+                state_v[item] = state[state_base + key_idx];
+                key_v[item] = k[k_base + key_idx];
+                query_v[item] = q[q_base + key_idx];
+                prior += state_v[item] * key_v[item];
+            }
+            prior = gp_qwen_warp_sum(prior);
+            const float prior_sum = __shfl_sync(0xffffffffu, prior, 0);
+            const float delta = (v[v_base + value_idx] - decay_h * prior_sum) * beta_h;
+
+            float attn = 0.0f;
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const int key_idx = threadIdx.x + item * 32;
+                const float updated = decay_h * state_v[item] + key_v[item] * delta;
+                state[state_base + key_idx] = updated;
+                attn += updated * query_v[item];
+            }
+            attn = gp_qwen_warp_sum(attn);
+            if (threadIdx.x == 0) {
+                out[(int64_t) row * out_stride + head_base + value_idx] = attn;
+            }
+            continue;
+        }
+
+        float prior = 0.0f;
+        for (int key_idx = threadIdx.x; key_idx < head_dim; key_idx += blockDim.x) {
+            prior += state[state_base + key_idx] * k[k_base + key_idx];
+        }
+        prior = gp_qwen_warp_sum(prior);
+        const float prior_sum = __shfl_sync(0xffffffffu, prior, 0);
+        const float delta = (v[v_base + value_idx] - decay_h * prior_sum) * beta_h;
+
+        float attn = 0.0f;
+        for (int key_idx = threadIdx.x; key_idx < head_dim; key_idx += blockDim.x) {
+            const int64_t idx = state_base + key_idx;
+            const float updated = decay_h * state[idx] + k[k_base + key_idx] * delta;
+            state[idx] = updated;
+            attn += updated * q[q_base + key_idx];
+        }
+        attn = gp_qwen_warp_sum(attn);
+        if (threadIdx.x == 0) {
+            out[(int64_t) row * out_stride + head_base + value_idx] = attn;
+        }
+    }
+}
+
+template <int value_rows>
+__global__ void gp_qwen_deltanet_rows_h16d128_vrows_kernel(
+        const float * __restrict__ q,
+        const float * __restrict__ k,
+        const float * __restrict__ v,
+        const float * __restrict__ beta,
+        const float * __restrict__ decay,
+        float * __restrict__ state,
+        float * __restrict__ out,
+        int rows) {
+    constexpr int heads = 16;
+    constexpr int head_dim = 128;
+    constexpr int qkv_stride = heads * head_dim * 3;
+    constexpr int out_stride = heads * head_dim;
+    const int head = blockIdx.x;
+    const int value_base =
+        (blockIdx.y * blockDim.y + threadIdx.y) * value_rows;
+    if (value_base >= head_dim) return;
+    const int lane = threadIdx.x;
+    const int head_base = head * head_dim;
+    float state_values[value_rows][4];
+#pragma unroll
+    for (int value_row = 0; value_row < value_rows; ++value_row) {
+        const int state_base =
+            (head * head_dim + value_base + value_row) * head_dim;
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            state_values[value_row][item] =
+                state[state_base + lane + item * 32];
+        }
+    }
+    for (int row = 0; row < rows; ++row) {
+        const int q_base = row * qkv_stride + head_base;
+        const float beta_value = beta[row * heads + head];
+        const float decay_value = decay[row * heads + head];
+        float key_values[4];
+        float query_values[4];
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            const int idx = lane + item * 32;
+            key_values[item] = k[q_base + idx];
+            query_values[item] = q[q_base + idx];
+        }
+#pragma unroll
+        for (int value_row = 0; value_row < value_rows; ++value_row) {
+            float prior = 0.0f;
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                prior += state_values[value_row][item] * key_values[item];
+            }
+            prior = gp_qwen_warp_sum(prior);
+            const float prior_sum = __shfl_sync(0xffffffffu, prior, 0);
+            const int value_idx = value_base + value_row;
+            const float delta =
+                (v[q_base + value_idx] - decay_value * prior_sum) * beta_value;
+            float attention = 0.0f;
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                state_values[value_row][item] =
+                    decay_value * state_values[value_row][item] +
+                    key_values[item] * delta;
+                attention += state_values[value_row][item] * query_values[item];
+            }
+            attention = gp_qwen_warp_sum(attention);
+            if (lane == 0) {
+                out[row * out_stride + head_base + value_idx] = attention;
+            }
+        }
+    }
+#pragma unroll
+    for (int value_row = 0; value_row < value_rows; ++value_row) {
+        const int state_base =
+            (head * head_dim + value_base + value_row) * head_dim;
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            state[state_base + lane + item * 32] =
+                state_values[value_row][item];
+        }
+    }
+}
+
+__global__ void gp_qwen_prepare_deltanet_rows_kernel(
+        float * beta,
+        float * decay,
+        const float * __restrict__ a_log,
+        const float * __restrict__ dt_bias,
+        int rows,
+        int heads,
+        int beta_stride,
+        int decay_stride) {
+    const int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= rows * heads) return;
+    const int row = idx / heads;
+    const int head = idx - row * heads;
+    const int64_t beta_idx = (int64_t) row * beta_stride + head;
+    const int64_t decay_idx = (int64_t) row * decay_stride + head;
+    beta[beta_idx] = 1.0f / (1.0f + expf(-beta[beta_idx]));
+    const float x = decay[decay_idx] + dt_bias[head];
+    const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+    float value = expf(-expf(a_log[head]) * sp);
+    decay[decay_idx] = fminf(fmaxf(value, 0.0f), 1.0f);
+}
+
+GP_CUDA_EXPORT int gp_qwen_deltanet_decode_rows(
+        const float * q,
+        const float * k,
+        const float * v,
+        float * beta,
+        float * alpha,
+        const float * a_log,
+        const float * dt_bias,
+        float * state,
+        float * out,
+        int rows,
+        int heads,
+        int head_dim,
+        int q_stride,
+        int k_stride,
+        int v_stride,
+        int beta_stride,
+        int alpha_stride,
+        int out_stride,
+        void * stream) {
+    if (rows <= 0 || heads <= 0 || head_dim <= 0 ||
+        q_stride < heads*head_dim || k_stride < heads*head_dim ||
+        v_stride < heads*head_dim || beta_stride < heads || alpha_stride < heads ||
+        out_stride < heads*head_dim) {
+        return (int) cudaErrorInvalidValue;
+    }
+    const int prepare_total = rows * heads;
+    gp_qwen_prepare_deltanet_rows_kernel<<<(prepare_total + 255)/256, 256, 0,
+        (cudaStream_t) stream>>>(
+        beta, alpha, a_log, dt_bias, rows, heads, beta_stride, alpha_stride);
+    cudaError_t err = cudaPeekAtLastError();
+    if (err != cudaSuccess) return (int) err;
+    constexpr int warps_per_block = 8;
+    const dim3 block(32, warps_per_block, 1);
+    if (heads == 16 && head_dim == 128 &&
+        q_stride == 6144 && k_stride == 6144 && v_stride == 6144 &&
+        beta_stride == 16 && alpha_stride == 16 && out_stride == 2048) {
+        const dim3 grid(heads, head_dim / (warps_per_block * 2), 1);
+        gp_qwen_deltanet_rows_h16d128_vrows_kernel<2><<<grid, block, 0,
+            (cudaStream_t)stream>>>(q, k, v, beta, alpha, state, out, rows);
+    } else {
+        const dim3 grid(heads, (head_dim + warps_per_block - 1) / warps_per_block, 1);
+        gp_qwen_deltanet_decode_rows_kernel<<<grid, block, 0,
+            (cudaStream_t) stream>>>(
+            q, k, v, beta, alpha, state, out, rows, heads, head_dim,
+            q_stride, k_stride, v_stride, beta_stride, alpha_stride, out_stride);
+    }
     return (int) cudaPeekAtLastError();
 }
 
@@ -889,7 +1419,9 @@ __global__ void gp_qwen_rope_decode_kernel(
         int head_dim,
         int rope_dim,
         int position,
+        const int * __restrict__ position_ptr,
         float base_freq) {
+    if (position_ptr != nullptr) position = *position_ptr;
     const int half = rope_dim / 2;
     const int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int total = heads * half;
@@ -921,7 +1453,75 @@ GP_CUDA_EXPORT int gp_qwen_rope_decode(
     }
     const int total = heads * (rope_dim / 2);
     gp_qwen_rope_decode_kernel<<<(total + 255)/256, 256, 0, (cudaStream_t) stream>>>(
-        values, heads, head_dim, rope_dim, position, base_freq);
+        values, heads, head_dim, rope_dim, position, nullptr, base_freq);
+    return (int) cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_qwen_rope_decode_position(
+        float * values,
+        int heads,
+        int head_dim,
+        int rope_dim,
+        const int * position,
+        float base_freq,
+        void * stream) {
+    if (heads <= 0 || head_dim <= 0 || rope_dim <= 0 || rope_dim > head_dim ||
+        (rope_dim & 1) != 0 || position == nullptr) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int total = heads * (rope_dim / 2);
+    gp_qwen_rope_decode_kernel<<<(total + 255)/256, 256, 0, (cudaStream_t)stream>>>(
+        values, heads, head_dim, rope_dim, 0, position, base_freq);
+    return (int) cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_rope_rows_kernel(
+        float * __restrict__ values,
+        int rows,
+        int heads,
+        int head_dim,
+        int rope_dim,
+        int position,
+        int row_stride,
+        float base_freq) {
+    const int half = rope_dim / 2;
+    const int per_row = heads * half;
+    const int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= rows * per_row) return;
+    const int row = idx / per_row;
+    const int local = idx - row * per_row;
+    const int i = local % half;
+    const int head = local / half;
+    const int64_t base = (int64_t) row * row_stride + (int64_t) head * head_dim;
+    const float x1 = values[base + i];
+    const float x2 = values[base + half + i];
+    const float inv = powf(base_freq, -2.0f * (float)i / (float)rope_dim);
+    const float theta = (float)(position + row) * inv;
+    float s;
+    float c;
+    sincosf(theta, &s, &c);
+    values[base + i] = x1 * c - x2 * s;
+    values[base + half + i] = x1 * s + x2 * c;
+}
+
+GP_CUDA_EXPORT int gp_qwen_rope_rows(
+        float * values,
+        int rows,
+        int heads,
+        int head_dim,
+        int rope_dim,
+        int position,
+        int row_stride,
+        float base_freq,
+        void * stream) {
+    if (rows <= 0 || heads <= 0 || head_dim <= 0 || rope_dim <= 0 ||
+        rope_dim > head_dim || (rope_dim & 1) != 0 || position < 0 ||
+        row_stride < heads * head_dim) {
+        return (int) cudaErrorInvalidValue;
+    }
+    const int total = rows * heads * (rope_dim / 2);
+    gp_qwen_rope_rows_kernel<<<(total + 255)/256, 256, 0, (cudaStream_t) stream>>>(
+        values, rows, heads, head_dim, rope_dim, position, row_stride, base_freq);
     return (int) cudaPeekAtLastError();
 }
 
@@ -929,12 +1529,14 @@ __global__ void gp_qwen_cache_write_kernel(
         const float * __restrict__ src,
         float * __restrict__ cache,
         int position,
+        const int * __restrict__ position_ptr,
         int heads,
         int head_dim,
         int max_context) {
+    if (position_ptr != nullptr) position = *position_ptr;
     const int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
     const int total = heads * head_dim;
-    if (idx >= total) return;
+    if (position < 0 || position >= max_context || idx >= total) return;
     cache[((int64_t) position * heads * head_dim) + idx] = src[idx];
 }
 
@@ -951,7 +1553,60 @@ GP_CUDA_EXPORT int gp_qwen_cache_write(
     }
     const int total = heads * head_dim;
     gp_qwen_cache_write_kernel<<<(total + 255)/256, 256, 0, (cudaStream_t) stream>>>(
-        src, cache, position, heads, head_dim, max_context);
+        src, cache, position, nullptr, heads, head_dim, max_context);
+    return (int) cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_qwen_cache_write_position(
+        const float * src,
+        float * cache,
+        const int * position,
+        int heads,
+        int head_dim,
+        int max_context,
+        void * stream) {
+    if (position == nullptr || heads <= 0 || head_dim <= 0 || max_context <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    const int total = heads * head_dim;
+    gp_qwen_cache_write_kernel<<<(total + 255)/256, 256, 0, (cudaStream_t)stream>>>(
+        src, cache, 0, position, heads, head_dim, max_context);
+    return (int) cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_cache_write_rows_kernel(
+        const float * __restrict__ src,
+        float * __restrict__ cache,
+        int rows,
+        int position,
+        int heads,
+        int head_dim,
+        int src_stride) {
+    const int width = heads * head_dim;
+    const int idx = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    if (idx >= rows * width) return;
+    const int row = idx / width;
+    const int local = idx - row * width;
+    cache[((int64_t)(position + row) * width) + local] = src[(int64_t)row * src_stride + local];
+}
+
+GP_CUDA_EXPORT int gp_qwen_cache_write_rows(
+        const float * src,
+        float * cache,
+        int rows,
+        int position,
+        int heads,
+        int head_dim,
+        int max_context,
+        int src_stride,
+        void * stream) {
+    if (rows <= 0 || position < 0 || position + rows > max_context ||
+        heads <= 0 || head_dim <= 0 || src_stride < heads * head_dim) {
+        return (int) cudaErrorInvalidValue;
+    }
+    const int total = rows * heads * head_dim;
+    gp_qwen_cache_write_rows_kernel<<<(total + 255)/256, 256, 0, (cudaStream_t) stream>>>(
+        src, cache, rows, position, heads, head_dim, src_stride);
     return (int) cudaPeekAtLastError();
 }
 
@@ -960,15 +1615,17 @@ __global__ void gp_qwen_attention_scores_decode_kernel(
         const float * __restrict__ k_cache,
         float * __restrict__ scores,
         int position,
+        const int * __restrict__ position_ptr,
         int q_heads,
         int kv_heads,
         int head_dim,
         int max_context,
         float scale) {
+    if (position_ptr != nullptr) position = *position_ptr;
     extern __shared__ float s[];
     const int pos = blockIdx.x;
     const int q_head = blockIdx.y;
-    if (pos > position || q_head >= q_heads) return;
+    if (position < 0 || position >= max_context || pos > position || q_head >= q_heads) return;
     const int gqa = q_heads / kv_heads;
     const int kv_head = q_head / gqa;
     const int64_t q_base = (int64_t) q_head * head_dim;
@@ -1004,18 +1661,41 @@ GP_CUDA_EXPORT int gp_qwen_attention_scores_decode(
         return (int) cudaErrorInvalidValue;
     }
     gp_qwen_attention_scores_decode_kernel<<<dim3(position + 1, q_heads, 1), 256, 256*sizeof(float), (cudaStream_t) stream>>>(
-        q, k_cache, scores, position, q_heads, kv_heads, head_dim, max_context, scale);
+        q, k_cache, scores, position, nullptr, q_heads, kv_heads, head_dim, max_context, scale);
+    return (int) cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_qwen_attention_scores_decode_position(
+        const float * q,
+        const float * k_cache,
+        float * scores,
+        const int * position,
+        int q_heads,
+        int kv_heads,
+        int head_dim,
+        int max_context,
+        float scale,
+        void * stream) {
+    if (position == nullptr || q_heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+        max_context <= 0 || q_heads % kv_heads != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    gp_qwen_attention_scores_decode_kernel<<<dim3(max_context, q_heads, 1), 256,
+        256*sizeof(float), (cudaStream_t)stream>>>(
+        q, k_cache, scores, 0, position, q_heads, kv_heads, head_dim, max_context, scale);
     return (int) cudaPeekAtLastError();
 }
 
 __global__ void gp_qwen_softmax_decode_kernel(
         float * __restrict__ scores,
         int position,
+        const int * __restrict__ position_ptr,
         int heads,
         int max_context) {
+    if (position_ptr != nullptr) position = *position_ptr;
     extern __shared__ float s[];
     const int head = blockIdx.x;
-    if (head >= heads) return;
+    if (position < 0 || position >= max_context || head >= heads) return;
     float local_max = -INFINITY;
     const int64_t base = (int64_t) head * max_context;
     for (int pos = threadIdx.x; pos <= position; pos += blockDim.x) {
@@ -1054,7 +1734,21 @@ GP_CUDA_EXPORT int gp_qwen_softmax_decode(
         void * stream) {
     if (position < 0 || position >= max_context || heads <= 0) return (int) cudaErrorInvalidValue;
     gp_qwen_softmax_decode_kernel<<<heads, 256, 256*sizeof(float), (cudaStream_t) stream>>>(
-        scores, position, heads, max_context);
+        scores, position, nullptr, heads, max_context);
+    return (int) cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_qwen_softmax_decode_position(
+        float * scores,
+        const int * position,
+        int heads,
+        int max_context,
+        void * stream) {
+    if (position == nullptr || heads <= 0 || max_context <= 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    gp_qwen_softmax_decode_kernel<<<heads, 256, 256*sizeof(float), (cudaStream_t)stream>>>(
+        scores, 0, position, heads, max_context);
     return (int) cudaPeekAtLastError();
 }
 
@@ -1063,14 +1757,16 @@ __global__ void gp_qwen_attention_values_decode_kernel(
         const float * __restrict__ v_cache,
         float * __restrict__ out,
         int position,
+        const int * __restrict__ position_ptr,
         int q_heads,
         int kv_heads,
         int value_dim,
         int max_context) {
+    if (position_ptr != nullptr) position = *position_ptr;
     extern __shared__ float s[];
     const int q_head = blockIdx.x;
     const int value_idx = blockIdx.y;
-    if (q_head >= q_heads || value_idx >= value_dim) return;
+    if (position < 0 || position >= max_context || q_head >= q_heads || value_idx >= value_dim) return;
     const int gqa = q_heads / kv_heads;
     const int kv_head = q_head / gqa;
     float acc = 0.0f;
@@ -1105,7 +1801,263 @@ GP_CUDA_EXPORT int gp_qwen_attention_values_decode(
         return (int) cudaErrorInvalidValue;
     }
     gp_qwen_attention_values_decode_kernel<<<dim3(q_heads, value_dim, 1), 256, 256*sizeof(float), (cudaStream_t) stream>>>(
-        scores, v_cache, out, position, q_heads, kv_heads, value_dim, max_context);
+        scores, v_cache, out, position, nullptr, q_heads, kv_heads, value_dim, max_context);
+    return (int) cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_qwen_attention_values_decode_position(
+        const float * scores,
+        const float * v_cache,
+        float * out,
+        const int * position,
+        int q_heads,
+        int kv_heads,
+        int value_dim,
+        int max_context,
+        void * stream) {
+    if (position == nullptr || q_heads <= 0 || kv_heads <= 0 || value_dim <= 0 ||
+        max_context <= 0 || q_heads % kv_heads != 0) {
+        return (int)cudaErrorInvalidValue;
+    }
+    gp_qwen_attention_values_decode_kernel<<<dim3(q_heads, value_dim, 1), 256,
+        256*sizeof(float), (cudaStream_t)stream>>>(
+        scores, v_cache, out, 0, position, q_heads, kv_heads, value_dim, max_context);
+    return (int) cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_increment_position_kernel(int * position) {
+    if (threadIdx.x == 0) ++*position;
+}
+
+GP_CUDA_EXPORT int gp_qwen_increment_position(int * position, void * stream) {
+    if (position == nullptr) return (int)cudaErrorInvalidValue;
+    gp_qwen_increment_position_kernel<<<1, 1, 0, (cudaStream_t)stream>>>(position);
+    return (int)cudaPeekAtLastError();
+}
+
+__global__ void gp_qwen_attention_rows_fused_kernel(
+        const float * __restrict__ q,
+        const float * __restrict__ k_cache,
+        const float * __restrict__ v_cache,
+        float * __restrict__ out,
+        int rows,
+        int position,
+        int q_heads,
+        int kv_heads,
+        int head_dim,
+        int value_dim,
+        int q_stride,
+        float scale) {
+    extern __shared__ float shared[];
+    const int row = blockIdx.x;
+    const int q_head = blockIdx.y;
+    const int context = position + row + 1;
+    float * scores = shared;
+    float * reduce = scores + context;
+    if (row >= rows || q_head >= q_heads) return;
+    const int gqa = q_heads / kv_heads;
+    const int kv_head = q_head / gqa;
+    const int64_t q_base = (int64_t) row * q_stride + (int64_t) q_head * head_dim;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int warps = blockDim.x >> 5;
+    float q_values[4];
+    if (head_dim == 128) {
+#pragma unroll
+        for (int item = 0; item < 4; ++item) {
+            q_values[item] = q[q_base + lane + item * 32];
+        }
+    }
+    float local_max = -INFINITY;
+    for (int pos = warp; pos < context; pos += warps) {
+        const int64_t k_base = ((int64_t) pos * kv_heads + kv_head) * head_dim;
+        float acc = 0.0f;
+        if (head_dim == 128) {
+#pragma unroll
+            for (int item = 0; item < 4; ++item) {
+                const int i = lane + item * 32;
+                acc += q_values[item] * k_cache[k_base + i];
+            }
+        } else {
+            for (int i = lane; i < head_dim; i += 32) {
+                acc += q[q_base + i] * k_cache[k_base + i];
+            }
+        }
+        acc = gp_qwen_warp_sum(acc);
+        if (lane == 0) {
+            const float score = acc * scale;
+            scores[pos] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    }
+    reduce[threadIdx.x] = lane == 0 ? local_max : -INFINITY;
+    __syncthreads();
+    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] = fmaxf(reduce[threadIdx.x], reduce[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float max_v = reduce[0];
+
+    float local_sum = 0.0f;
+    for (int pos = threadIdx.x; pos < context; pos += blockDim.x) {
+        const float value = expf(scores[pos] - max_v);
+        scores[pos] = value;
+        local_sum += value;
+    }
+    reduce[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x/2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) reduce[threadIdx.x] += reduce[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inv_sum = 1.0f / fmaxf(reduce[0], 1.0e-20f);
+    for (int pos = threadIdx.x; pos < context; pos += blockDim.x) {
+        scores[pos] *= inv_sum;
+    }
+    __syncthreads();
+
+    for (int value_idx = threadIdx.x; value_idx < value_dim; value_idx += blockDim.x) {
+        float acc = 0.0f;
+        for (int pos = 0; pos < context; ++pos) {
+            const int64_t v_base = ((int64_t) pos * kv_heads + kv_head) * value_dim;
+            acc += scores[pos] * v_cache[v_base + value_idx];
+        }
+        out[((int64_t) row * q_heads + q_head) * value_dim + value_idx] = acc;
+    }
+}
+
+template <int query_tile>
+__global__ void gp_qwen_attention_rows_qtile_h256v256_kernel(
+        const float * __restrict__ q,
+        const float * __restrict__ k_cache,
+        const float * __restrict__ v_cache,
+        float * __restrict__ out,
+        int rows,
+        int position,
+        int q_heads,
+        int kv_heads,
+        int q_stride,
+        float scale) {
+    extern __shared__ float shared_scores[];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * query_tile + warp;
+    if (row >= rows) return;
+
+    const int q_head = blockIdx.y;
+    const int kv_head = q_head / (q_heads / kv_heads);
+    const int full_context = position + rows;
+    const int context = position + row + 1;
+    float * scores = shared_scores + (int64_t)warp * full_context;
+    const int64_t q_base = (int64_t)row * q_stride + (int64_t)q_head * 256;
+    float q_values[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        q_values[item] = q[q_base + lane + item * 32];
+    }
+
+    float local_max = -INFINITY;
+    for (int pos = 0; pos < context; ++pos) {
+        const int64_t k_base = ((int64_t)pos * kv_heads + kv_head) * 256;
+        float score = 0.0f;
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            score += q_values[item] * k_cache[k_base + lane + item * 32];
+        }
+        score = gp_qwen_warp_sum(score);
+        if (lane == 0) {
+            score *= scale;
+            scores[pos] = score;
+            local_max = fmaxf(local_max, score);
+        }
+    }
+    const float max_value = __shfl_sync(0xffffffffu, local_max, 0);
+
+    float local_sum = 0.0f;
+    for (int pos = lane; pos < context; pos += 32) {
+        const float value = expf(scores[pos] - max_value);
+        scores[pos] = value;
+        local_sum += value;
+    }
+    local_sum = gp_qwen_warp_sum(local_sum);
+    const float inv_sum = 1.0f / fmaxf(__shfl_sync(0xffffffffu, local_sum, 0), 1.0e-20f);
+    for (int pos = lane; pos < context; pos += 32) {
+        scores[pos] *= inv_sum;
+    }
+    __syncwarp();
+
+    float values[8];
+#pragma unroll
+    for (int item = 0; item < 8; ++item) values[item] = 0.0f;
+    for (int pos = 0; pos < context; ++pos) {
+        const int64_t v_base = ((int64_t)pos * kv_heads + kv_head) * 256;
+        const float weight = scores[pos];
+#pragma unroll
+        for (int item = 0; item < 8; ++item) {
+            values[item] += weight * v_cache[v_base + lane + item * 32];
+        }
+    }
+    const int64_t out_base = ((int64_t)row * q_heads + q_head) * 256;
+#pragma unroll
+    for (int item = 0; item < 8; ++item) {
+        out[out_base + lane + item * 32] = values[item];
+    }
+}
+
+GP_CUDA_EXPORT int gp_qwen_attention_rows_fused(
+        const float * q,
+        const float * k_cache,
+        const float * v_cache,
+        float * out,
+        int rows,
+        int position,
+        int q_heads,
+        int kv_heads,
+        int head_dim,
+        int value_dim,
+        int max_context,
+        int q_stride,
+        void * stream) {
+    if (rows <= 0 || position < 0 || position + rows > max_context ||
+        q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
+        head_dim <= 0 || value_dim <= 0 || q_stride < q_heads * head_dim) {
+        return (int) cudaErrorInvalidValue;
+    }
+    if (head_dim == 256 && value_dim == 256) {
+        constexpr int query_tile = 2;
+        const int block = query_tile * 32;
+        const size_t shared = (size_t)query_tile * (position + rows) * sizeof(float);
+        if (shared > 48*1024) {
+            int max_shared = 0;
+            cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+            if (shared > (size_t)max_shared) return (int)cudaErrorInvalidValue;
+            cudaError_t attr = cudaFuncSetAttribute(
+                (const void *)gp_qwen_attention_rows_qtile_h256v256_kernel<query_tile>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shared);
+            if (attr != cudaSuccess) return (int)attr;
+        }
+        const float scale = 0.0625f;
+        gp_qwen_attention_rows_qtile_h256v256_kernel<query_tile><<<
+            dim3((rows + query_tile - 1) / query_tile, q_heads, 1), block, shared,
+            (cudaStream_t)stream>>>(q, k_cache, v_cache, out, rows, position,
+            q_heads, kv_heads, q_stride, scale);
+        return (int)cudaPeekAtLastError();
+    }
+
+    const int block = 128;
+    const size_t shared = (size_t)(position + rows + block + head_dim) * sizeof(float);
+    if (shared > 48*1024) {
+        int max_shared = 0;
+        cudaDeviceGetAttribute(&max_shared, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+        if (shared > (size_t)max_shared) return (int)cudaErrorInvalidValue;
+        cudaError_t attr = cudaFuncSetAttribute((const void *)gp_qwen_attention_rows_fused_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shared);
+        if (attr != cudaSuccess) return (int)attr;
+    }
+    const float scale = rsqrtf((float)head_dim);
+    gp_qwen_attention_rows_fused_kernel<<<dim3(rows, q_heads, 1), block, shared,
+        (cudaStream_t) stream>>>(q, k_cache, v_cache, out, rows, position, q_heads,
+        kv_heads, head_dim, value_dim, q_stride, scale);
     return (int) cudaPeekAtLastError();
 }
 
@@ -1529,7 +2481,21 @@ static int gp_blck_size(int dtype) {
     }
 }
 
-template <ggml_type type, int mmq_x, bool use_stream_k>
+template <ggml_type type, int mmq_x>
+static cudaError_t gp_configure_mmq_shared(const int nbytes_shared) {
+    static const cudaError_t configure_error = [nbytes_shared]() {
+        cudaError_t err = cudaFuncSetAttribute(
+            (const void *)mul_mat_q<type, mmq_x, false>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+        if (err != cudaSuccess) return err;
+        return cudaFuncSetAttribute(
+            (const void *)mul_mat_q<type, mmq_x, true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+    }();
+    return configure_error;
+}
+
+template <ggml_type type, int mmq_x, bool use_stream_k, bool need_check>
 static cudaError_t gp_launch_mmq_typed(
         const char * weights,
         const int * y_q8,
@@ -1546,10 +2512,9 @@ static cudaError_t gp_launch_mmq_typed(
     constexpr int nwarps = 8;
     constexpr int mmq_y = 128;
     const int nbytes_shared = (int) mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps);
-    cudaFuncSetAttribute((const void *) mul_mat_q<type, mmq_x, false>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
-    cudaFuncSetAttribute((const void *) mul_mat_q<type, mmq_x, true>,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, nbytes_shared);
+    const cudaError_t configure_error =
+        gp_configure_mmq_shared<type, mmq_x>(nbytes_shared);
+    if (configure_error != cudaSuccess) return configure_error;
 
     const dim3 block_dims(warp_size, nwarps, 1);
     const int64_t nrows_dst = nrows_x;
@@ -1558,42 +2523,40 @@ static cudaError_t gp_launch_mmq_typed(
     const int nty = (int)((nrows_x + mmq_y - 1) / mmq_y);
     const int ntx = (int)((ncols_max + mmq_x - 1) / mmq_x);
 
-    const int channel_ratio = 1;
-    const int sample_ratio = 1;
-    const int64_t zero = 0;
-    constexpr bool need_check = true;
-
+    const uint3 blocks_per_ne00 = init_fastdiv_values(
+        ncols_x / ggml_cuda_type_traits<type>::qk);
+    const uint3 ntx_fast = init_fastdiv_values(ntx);
+    const uint3 one = init_fastdiv_values(1);
+    const int zero = 0;
     if constexpr (!use_stream_k) {
-        const dim3 grid(nty, 1, 1);
+        const dim3 grid(nty, ntx, 1);
         mul_mat_q<type, mmq_x, need_check><<<grid, block_dims, nbytes_shared, stream>>>(
             weights, y_q8, nullptr, nullptr, dst, nullptr,
-            ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, nrows_dst,
-            channel_ratio, 1, zero, zero, zero,
-            sample_ratio, 1, zero, zero, zero,
-            ncols_max);
+            blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, nrows_dst,
+            one, one, zero, zero, zero,
+            one, one, zero, zero, zero,
+            ntx_fast);
         return cudaPeekAtLastError();
     } else {
         const int tile_count = ntx*nty;
-        const int grid_x = ncols_dst <= 128 ? nsm : (tile_count < nsm ? tile_count : nsm);
+        const int grid_x = ncols_dst <= 128 ? nsm : min(tile_count, nsm);
         const dim3 grid(grid_x, 1, 1);
         const bool fixup_needed = tile_count % grid_x != 0;
-        if (fixup_needed) {
-            cudaError_t err = cudaMemsetAsync(dst, 0, (size_t) nrows_x * (size_t) ncols_dst * sizeof(float), stream);
-            if (err != cudaSuccess) return err;
-        }
         float * tmp = fixup_needed ? fixup : nullptr;
         mul_mat_q<type, mmq_x, need_check><<<grid, block_dims, nbytes_shared, stream>>>(
             weights, y_q8, nullptr, nullptr, dst, tmp,
-            ncols_x, nrows_x, ncols_dst, stride_row_x, ncols_y, nrows_dst,
-            channel_ratio, 1, zero, zero, zero,
-            sample_ratio, 1, zero, zero, zero,
-            ncols_max);
+            blocks_per_ne00, nrows_x, ncols_dst, stride_row_x, ncols_y, nrows_dst,
+            one, one, zero, zero, zero,
+            one, one, zero, zero, zero,
+            ntx_fast);
         cudaError_t err = cudaPeekAtLastError();
         if (err != cudaSuccess || !fixup_needed) return err;
-        mul_mat_q_stream_k_fixup<type, mmq_x, need_check><<<grid, block_dims, 0, stream>>>(
+        const dim3 fixup_grid(grid_x, mmq_y / warp_size, 1);
+        const dim3 fixup_block(warp_size, nwarps / 2, 1);
+        mul_mat_q_stream_k_fixup<type, mmq_x, need_check><<<fixup_grid, fixup_block, 0, stream>>>(
             nullptr, nullptr, dst, tmp,
-            ncols_x, nrows_x, ncols_dst, nrows_dst,
-            1, zero, 1, zero, ncols_max);
+            blocks_per_ne00, nrows_x, ncols_dst, nrows_dst,
+            one, zero, one, zero, ntx_fast);
         return cudaPeekAtLastError();
     }
 }
@@ -1611,11 +2574,21 @@ static cudaError_t gp_launch_mmq_choose_stream(
         int nsm,
         bool use_stream_k,
         cudaStream_t stream) {
+    constexpr int mmq_y = 128;
+    const bool need_check = nrows_x % mmq_y != 0;
     if (use_stream_k) {
-        return gp_launch_mmq_typed<type, mmq_x, true>(
+        if (need_check) {
+            return gp_launch_mmq_typed<type, mmq_x, true, true>(
+                weights, y_q8, dst, fixup, ncols_x, stride_row_x, nrows_x, ncols_dst, nsm, stream);
+        }
+        return gp_launch_mmq_typed<type, mmq_x, true, false>(
             weights, y_q8, dst, fixup, ncols_x, stride_row_x, nrows_x, ncols_dst, nsm, stream);
     }
-    return gp_launch_mmq_typed<type, mmq_x, false>(
+    if (need_check) {
+        return gp_launch_mmq_typed<type, mmq_x, false, true>(
+            weights, y_q8, dst, fixup, ncols_x, stride_row_x, nrows_x, ncols_dst, nsm, stream);
+    }
+    return gp_launch_mmq_typed<type, mmq_x, false, false>(
         weights, y_q8, dst, fixup, ncols_x, stride_row_x, nrows_x, ncols_dst, nsm, stream);
 }
 
@@ -1638,12 +2611,11 @@ static cudaError_t gp_launch_mmq_type(
     constexpr int warp_size = 32;
     constexpr int nwarps = 8;
     constexpr int mmq_y = 128;
-    int smpbo = 0;
-    cudaDeviceGetAttribute(&smpbo, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0);
+    const size_t smpbo = gp_cuda_info_state.devices[gp_cuda_current_device].smpbo;
     for (int mmq_x = 8; mmq_x <= 128 && ntiles_x_best > 1; mmq_x += 8) {
         const int granularity = mmq_get_granularity_host(mmq_x, cc);
         if (mmq_x % granularity != 0) continue;
-        if ((int) mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) continue;
+        if (mmq_get_nbytes_shared<type>(mmq_x, mmq_y, cc, warp_size, nwarps) > smpbo) continue;
         const int ntiles_x = (int)((ncols_dst + mmq_x - 1) / mmq_x);
         if (ntiles_x < ntiles_x_best) {
             mmq_x_best = mmq_x;
@@ -1670,10 +2642,36 @@ static cudaError_t gp_launch_mmq_type(
     }
 }
 
-GP_CUDA_EXPORT int gp_mmq_matmul(
+GP_CUDA_EXPORT int gp_mmq_quantize(
+        int dtype,
+        const float * src,
+        void * q8_scratch,
+        int64_t ncols_x,
+        int64_t ncols_dst,
+        void * stream_ptr) {
+    switch ((ggml_type)dtype) {
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q5_0:
+            break;
+        default:
+            return (int)cudaErrorInvalidValue;
+    }
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const int64_t ne0 = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
+    quantize_mmq_q8_1_cuda(
+        src, nullptr, q8_scratch, (ggml_type)dtype,
+        ncols_x, ncols_x, 0, 0,
+        ne0, ncols_dst, 1, 1,
+        stream);
+    return (int)cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_mmq_matmul_q8(
         int dtype,
         const void * weights,
-        const float * src,
         float * dst,
         void * q8_scratch,
         void * fixup_scratch,
@@ -1683,19 +2681,9 @@ GP_CUDA_EXPORT int gp_mmq_matmul(
         int64_t ncols_dst,
         void * stream_ptr) {
     cudaStream_t stream = (cudaStream_t) stream_ptr;
-    const int64_t ne0 = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
-    const int64_t s01 = ncols_x;
-    quantize_mmq_q8_1_cuda(
-        src, nullptr, q8_scratch, (ggml_type) dtype,
-        ncols_x, s01, 0, 0,
-        ne0, ncols_dst, 1, 1,
-        stream);
-    cudaError_t err = cudaPeekAtLastError();
-    if (err != cudaSuccess) return (int) err;
-
-    int nsm = 0;
-    cudaDeviceGetAttribute(&nsm, cudaDevAttrMultiProcessorCount, 0);
+    const int nsm = gp_cuda_info_state.devices[gp_cuda_current_device].nsm;
     const bool use_stream_k = ncols_dst <= 128 || ncols_dst >= 512;
+    cudaError_t err;
     switch ((ggml_type) dtype) {
         case GGML_TYPE_Q4_K:
             err = gp_launch_mmq_type<GGML_TYPE_Q4_K>(
@@ -1728,10 +2716,47 @@ GP_CUDA_EXPORT int gp_mmq_matmul(
     return (int) err;
 }
 
-GP_CUDA_EXPORT int gp_mmvq_matvec(
+GP_CUDA_EXPORT int gp_mmq_matmul(
         int dtype,
         const void * weights,
         const float * src,
+        float * dst,
+        void * q8_scratch,
+        void * fixup_scratch,
+        int64_t ncols_x,
+        int64_t stride_row_x,
+        int64_t nrows_x,
+        int64_t ncols_dst,
+        void * stream_ptr) {
+    int err = gp_mmq_quantize(
+        dtype, src, q8_scratch, ncols_x, ncols_dst, stream_ptr);
+    if (err != 0) return err;
+    return gp_mmq_matmul_q8(
+        dtype, weights, dst, q8_scratch, fixup_scratch,
+        ncols_x, stride_row_x, nrows_x, ncols_dst, stream_ptr);
+}
+
+GP_CUDA_EXPORT int gp_mmvq_quantize(
+        const float * src,
+        void * q8_scratch,
+        int64_t ncols_x,
+        void * stream_ptr) {
+    if (ncols_x <= 0 || ncols_x > (int64_t)INT_MAX) {
+        return (int)cudaErrorInvalidValue;
+    }
+    cudaStream_t stream = (cudaStream_t)stream_ptr;
+    const int64_t ne0 = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
+    quantize_row_q8_1_cuda(
+        src, nullptr, q8_scratch, GGML_TYPE_Q4_K,
+        ncols_x, ncols_x, 0, 0,
+        ne0, 1, 1, 1,
+        stream);
+    return (int)cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_mmvq_matvec_q8(
+        int dtype,
+        const void * weights,
         float * dst,
         void * q8_scratch,
         int64_t ncols_x,
@@ -1757,14 +2782,6 @@ GP_CUDA_EXPORT int gp_mmvq_matvec(
 
     cudaStream_t stream = (cudaStream_t) stream_ptr;
     const int64_t ne0 = GGML_PAD(ncols_x, MATRIX_ROW_PADDING);
-    quantize_row_q8_1_cuda(
-        src, nullptr, q8_scratch, (ggml_type) dtype,
-        ncols_x, ncols_x, 0, 0,
-        ne0, 1, 1, 1,
-        stream);
-    cudaError_t err = cudaPeekAtLastError();
-    if (err != cudaSuccess) return (int) err;
-
     ggml_cuda_mm_fusion_args_device fusion{};
     mul_mat_vec_q_switch_type(
         weights, (ggml_type) dtype, q8_scratch, nullptr, fusion, dst,
@@ -1775,4 +2792,20 @@ GP_CUDA_EXPORT int gp_mmvq_matvec(
         1, 1, 1, 1, 1,
         0, stream);
     return (int) cudaPeekAtLastError();
+}
+
+GP_CUDA_EXPORT int gp_mmvq_matvec(
+        int dtype,
+        const void * weights,
+        const float * src,
+        float * dst,
+        void * q8_scratch,
+        int64_t ncols_x,
+        int64_t stride_row_x,
+        int64_t nrows_x,
+        void * stream_ptr) {
+    int err = gp_mmvq_quantize(src, q8_scratch, ncols_x, stream_ptr);
+    if (err != cudaSuccess) return err;
+    return gp_mmvq_matvec_q8(dtype, weights, dst, q8_scratch, ncols_x,
+        stride_row_x, nrows_x, stream_ptr);
 }

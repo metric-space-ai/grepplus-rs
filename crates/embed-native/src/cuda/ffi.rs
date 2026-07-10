@@ -34,6 +34,11 @@ type GpCudaMemcpyD2DAsync =
 type GpCudaMemsetAsync = unsafe extern "C" fn(*mut c_void, i32, usize, *mut c_void) -> i32;
 type GpCudaStreamSync = unsafe extern "C" fn(*mut c_void) -> i32;
 type GpCudaMemGetInfo = unsafe extern "C" fn(*mut usize, *mut usize) -> i32;
+type GpCudaGraphBegin = unsafe extern "C" fn(*mut c_void) -> i32;
+type GpCudaGraphEnd = unsafe extern "C" fn(*mut c_void, *mut *mut c_void, *mut *mut c_void) -> i32;
+type GpCudaGraphAbort = unsafe extern "C" fn(*mut c_void) -> i32;
+type GpCudaGraphLaunch = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+type GpCudaGraphDestroy = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
 
 type GpEmbedQ4k =
     unsafe extern "C" fn(*const c_void, *const u32, *mut f32, i32, i32, f32, *mut c_void) -> i32;
@@ -74,10 +79,36 @@ type GpQwenAddRmsNorm = unsafe extern "C" fn(
     f32,
     *mut c_void,
 ) -> i32;
+type GpQwenRmsNormQ8 =
+    unsafe extern "C" fn(*const f32, *const f32, *mut c_void, i32, f32, *mut c_void) -> i32;
+type GpQwenAddRmsNormQ8 = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    *mut c_void,
+    i32,
+    f32,
+    *mut c_void,
+) -> i32;
 type GpQwenCausalConv1dSilu =
     unsafe extern "C" fn(*mut f32, *const f32, *mut f32, i32, i32, *mut c_void) -> i32;
+type GpQwenCausalConv1dSiluRows =
+    unsafe extern "C" fn(*mut f32, *const f32, *mut f32, i32, i32, i32, *mut c_void) -> i32;
+type GpQwenCausalConv1dSiluRowsParallel = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *mut f32,
+    *mut f32,
+    i32,
+    i32,
+    i32,
+    *mut c_void,
+) -> i32;
 type GpQwenNormalizeLinearQk =
     unsafe extern "C" fn(*mut f32, *mut f32, i32, i32, f32, *mut c_void) -> i32;
+type GpQwenNormalizeLinearQkRows =
+    unsafe extern "C" fn(*mut f32, *mut f32, i32, i32, i32, i32, i32, f32, *mut c_void) -> i32;
 type GpQwenDeinterleaveQGate = unsafe extern "C" fn(
     *const f32,
     *mut f32,
@@ -109,9 +140,38 @@ type GpQwenDeltaNetDecode = unsafe extern "C" fn(
     i32,
     *mut c_void,
 ) -> i32;
+type GpQwenDeltaNetDecodeRows = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    *const f32,
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    *mut f32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    *mut c_void,
+) -> i32;
 type GpQwenRopeDecode = unsafe extern "C" fn(*mut f32, i32, i32, i32, i32, f32, *mut c_void) -> i32;
+type GpQwenRopeDecodePosition =
+    unsafe extern "C" fn(*mut f32, i32, i32, i32, *const i32, f32, *mut c_void) -> i32;
+type GpQwenRopeRows =
+    unsafe extern "C" fn(*mut f32, i32, i32, i32, i32, i32, i32, f32, *mut c_void) -> i32;
 type GpQwenCacheWrite =
     unsafe extern "C" fn(*const f32, *mut f32, i32, i32, i32, i32, *mut c_void) -> i32;
+type GpQwenCacheWritePosition =
+    unsafe extern "C" fn(*const f32, *mut f32, *const i32, i32, i32, i32, *mut c_void) -> i32;
+type GpQwenCacheWriteRows =
+    unsafe extern "C" fn(*const f32, *mut f32, i32, i32, i32, i32, i32, i32, *mut c_void) -> i32;
 type GpQwenAttentionScoresDecode = unsafe extern "C" fn(
     *const f32,
     *const f32,
@@ -124,11 +184,52 @@ type GpQwenAttentionScoresDecode = unsafe extern "C" fn(
     f32,
     *mut c_void,
 ) -> i32;
+type GpQwenAttentionScoresDecodePosition = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *mut f32,
+    *const i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    f32,
+    *mut c_void,
+) -> i32;
 type GpQwenSoftmaxDecode = unsafe extern "C" fn(*mut f32, i32, i32, i32, *mut c_void) -> i32;
+type GpQwenSoftmaxDecodePosition =
+    unsafe extern "C" fn(*mut f32, *const i32, i32, i32, *mut c_void) -> i32;
 type GpQwenAttentionValuesDecode = unsafe extern "C" fn(
     *const f32,
     *const f32,
     *mut f32,
+    i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    *mut c_void,
+) -> i32;
+type GpQwenAttentionValuesDecodePosition = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *mut f32,
+    *const i32,
+    i32,
+    i32,
+    i32,
+    i32,
+    *mut c_void,
+) -> i32;
+type GpQwenIncrementPosition = unsafe extern "C" fn(*mut i32, *mut c_void) -> i32;
+type GpQwenAttentionRowsFused = unsafe extern "C" fn(
+    *const f32,
+    *const f32,
+    *const f32,
+    *mut f32,
+    i32,
+    i32,
+    i32,
     i32,
     i32,
     i32,
@@ -177,10 +278,35 @@ type GpMmqMatmul = unsafe extern "C" fn(
     i64,
     *mut c_void,
 ) -> i32;
+type GpMmqQuantize =
+    unsafe extern "C" fn(i32, *const f32, *mut c_void, i64, i64, *mut c_void) -> i32;
+type GpMmqMatmulQ8 = unsafe extern "C" fn(
+    i32,
+    *const c_void,
+    *mut f32,
+    *mut c_void,
+    *mut c_void,
+    i64,
+    i64,
+    i64,
+    i64,
+    *mut c_void,
+) -> i32;
 type GpMmvqMatvec = unsafe extern "C" fn(
     i32,
     *const c_void,
     *const f32,
+    *mut f32,
+    *mut c_void,
+    i64,
+    i64,
+    i64,
+    *mut c_void,
+) -> i32;
+type GpMmvqQuantize = unsafe extern "C" fn(*const f32, *mut c_void, i64, *mut c_void) -> i32;
+type GpMmvqMatvecQ8 = unsafe extern "C" fn(
+    i32,
+    *const c_void,
     *mut f32,
     *mut c_void,
     i64,
@@ -202,6 +328,11 @@ struct CudaApi {
     gp_cuda_memset_async: GpCudaMemsetAsync,
     gp_cuda_stream_sync: GpCudaStreamSync,
     gp_cuda_mem_get_info: GpCudaMemGetInfo,
+    gp_cuda_graph_begin: GpCudaGraphBegin,
+    gp_cuda_graph_end: GpCudaGraphEnd,
+    gp_cuda_graph_abort: GpCudaGraphAbort,
+    gp_cuda_graph_launch: GpCudaGraphLaunch,
+    gp_cuda_graph_destroy: GpCudaGraphDestroy,
     gp_embed_q4k: GpEmbedQ4k,
     gp_embed_q6k: GpEmbedQ6k,
     gp_rms_norm: GpRmsNorm,
@@ -209,8 +340,13 @@ struct CudaApi {
     gp_qwen_rms_norm: GpQwenRmsNorm,
     gp_qwen_rms_norm_add: GpQwenRmsNormAdd,
     gp_qwen_add_rms_norm: GpQwenAddRmsNorm,
+    gp_qwen_rms_norm_q8: GpQwenRmsNormQ8,
+    gp_qwen_add_rms_norm_q8: GpQwenAddRmsNormQ8,
     gp_qwen_causal_conv1d_silu: GpQwenCausalConv1dSilu,
+    gp_qwen_causal_conv1d_silu_rows: GpQwenCausalConv1dSiluRows,
+    gp_qwen_causal_conv1d_silu_rows_parallel: GpQwenCausalConv1dSiluRowsParallel,
     gp_qwen_normalize_linear_qk: GpQwenNormalizeLinearQk,
+    gp_qwen_normalize_linear_qk_rows: GpQwenNormalizeLinearQkRows,
     gp_qwen_deinterleave_q_gate: GpQwenDeinterleaveQGate,
     gp_qwen_swiglu: GpQwenSwiGlu,
     gp_qwen_apply_silu_gate: GpQwenApplySiluGate,
@@ -218,11 +354,21 @@ struct CudaApi {
     gp_qwen_add: GpQwenAdd,
     gp_qwen_argmax: GpQwenArgmax,
     gp_qwen_deltanet_decode: GpQwenDeltaNetDecode,
+    gp_qwen_deltanet_decode_rows: GpQwenDeltaNetDecodeRows,
     gp_qwen_rope_decode: GpQwenRopeDecode,
+    gp_qwen_rope_decode_position: GpQwenRopeDecodePosition,
+    gp_qwen_rope_rows: GpQwenRopeRows,
     gp_qwen_cache_write: GpQwenCacheWrite,
+    gp_qwen_cache_write_position: GpQwenCacheWritePosition,
+    gp_qwen_cache_write_rows: GpQwenCacheWriteRows,
     gp_qwen_attention_scores_decode: GpQwenAttentionScoresDecode,
+    gp_qwen_attention_scores_decode_position: GpQwenAttentionScoresDecodePosition,
     gp_qwen_softmax_decode: GpQwenSoftmaxDecode,
+    gp_qwen_softmax_decode_position: GpQwenSoftmaxDecodePosition,
     gp_qwen_attention_values_decode: GpQwenAttentionValuesDecode,
+    gp_qwen_attention_values_decode_position: GpQwenAttentionValuesDecodePosition,
+    gp_qwen_increment_position: GpQwenIncrementPosition,
+    gp_qwen_attention_rows_fused: GpQwenAttentionRowsFused,
     gp_rms_norm_heads: GpRmsNormHeads,
     gp_split_heads: GpSplitHeads,
     gp_rope_neox: GpRopeNeox,
@@ -234,7 +380,11 @@ struct CudaApi {
     gp_mean_pool: GpMeanPool,
     gp_l2_norm: GpL2Norm,
     gp_mmq_matmul: GpMmqMatmul,
+    gp_mmq_quantize: GpMmqQuantize,
+    gp_mmq_matmul_q8: GpMmqMatmulQ8,
     gp_mmvq_matvec: GpMmvqMatvec,
+    gp_mmvq_quantize: GpMmvqQuantize,
+    gp_mmvq_matvec_q8: GpMmvqMatvecQ8,
 }
 
 unsafe impl Send for CudaApi {}
@@ -266,6 +416,11 @@ fn load_cuda_api() -> std::result::Result<CudaApi, String> {
             gp_cuda_memset_async: load_symbol(&lib, b"gp_cuda_memset_async\0")?,
             gp_cuda_stream_sync: load_symbol(&lib, b"gp_cuda_stream_sync\0")?,
             gp_cuda_mem_get_info: load_symbol(&lib, b"gp_cuda_mem_get_info\0")?,
+            gp_cuda_graph_begin: load_symbol(&lib, b"gp_cuda_graph_begin\0")?,
+            gp_cuda_graph_end: load_symbol(&lib, b"gp_cuda_graph_end\0")?,
+            gp_cuda_graph_abort: load_symbol(&lib, b"gp_cuda_graph_abort\0")?,
+            gp_cuda_graph_launch: load_symbol(&lib, b"gp_cuda_graph_launch\0")?,
+            gp_cuda_graph_destroy: load_symbol(&lib, b"gp_cuda_graph_destroy\0")?,
             gp_embed_q4k: load_symbol(&lib, b"gp_embed_q4k\0")?,
             gp_embed_q6k: load_symbol(&lib, b"gp_embed_q6k\0")?,
             gp_rms_norm: load_symbol(&lib, b"gp_rms_norm\0")?,
@@ -273,8 +428,22 @@ fn load_cuda_api() -> std::result::Result<CudaApi, String> {
             gp_qwen_rms_norm: load_symbol(&lib, b"gp_qwen_rms_norm\0")?,
             gp_qwen_rms_norm_add: load_symbol(&lib, b"gp_qwen_rms_norm_add\0")?,
             gp_qwen_add_rms_norm: load_symbol(&lib, b"gp_qwen_add_rms_norm\0")?,
+            gp_qwen_rms_norm_q8: load_symbol(&lib, b"gp_qwen_rms_norm_q8\0")?,
+            gp_qwen_add_rms_norm_q8: load_symbol(&lib, b"gp_qwen_add_rms_norm_q8\0")?,
             gp_qwen_causal_conv1d_silu: load_symbol(&lib, b"gp_qwen_causal_conv1d_silu\0")?,
+            gp_qwen_causal_conv1d_silu_rows: load_symbol(
+                &lib,
+                b"gp_qwen_causal_conv1d_silu_rows\0",
+            )?,
+            gp_qwen_causal_conv1d_silu_rows_parallel: load_symbol(
+                &lib,
+                b"gp_qwen_causal_conv1d_silu_rows_parallel\0",
+            )?,
             gp_qwen_normalize_linear_qk: load_symbol(&lib, b"gp_qwen_normalize_linear_qk\0")?,
+            gp_qwen_normalize_linear_qk_rows: load_symbol(
+                &lib,
+                b"gp_qwen_normalize_linear_qk_rows\0",
+            )?,
             gp_qwen_deinterleave_q_gate: load_symbol(&lib, b"gp_qwen_deinterleave_q_gate\0")?,
             gp_qwen_swiglu: load_symbol(&lib, b"gp_qwen_swiglu\0")?,
             gp_qwen_apply_silu_gate: load_symbol(&lib, b"gp_qwen_apply_silu_gate\0")?,
@@ -282,17 +451,36 @@ fn load_cuda_api() -> std::result::Result<CudaApi, String> {
             gp_qwen_add: load_symbol(&lib, b"gp_qwen_add\0")?,
             gp_qwen_argmax: load_symbol(&lib, b"gp_qwen_argmax\0")?,
             gp_qwen_deltanet_decode: load_symbol(&lib, b"gp_qwen_deltanet_decode\0")?,
+            gp_qwen_deltanet_decode_rows: load_symbol(&lib, b"gp_qwen_deltanet_decode_rows\0")?,
             gp_qwen_rope_decode: load_symbol(&lib, b"gp_qwen_rope_decode\0")?,
+            gp_qwen_rope_decode_position: load_symbol(&lib, b"gp_qwen_rope_decode_position\0")?,
+            gp_qwen_rope_rows: load_symbol(&lib, b"gp_qwen_rope_rows\0")?,
             gp_qwen_cache_write: load_symbol(&lib, b"gp_qwen_cache_write\0")?,
+            gp_qwen_cache_write_position: load_symbol(&lib, b"gp_qwen_cache_write_position\0")?,
+            gp_qwen_cache_write_rows: load_symbol(&lib, b"gp_qwen_cache_write_rows\0")?,
             gp_qwen_attention_scores_decode: load_symbol(
                 &lib,
                 b"gp_qwen_attention_scores_decode\0",
             )?,
+            gp_qwen_attention_scores_decode_position: load_symbol(
+                &lib,
+                b"gp_qwen_attention_scores_decode_position\0",
+            )?,
             gp_qwen_softmax_decode: load_symbol(&lib, b"gp_qwen_softmax_decode\0")?,
+            gp_qwen_softmax_decode_position: load_symbol(
+                &lib,
+                b"gp_qwen_softmax_decode_position\0",
+            )?,
             gp_qwen_attention_values_decode: load_symbol(
                 &lib,
                 b"gp_qwen_attention_values_decode\0",
             )?,
+            gp_qwen_attention_values_decode_position: load_symbol(
+                &lib,
+                b"gp_qwen_attention_values_decode_position\0",
+            )?,
+            gp_qwen_increment_position: load_symbol(&lib, b"gp_qwen_increment_position\0")?,
+            gp_qwen_attention_rows_fused: load_symbol(&lib, b"gp_qwen_attention_rows_fused\0")?,
             gp_rms_norm_heads: load_symbol(&lib, b"gp_rms_norm_heads\0")?,
             gp_split_heads: load_symbol(&lib, b"gp_split_heads\0")?,
             gp_rope_neox: load_symbol(&lib, b"gp_rope_neox\0")?,
@@ -304,7 +492,11 @@ fn load_cuda_api() -> std::result::Result<CudaApi, String> {
             gp_mean_pool: load_symbol(&lib, b"gp_mean_pool\0")?,
             gp_l2_norm: load_symbol(&lib, b"gp_l2_norm\0")?,
             gp_mmq_matmul: load_symbol(&lib, b"gp_mmq_matmul\0")?,
+            gp_mmq_quantize: load_symbol(&lib, b"gp_mmq_quantize\0")?,
+            gp_mmq_matmul_q8: load_symbol(&lib, b"gp_mmq_matmul_q8\0")?,
             gp_mmvq_matvec: load_symbol(&lib, b"gp_mmvq_matvec\0")?,
+            gp_mmvq_quantize: load_symbol(&lib, b"gp_mmvq_quantize\0")?,
+            gp_mmvq_matvec_q8: load_symbol(&lib, b"gp_mmvq_matvec_q8\0")?,
             _lib: lib,
         })
     }
@@ -408,6 +600,36 @@ impl CudaDevice {
         Ok((free, total))
     }
 
+    pub fn begin_graph_capture(&self) -> Result<()> {
+        let api = cuda_api()?;
+        check(
+            unsafe { (api.gp_cuda_graph_begin)(self.stream()) },
+            "cuda graph begin capture",
+        )
+    }
+
+    pub fn end_graph_capture(&self) -> Result<CudaGraph> {
+        let api = cuda_api()?;
+        let mut graph = std::ptr::null_mut();
+        let mut exec = std::ptr::null_mut();
+        check(
+            unsafe { (api.gp_cuda_graph_end)(self.stream(), &mut graph, &mut exec) },
+            "cuda graph end capture",
+        )?;
+        let graph = NonNull::new(graph)
+            .ok_or_else(|| Error::InvalidGguf("CUDA graph capture returned null graph".into()))?;
+        let exec = NonNull::new(exec).ok_or_else(|| {
+            Error::InvalidGguf("CUDA graph capture returned null executable".into())
+        })?;
+        Ok(CudaGraph { graph, exec })
+    }
+
+    pub fn abort_graph_capture(&self) {
+        if let Ok(api) = cuda_api() {
+            let _ = unsafe { (api.gp_cuda_graph_abort)(self.stream()) };
+        }
+    }
+
     pub fn alloc(&self, bytes: usize) -> Result<DeviceBuffer> {
         let api = cuda_api()?;
         let mut ptr = std::ptr::null_mut();
@@ -492,6 +714,32 @@ impl CudaDevice {
             unsafe { (api.gp_cuda_memset_async)(dst.ptr(), value, dst.bytes, self.stream()) },
             "cuda memset",
         )
+    }
+}
+
+pub struct CudaGraph {
+    graph: NonNull<c_void>,
+    exec: NonNull<c_void>,
+}
+
+unsafe impl Send for CudaGraph {}
+unsafe impl Sync for CudaGraph {}
+
+impl CudaGraph {
+    pub fn launch(&self, device: &CudaDevice) -> Result<()> {
+        let api = cuda_api()?;
+        check(
+            unsafe { (api.gp_cuda_graph_launch)(self.exec.as_ptr(), device.stream()) },
+            "cuda graph launch",
+        )
+    }
+}
+
+impl Drop for CudaGraph {
+    fn drop(&mut self) {
+        if let Ok(api) = cuda_api() {
+            let _ = unsafe { (api.gp_cuda_graph_destroy)(self.graph.as_ptr(), self.exec.as_ptr()) };
+        }
     }
 }
 
@@ -1433,6 +1681,39 @@ pub unsafe fn gp_qwen_add_rms_norm(
     }
 }
 
+pub unsafe fn gp_qwen_rms_norm_q8(
+    src: *const f32,
+    weight: *const f32,
+    q8_out: *mut c_void,
+    dim: i32,
+    eps: f32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe { (api.gp_qwen_rms_norm_q8)(src, weight, q8_out, dim, eps, stream) },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_add_rms_norm_q8(
+    lhs: *const f32,
+    rhs: *const f32,
+    weight: *const f32,
+    sum_out: *mut f32,
+    q8_out: *mut c_void,
+    dim: i32,
+    eps: f32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_add_rms_norm_q8)(lhs, rhs, weight, sum_out, q8_out, dim, eps, stream)
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gp_qwen_causal_conv1d_silu(
     values: *mut f32,
@@ -1450,6 +1731,47 @@ pub unsafe fn gp_qwen_causal_conv1d_silu(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_causal_conv1d_silu_rows(
+    values: *mut f32,
+    weights: *const f32,
+    state: *mut f32,
+    rows: i32,
+    channels: i32,
+    kernel: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_causal_conv1d_silu_rows)(
+                values, weights, state, rows, channels, kernel, stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_causal_conv1d_silu_rows_parallel(
+    values: *const f32,
+    weights: *const f32,
+    state: *mut f32,
+    out: *mut f32,
+    rows: i32,
+    channels: i32,
+    kernel: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_causal_conv1d_silu_rows_parallel)(
+                values, weights, state, out, rows, channels, kernel, stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
 pub unsafe fn gp_qwen_normalize_linear_qk(
     q: *mut f32,
     k: *mut f32,
@@ -1460,6 +1782,28 @@ pub unsafe fn gp_qwen_normalize_linear_qk(
 ) -> i32 {
     match cuda_api() {
         Ok(api) => unsafe { (api.gp_qwen_normalize_linear_qk)(q, k, heads, head_dim, eps, stream) },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_normalize_linear_qk_rows(
+    q: *mut f32,
+    k: *mut f32,
+    rows: i32,
+    heads: i32,
+    head_dim: i32,
+    q_stride: i32,
+    k_stride: i32,
+    eps: f32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_normalize_linear_qk_rows)(
+                q, k, rows, heads, head_dim, q_stride, k_stride, eps, stream,
+            )
+        },
         Err(_) => CUDA_BACKEND_UNAVAILABLE,
     }
 }
@@ -1596,6 +1940,56 @@ pub unsafe fn gp_qwen_deltanet_decode(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_deltanet_decode_rows(
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    beta: *const f32,
+    alpha: *const f32,
+    a_log: *const f32,
+    dt_bias: *const f32,
+    state: *mut f32,
+    out: *mut f32,
+    rows: i32,
+    heads: i32,
+    head_dim: i32,
+    q_stride: i32,
+    k_stride: i32,
+    v_stride: i32,
+    beta_stride: i32,
+    alpha_stride: i32,
+    out_stride: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_deltanet_decode_rows)(
+                q,
+                k,
+                v,
+                beta,
+                alpha,
+                a_log,
+                dt_bias,
+                state,
+                out,
+                rows,
+                heads,
+                head_dim,
+                q_stride,
+                k_stride,
+                v_stride,
+                beta_stride,
+                alpha_stride,
+                out_stride,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn gp_qwen_rope_decode(
     values: *mut f32,
     heads: i32,
@@ -1616,6 +2010,48 @@ pub unsafe fn gp_qwen_rope_decode(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_rope_decode_position(
+    values: *mut f32,
+    heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    position: *const i32,
+    base_freq: f32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_rope_decode_position)(
+                values, heads, head_dim, rope_dim, position, base_freq, stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_rope_rows(
+    values: *mut f32,
+    rows: i32,
+    heads: i32,
+    head_dim: i32,
+    rope_dim: i32,
+    position: i32,
+    row_stride: i32,
+    base_freq: f32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_rope_rows)(
+                values, rows, heads, head_dim, rope_dim, position, row_stride, base_freq, stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn gp_qwen_cache_write(
     src: *const f32,
     cache: *mut f32,
@@ -1628,6 +2064,62 @@ pub unsafe fn gp_qwen_cache_write(
     match cuda_api() {
         Ok(api) => unsafe {
             (api.gp_qwen_cache_write)(src, cache, position, heads, head_dim, max_context, stream)
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_cache_write_position(
+    src: *const f32,
+    cache: *mut f32,
+    position: *const i32,
+    heads: i32,
+    head_dim: i32,
+    max_context: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_cache_write_position)(
+                src,
+                cache,
+                position,
+                heads,
+                head_dim,
+                max_context,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_cache_write_rows(
+    src: *const f32,
+    cache: *mut f32,
+    rows: i32,
+    position: i32,
+    heads: i32,
+    head_dim: i32,
+    max_context: i32,
+    src_stride: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_cache_write_rows)(
+                src,
+                cache,
+                rows,
+                position,
+                heads,
+                head_dim,
+                max_context,
+                src_stride,
+                stream,
+            )
         },
         Err(_) => CUDA_BACKEND_UNAVAILABLE,
     }
@@ -1703,6 +2195,128 @@ pub unsafe fn gp_qwen_attention_values_decode(
                 kv_heads,
                 value_dim,
                 max_context,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_attention_scores_decode_position(
+    q: *const f32,
+    k_cache: *const f32,
+    scores: *mut f32,
+    position: *const i32,
+    q_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    max_context: i32,
+    scale: f32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_attention_scores_decode_position)(
+                q,
+                k_cache,
+                scores,
+                position,
+                q_heads,
+                kv_heads,
+                head_dim,
+                max_context,
+                scale,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+pub unsafe fn gp_qwen_softmax_decode_position(
+    scores: *mut f32,
+    position: *const i32,
+    heads: i32,
+    max_context: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_softmax_decode_position)(scores, position, heads, max_context, stream)
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_attention_values_decode_position(
+    scores: *const f32,
+    v_cache: *const f32,
+    out: *mut f32,
+    position: *const i32,
+    q_heads: i32,
+    kv_heads: i32,
+    value_dim: i32,
+    max_context: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_attention_values_decode_position)(
+                scores,
+                v_cache,
+                out,
+                position,
+                q_heads,
+                kv_heads,
+                value_dim,
+                max_context,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+pub unsafe fn gp_qwen_increment_position(position: *mut i32, stream: *mut c_void) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe { (api.gp_qwen_increment_position)(position, stream) },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_qwen_attention_rows_fused(
+    q: *const f32,
+    k_cache: *const f32,
+    v_cache: *const f32,
+    out: *mut f32,
+    rows: i32,
+    position: i32,
+    q_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    value_dim: i32,
+    max_context: i32,
+    q_stride: i32,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_qwen_attention_rows_fused)(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                rows,
+                position,
+                q_heads,
+                kv_heads,
+                head_dim,
+                value_dim,
+                max_context,
+                q_stride,
                 stream,
             )
         },
@@ -1929,6 +2543,54 @@ pub unsafe fn gp_mmq_matmul(
     }
 }
 
+pub unsafe fn gp_mmq_quantize(
+    dtype: i32,
+    src: *const f32,
+    q8_scratch: *mut c_void,
+    ncols_x: i64,
+    ncols_dst: i64,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_mmq_quantize)(dtype, src, q8_scratch, ncols_x, ncols_dst, stream)
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_mmq_matmul_q8(
+    dtype: i32,
+    weights: *const c_void,
+    dst: *mut f32,
+    q8_scratch: *mut c_void,
+    fixup_scratch: *mut c_void,
+    ncols_x: i64,
+    stride_row_x: i64,
+    nrows_x: i64,
+    ncols_dst: i64,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_mmq_matmul_q8)(
+                dtype,
+                weights,
+                dst,
+                q8_scratch,
+                fixup_scratch,
+                ncols_x,
+                stride_row_x,
+                nrows_x,
+                ncols_dst,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn gp_mmvq_matvec(
     dtype: i32,
@@ -1947,6 +2609,46 @@ pub unsafe fn gp_mmvq_matvec(
                 dtype,
                 weights,
                 src,
+                dst,
+                q8_scratch,
+                ncols_x,
+                stride_row_x,
+                nrows_x,
+                stream,
+            )
+        },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+pub unsafe fn gp_mmvq_quantize(
+    src: *const f32,
+    q8_scratch: *mut c_void,
+    ncols_x: i64,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe { (api.gp_mmvq_quantize)(src, q8_scratch, ncols_x, stream) },
+        Err(_) => CUDA_BACKEND_UNAVAILABLE,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn gp_mmvq_matvec_q8(
+    dtype: i32,
+    weights: *const c_void,
+    dst: *mut f32,
+    q8_scratch: *mut c_void,
+    ncols_x: i64,
+    stride_row_x: i64,
+    nrows_x: i64,
+    stream: *mut c_void,
+) -> i32 {
+    match cuda_api() {
+        Ok(api) => unsafe {
+            (api.gp_mmvq_matvec_q8)(
+                dtype,
+                weights,
                 dst,
                 q8_scratch,
                 ncols_x,
