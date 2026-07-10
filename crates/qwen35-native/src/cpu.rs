@@ -3,6 +3,7 @@ use std::hash::{Hash, Hasher};
 
 use greppy_embed_native::matmul::QuantMatrix;
 use greppy_embed_native::GgufModel;
+use rayon::prelude::*;
 use tokenizers::Tokenizer;
 
 use crate::inventory::Qwen35Inventory;
@@ -248,6 +249,89 @@ impl CpuQwen35Model {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn profile_prefill_tokens(
+        &self,
+        tokens: &[u32],
+        state: &mut ForwardState,
+    ) -> Result<()> {
+        if tokens.is_empty() {
+            return Ok(());
+        }
+        if state.position.saturating_add(tokens.len()) > state.max_context {
+            return Err(Error::InvalidRequest(format!(
+                "qwen35 prompt exceeds local context cap {}",
+                state.max_context
+            )));
+        }
+        let rows = tokens.len();
+        let start_position = state.position;
+        let total_start = std::time::Instant::now();
+        let stage_start = std::time::Instant::now();
+        let mut hidden = self.token_embd.embedding_rows(tokens)?;
+        eprintln!(
+            "cpu_prefill_profile stage=embed rows={rows} ms={:.3}",
+            stage_start.elapsed().as_secs_f64() * 1.0e3
+        );
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let kind = match &layer.kind {
+                LayerKind::Delta(_) => "delta",
+                LayerKind::Full(_) => "full",
+            };
+            let layer_start = std::time::Instant::now();
+            let stage_start = std::time::Instant::now();
+            let residual = hidden.clone();
+            rms_norm_rows_qwen(&mut hidden, &layer.attn_norm, self.inventory.hidden_size);
+            let norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            let attn = match (&layer.kind, &mut state.layer_states[idx]) {
+                (LayerKind::Delta(weights), LayerState::Delta(runtime)) => {
+                    self.delta_block_rows(weights, runtime, &hidden, rows)?
+                }
+                (LayerKind::Full(weights), LayerState::Full(runtime)) => {
+                    self.full_attention_block_rows(weights, runtime, start_position, &hidden, rows)?
+                }
+                _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
+            };
+            let attention_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            add_rows(&mut hidden, &residual, &attn);
+            let residual_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            let residual = hidden.clone();
+            rms_norm_rows_qwen(
+                &mut hidden,
+                &layer.post_attention_norm,
+                self.inventory.hidden_size,
+            );
+            let post_norm_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            let ffn = self.ffn_rows(layer, &hidden, rows)?;
+            let ffn_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+
+            let stage_start = std::time::Instant::now();
+            add_rows(&mut hidden, &residual, &ffn);
+            let ffn_add_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+            eprintln!(
+                "cpu_prefill_profile stage=layer layer={idx} kind={kind} total_ms={:.3} norm_ms={norm_ms:.3} attention_ms={attention_ms:.3} residual_ms={residual_ms:.3} post_norm_ms={post_norm_ms:.3} ffn_ms={ffn_ms:.3} ffn_add_ms={ffn_add_ms:.3}",
+                layer_start.elapsed().as_secs_f64() * 1.0e3,
+            );
+        }
+        state.position += rows;
+        let total_secs = total_start.elapsed().as_secs_f64();
+        eprintln!(
+            "cpu_prefill_profile stage=total rows={rows} ms={:.3} tok_s={:.2}",
+            total_secs * 1.0e3,
+            rows as f64 / total_secs.max(1.0e-9),
+        );
+        Ok(())
+    }
+
     pub(crate) fn forward_token_logits(
         &self,
         token: u32,
@@ -301,12 +385,36 @@ impl CpuQwen35Model {
     }
 
     fn ffn_rows(&self, layer: &LayerWeights, hidden: &[f32], rows: usize) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        let profile = std::env::var_os("QWEN35_NATIVE_CPU_PROFILE_STAGES").is_some();
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
         let mut gate = layer.ffn_gate.matmul(hidden, rows)?;
+        #[cfg(test)]
+        let gate_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
         let up = layer.ffn_up.matmul(hidden, rows)?;
+        #[cfg(test)]
+        let up_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
         for (gate, up) in gate.iter_mut().zip(up) {
             *gate = silu(*gate) * up;
         }
-        layer.ffn_down.matmul(&gate, rows).map_err(Into::into)
+        #[cfg(test)]
+        let activation_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+        let out = layer.ffn_down.matmul(&gate, rows)?;
+        #[cfg(test)]
+        if profile {
+            eprintln!(
+                "cpu_ffn_stage rows={rows} gate_ms={gate_ms:.3} up_ms={up_ms:.3} activation_ms={activation_ms:.3} down_ms={:.3}",
+                stage_start.elapsed().as_secs_f64() * 1.0e3,
+            );
+        }
+        Ok(out)
     }
 
     fn delta_block_rows(
@@ -316,57 +424,106 @@ impl CpuQwen35Model {
         hidden: &[f32],
         rows: usize,
     ) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        let profile = std::env::var_os("QWEN35_NATIVE_CPU_PROFILE_STAGES").is_some();
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
         let inner = self.inventory.ssm_inner_size;
         let mut qkv = weights.attn_qkv.matmul(hidden, rows)?;
         let z = weights.attn_gate.matmul(hidden, rows)?;
         let beta = weights.ssm_beta.matmul(hidden, rows)?;
         let alpha = weights.ssm_alpha.matmul(hidden, rows)?;
-        let mut out = vec![0.0f32; rows * inner];
+        let mut scan_params = vec![(0.0f32, 0.0f32); rows * LINEAR_HEADS];
+        #[cfg(test)]
+        let projection_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
 
         for row in 0..rows {
             let qkv_row = &mut qkv[row * inner * 3..(row + 1) * inner * 3];
             causal_conv1d_silu(qkv_row, &weights.ssm_conv1d, &mut state.conv);
             let (q, rest) = qkv_row.split_at_mut(inner);
-            let (k, v) = rest.split_at_mut(inner);
+            let (k, _) = rest.split_at_mut(inner);
             normalize_linear_qk(q, k);
-            let out_row = &mut out[row * inner..(row + 1) * inner];
-            let z_row = &z[row * inner..(row + 1) * inner];
             let beta_row = &beta[row * LINEAR_HEADS..(row + 1) * LINEAR_HEADS];
             let alpha_row = &alpha[row * LINEAR_HEADS..(row + 1) * LINEAR_HEADS];
-
             for head in 0..LINEAR_HEADS {
-                let base = head * LINEAR_HEAD_DIM;
-                let qh = &q[base..base + LINEAR_HEAD_DIM];
-                let kh = &k[base..base + LINEAR_HEAD_DIM];
-                let vh = &v[base..base + LINEAR_HEAD_DIM];
-                let oh = &mut out_row[base..base + LINEAR_HEAD_DIM];
-                let recurrent = &mut state.recurrent[head * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM
-                    ..(head + 1) * LINEAR_HEAD_DIM * LINEAR_HEAD_DIM];
                 let beta_h = sigmoid(beta_row[head]);
                 let decay = (-weights.ssm_a[head].exp()
                     * softplus(alpha_row[head] + weights.ssm_dt_bias[head]))
                 .exp()
                 .clamp(0.0, 1.0);
-                for value_idx in 0..LINEAR_HEAD_DIM {
-                    let recurrent_row = &mut recurrent
-                        [value_idx * LINEAR_HEAD_DIM..(value_idx + 1) * LINEAR_HEAD_DIM];
+                scan_params[row * LINEAR_HEADS + head] = (beta_h, decay);
+            }
+        }
+        #[cfg(test)]
+        let prepare_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+
+        let mut transposed = vec![0.0f32; inner * rows];
+        state
+            .recurrent
+            .par_chunks_mut(LINEAR_HEAD_DIM)
+            .zip(transposed.par_chunks_mut(rows))
+            .enumerate()
+            .for_each(|(state_row, (recurrent_row, out_values))| {
+                let head = state_row / LINEAR_HEAD_DIM;
+                let value_idx = state_row % LINEAR_HEAD_DIM;
+                let head_base = head * LINEAR_HEAD_DIM;
+                for row in 0..rows {
+                    let qkv_base = row * inner * 3;
+                    let qh = &qkv[qkv_base + head_base..qkv_base + head_base + LINEAR_HEAD_DIM];
+                    let kh = &qkv[qkv_base + inner + head_base
+                        ..qkv_base + inner + head_base + LINEAR_HEAD_DIM];
+                    let value = qkv[qkv_base + inner * 2 + head_base + value_idx];
+                    let (beta_h, decay) = scan_params[row * LINEAR_HEADS + head];
                     let prior = dot(recurrent_row, kh);
-                    let delta = (vh[value_idx] - decay * prior) * beta_h;
+                    let delta = (value - decay * prior) * beta_h;
                     let mut attn = 0.0f32;
                     for key_idx in 0..LINEAR_HEAD_DIM {
                         recurrent_row[key_idx] =
                             decay * recurrent_row[key_idx] + kh[key_idx] * delta;
                         attn += recurrent_row[key_idx] * qh[key_idx];
                     }
-                    oh[value_idx] = attn;
+                    out_values[row] = attn;
                 }
-                rms_norm_plain(oh, &weights.ssm_norm);
-                for i in 0..LINEAR_HEAD_DIM {
-                    oh[i] *= silu(z_row[base + i]);
+            });
+        #[cfg(test)]
+        let scan_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+
+        let mut out = vec![0.0f32; rows * inner];
+        out.par_chunks_mut(inner)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let z_row = &z[row * inner..(row + 1) * inner];
+                for head in 0..LINEAR_HEADS {
+                    let base = head * LINEAR_HEAD_DIM;
+                    let values = &mut out_row[base..base + LINEAR_HEAD_DIM];
+                    for value_idx in 0..LINEAR_HEAD_DIM {
+                        values[value_idx] = transposed[(base + value_idx) * rows + row];
+                    }
+                    rms_norm_plain(values, &weights.ssm_norm);
+                    for value_idx in 0..LINEAR_HEAD_DIM {
+                        values[value_idx] *= silu(z_row[base + value_idx]);
+                    }
                 }
-            }
+            });
+        #[cfg(test)]
+        let normalize_gate_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+        let projected = weights.ssm_out.matmul(&out, rows)?;
+        #[cfg(test)]
+        if profile {
+            eprintln!(
+                "cpu_attention_stage kind=delta rows={rows} projections_ms={projection_ms:.3} prepare_ms={prepare_ms:.3} scan_ms={scan_ms:.3} normalize_gate_ms={normalize_gate_ms:.3} output_projection_ms={:.3}",
+                stage_start.elapsed().as_secs_f64() * 1.0e3,
+            );
         }
-        weights.ssm_out.matmul(&out, rows).map_err(Into::into)
+        Ok(projected)
     }
 
     fn full_attention_block_rows(
@@ -377,12 +534,22 @@ impl CpuQwen35Model {
         hidden: &[f32],
         rows: usize,
     ) -> Result<Vec<f32>> {
+        #[cfg(test)]
+        let profile = std::env::var_os("QWEN35_NATIVE_CPU_PROFILE_STAGES").is_some();
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
         let kv_k_dim = self.inventory.kv_heads * self.inventory.head_dim;
         let kv_v_dim = self.inventory.kv_heads * self.inventory.value_dim;
         let q_dim = self.inventory.attention_heads * self.inventory.head_dim;
         let q_fused = weights.attn_q.matmul(hidden, rows)?;
         let mut k = weights.attn_k.matmul(hidden, rows)?;
         let v = weights.attn_v.matmul(hidden, rows)?;
+        #[cfg(test)]
+        let projection_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+        let mut q = vec![0.0f32; rows * q_dim];
+        let mut q_gate = vec![0.0f32; rows * q_dim];
         let mut attn_out =
             vec![0.0f32; rows * self.inventory.attention_heads * self.inventory.value_dim];
         let gqa = self.inventory.attention_heads / self.inventory.kv_heads;
@@ -391,17 +558,23 @@ impl CpuQwen35Model {
         for row in 0..rows {
             let position = start_position + row;
             let packed = &q_fused[row * q_dim * 2..(row + 1) * q_dim * 2];
-            let (mut q, q_gate) = split_full_attention_q_gate(
-                packed,
-                self.inventory.attention_heads,
-                self.inventory.head_dim,
-            );
+            let q_row = &mut q[row * q_dim..(row + 1) * q_dim];
+            let q_gate_row = &mut q_gate[row * q_dim..(row + 1) * q_dim];
+            for head in 0..self.inventory.attention_heads {
+                let src = head * self.inventory.head_dim * 2;
+                let dst = head * self.inventory.head_dim;
+                q_row[dst..dst + self.inventory.head_dim]
+                    .copy_from_slice(&packed[src..src + self.inventory.head_dim]);
+                q_gate_row[dst..dst + self.inventory.head_dim].copy_from_slice(
+                    &packed[src + self.inventory.head_dim..src + self.inventory.head_dim * 2],
+                );
+            }
             let k_row = &mut k[row * kv_k_dim..(row + 1) * kv_k_dim];
             let v_row = &v[row * kv_v_dim..(row + 1) * kv_v_dim];
             for head in 0..self.inventory.attention_heads {
                 let off = head * self.inventory.head_dim;
                 rms_norm_qwen(
-                    &mut q[off..off + self.inventory.head_dim],
+                    &mut q_row[off..off + self.inventory.head_dim],
                     &weights.attn_q_norm,
                 );
             }
@@ -413,7 +586,7 @@ impl CpuQwen35Model {
                 );
             }
             apply_rope(
-                &mut q,
+                q_row,
                 position,
                 self.inventory.head_dim,
                 self.inventory.rope_dim,
@@ -428,38 +601,62 @@ impl CpuQwen35Model {
             state.k_cache[k_off..k_off + kv_k_dim].copy_from_slice(k_row);
             let v_off = position * kv_v_dim;
             state.v_cache[v_off..v_off + kv_v_dim].copy_from_slice(v_row);
+        }
+        #[cfg(test)]
+        let prepare_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
 
-            let out_row = &mut attn_out[row * q_dim..(row + 1) * q_dim];
-            for head in 0..self.inventory.attention_heads {
-                let kv_head = head / gqa;
-                let qh = &q[head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
-                let mut scores = Vec::with_capacity(position + 1);
-                for pos in 0..=position {
-                    let key_base = pos * kv_k_dim + kv_head * self.inventory.head_dim;
-                    let kh = &state.k_cache[key_base..key_base + self.inventory.head_dim];
-                    scores.push(dot(qh, kh) * score_scale);
-                }
-                softmax_in_place(&mut scores);
-                let dst = &mut out_row
-                    [head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
-                for (pos, score) in scores.iter().copied().enumerate() {
-                    let value_base = pos * kv_v_dim + kv_head * self.inventory.value_dim;
-                    let vh = &state.v_cache[value_base..value_base + self.inventory.value_dim];
+        attn_out
+            .par_chunks_mut(q_dim)
+            .enumerate()
+            .for_each(|(row, out_row)| {
+                let position = start_position + row;
+                let q_row = &q[row * q_dim..(row + 1) * q_dim];
+                let q_gate_row = &q_gate[row * q_dim..(row + 1) * q_dim];
+                for head in 0..self.inventory.attention_heads {
+                    let kv_head = head / gqa;
+                    let qh = &q_row
+                        [head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
+                    let mut scores = Vec::with_capacity(position + 1);
+                    for pos in 0..=position {
+                        let key_base = pos * kv_k_dim + kv_head * self.inventory.head_dim;
+                        let kh = &state.k_cache[key_base..key_base + self.inventory.head_dim];
+                        scores.push(dot(qh, kh) * score_scale);
+                    }
+                    softmax_in_place(&mut scores);
+                    let dst = &mut out_row
+                        [head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
+                    for (pos, score) in scores.iter().copied().enumerate() {
+                        let value_base = pos * kv_v_dim + kv_head * self.inventory.value_dim;
+                        let vh = &state.v_cache[value_base..value_base + self.inventory.value_dim];
+                        for i in 0..self.inventory.value_dim {
+                            dst[i] += score * vh[i];
+                        }
+                    }
+                    let gate = &q_gate_row
+                        [head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
                     for i in 0..self.inventory.value_dim {
-                        dst[i] += score * vh[i];
+                        dst[i] *= sigmoid(gate[i]);
                     }
                 }
-                let gate =
-                    &q_gate[head * self.inventory.value_dim..(head + 1) * self.inventory.value_dim];
-                for i in 0..self.inventory.value_dim {
-                    dst[i] *= sigmoid(gate[i]);
-                }
-            }
-        }
-        weights
+            });
+        #[cfg(test)]
+        let attention_ms = stage_start.elapsed().as_secs_f64() * 1.0e3;
+        #[cfg(test)]
+        let stage_start = std::time::Instant::now();
+        let projected = weights
             .attn_output
             .matmul(&attn_out, rows)
-            .map_err(Into::into)
+            .map_err(Error::from)?;
+        #[cfg(test)]
+        if profile {
+            eprintln!(
+                "cpu_attention_stage kind=full rows={rows} projections_ms={projection_ms:.3} prepare_ms={prepare_ms:.3} attention_ms={attention_ms:.3} output_projection_ms={:.3}",
+                stage_start.elapsed().as_secs_f64() * 1.0e3,
+            );
+        }
+        Ok(projected)
     }
 
     fn delta_block(

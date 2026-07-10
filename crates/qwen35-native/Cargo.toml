@@ -9,6 +9,7 @@ description = "Native Qwen3.5-0.8B summarizer contract for greppy brief."
 
 [dependencies]
 greppy-embed-native = { path = "../embed-native" }
+rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

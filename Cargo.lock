@@ -822,6 +822,7 @@ name = "greppy-qwen35-native"
 version = "0.1.2"
 dependencies = [
  "greppy-embed-native",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

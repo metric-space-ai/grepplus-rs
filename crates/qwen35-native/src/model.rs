@@ -755,6 +755,40 @@ mod cpu_perf_tests {
         );
     }
 
+    #[test]
+    #[ignore = "diagnostic CPU layer profile"]
+    fn qwen35_cpu_prefill_profile_when_env_set() {
+        let (Some(gguf), Some(tokenizer)) = (
+            std::env::var_os("QWEN35_NATIVE_GGUF"),
+            std::env::var_os("QWEN35_NATIVE_TOKENIZER"),
+        ) else {
+            eprintln!("skipping CPU profile: QWEN35_NATIVE_GGUF/TOKENIZER unset");
+            return;
+        };
+        let rows = perf_env_usize("QWEN35_NATIVE_CPU_PROFILE_ROWS", 511).clamp(1, 512);
+        let summarizer = Qwen35Summarizer::load_gguf(
+            gguf,
+            tokenizer,
+            LoadOptions {
+                device: DevicePreference::Cpu,
+            },
+        )
+        .expect("load CPU Qwen3.5 summarizer");
+        let model = match &summarizer.backend {
+            Backend::Cpu(model) => model,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(_) => panic!("expected CPU backend"),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(_) => panic!("expected CPU backend"),
+        };
+        let prompt_ids = perf_prompt_ids(&summarizer.tokenizer, rows + 1);
+        let tokens = &prompt_ids[..rows.min(prompt_ids.len())];
+        let mut state = model.new_state(tokens.len() + 1);
+        model
+            .profile_prefill_tokens(tokens, &mut state)
+            .expect("CPU profile prefill");
+    }
+
     fn perf_env_usize(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()

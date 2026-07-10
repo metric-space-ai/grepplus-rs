@@ -48,6 +48,7 @@ pub fn cpu_simd_backend() -> &'static str {
 enum X86KernelKind {
     Scalar,
     Avx2,
+    AvxVnni,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -56,7 +57,12 @@ impl X86KernelKind {
         match self {
             Self::Scalar => "scalar",
             Self::Avx2 => "avx2",
+            Self::AvxVnni => "avx-vnni",
         }
+    }
+
+    fn has_avx2(self) -> bool {
+        matches!(self, Self::Avx2 | Self::AvxVnni)
     }
 }
 
@@ -70,10 +76,15 @@ fn x86_kernel_kind() -> X86KernelKind {
         match requested.as_deref() {
             Some("scalar" | "none" | "off" | "0") => return X86KernelKind::Scalar,
             Some("avx2") if is_x86_feature_detected!("avx2") => return X86KernelKind::Avx2,
+            Some("avx-vnni" | "avxvnni" | "vnni") if is_x86_feature_detected!("avxvnni") => {
+                return X86KernelKind::AvxVnni;
+            }
             _ => {}
         }
 
-        if is_x86_feature_detected!("avx2") {
+        if is_x86_feature_detected!("avxvnni") {
+            X86KernelKind::AvxVnni
+        } else if is_x86_feature_detected!("avx2") {
             X86KernelKind::Avx2
         } else {
             X86KernelKind::Scalar
@@ -143,6 +154,15 @@ struct BlockQ8K {
     d: f32,
     qs: [i8; QK_K],
     bsums: [i16; QK_K / 16],
+}
+
+#[cfg(target_arch = "aarch64")]
+#[derive(Debug, Clone)]
+#[repr(C)]
+struct BlockQ8Kx4 {
+    d: [f32; 4],
+    qs: [i8; QK_K * 4],
+    bsums: [i16; QK_K / 4],
 }
 
 #[derive(Debug, Clone)]
@@ -308,6 +328,8 @@ impl QuantMatrix {
                     let xq = quantize_q8k(lhs);
                     #[cfg(target_arch = "aarch64")]
                     let used_x8 = if let Some(x8) = x8 {
+                        let xq_i8mm = std::arch::is_aarch64_feature_detected!("i8mm")
+                            .then(|| pack_q8kx4_repeated(&xq));
                         out.par_chunks_mut(64)
                             .enumerate()
                             .for_each(|(chunk_idx, dst)| {
@@ -315,7 +337,12 @@ impl QuantMatrix {
                                 for (local_group, values) in dst.chunks_exact_mut(8).enumerate() {
                                     let group = first_group + local_group;
                                     let y = &x8[group * row_blocks..(group + 1) * row_blocks];
-                                    values.copy_from_slice(unsafe { &dot8_q4k_q8k_neon(y, &xq) });
+                                    let tile = if let Some(xq_i8mm) = &xq_i8mm {
+                                        unsafe { dot8x4_q4k_q8k_neon(y, xq_i8mm)[0] }
+                                    } else {
+                                        unsafe { dot8_q4k_q8k_neon(y, &xq) }
+                                    };
+                                    values.copy_from_slice(&tile);
                                 }
                             });
                         true
@@ -360,9 +387,15 @@ impl QuantMatrix {
                             let xq = quantize_q8k(x);
                             #[cfg(target_arch = "aarch64")]
                             if let Some(x8) = x8 {
+                                let xq_i8mm = std::arch::is_aarch64_feature_detected!("i8mm")
+                                    .then(|| pack_q8kx4_repeated(&xq));
                                 for group in 0..self.rows / 8 {
                                     let y = &x8[group * row_blocks..(group + 1) * row_blocks];
-                                    let values = unsafe { dot8_q4k_q8k_neon(y, &xq) };
+                                    let values = if let Some(xq_i8mm) = &xq_i8mm {
+                                        unsafe { dot8x4_q4k_q8k_neon(y, xq_i8mm)[0] }
+                                    } else {
+                                        unsafe { dot8_q4k_q8k_neon(y, &xq) }
+                                    };
                                     dst[group * 8..group * 8 + 8].copy_from_slice(&values);
                                 }
                                 return;
@@ -666,6 +699,10 @@ fn matmul_q4k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    #[cfg(target_arch = "x86_64")]
+    if x86_kernel_kind() == X86KernelKind::AvxVnni {
+        return matmul_q4k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+    }
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
     let chunk_values = 64 * lhs_rows;
     transposed
@@ -700,6 +737,72 @@ fn matmul_q4k_batched(
     transpose_batched_output(&transposed, lhs_rows, matrix_rows)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn matmul_q4k_batched_avxvnni(
+    rhs: &[BlockQ4K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
+    let tiled_input_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let weights = [
+                    &rhs[output_row * row_blocks..(output_row + 1) * row_blocks],
+                    &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks],
+                    &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks],
+                    &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks],
+                ];
+                for input_row in (0..tiled_input_rows).step_by(4) {
+                    let inputs = [
+                        activations[input_row].as_slice(),
+                        activations[input_row + 1].as_slice(),
+                        activations[input_row + 2].as_slice(),
+                        activations[input_row + 3].as_slice(),
+                    ];
+                    let values = unsafe { dot4x4_q4k_q8k_avxvnni(weights, inputs) };
+                    for input_lane in 0..4 {
+                        for output_lane in 0..4 {
+                            chunk[(local + output_lane) * lhs_rows + input_row + input_lane] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for input_row in tiled_input_rows..lhs_rows {
+                    let (d0, d1, d2, d3) = dot4_q4k_q8k(
+                        weights[0],
+                        weights[1],
+                        weights[2],
+                        weights[3],
+                        &activations[input_row],
+                    );
+                    chunk[local * lhs_rows + input_row] = d0;
+                    chunk[(local + 1) * lhs_rows + input_row] = d1;
+                    chunk[(local + 2) * lhs_rows + input_row] = d2;
+                    chunk[(local + 3) * lhs_rows + input_row] = d3;
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let weights = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q4k_q8k(weights, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
 #[cfg(target_arch = "aarch64")]
 fn matmul_q4kx8_batched(
     rhs: &[BlockQ4Kx8],
@@ -709,10 +812,22 @@ fn matmul_q4kx8_batched(
     matrix_cols: usize,
 ) -> Vec<f32> {
     let row_blocks = matrix_cols / QK_K;
-    let activations = lhs
+    let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+    let tiled_rows = if use_i8mm { lhs_rows & !3 } else { 0 };
+    let activation_tiles = lhs[..tiled_rows * matrix_cols]
+        .par_chunks(matrix_cols * 4)
+        .map(|rows| quantize_q8kx4(rows, matrix_cols))
+        .collect::<Vec<_>>();
+    let tail_activations = lhs[tiled_rows * matrix_cols..]
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    let tail_tiles = use_i8mm.then(|| {
+        tail_activations
+            .iter()
+            .map(|row| pack_q8kx4_repeated(row))
+            .collect::<Vec<_>>()
+    });
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
     let chunk_values = 64 * lhs_rows;
     transposed
@@ -723,8 +838,23 @@ fn matmul_q4kx8_batched(
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                for (input_row, xq) in activations.iter().enumerate() {
-                    let values = unsafe { dot8_q4k_q8k_neon(weights, xq) };
+                for (input_tile, xq) in activation_tiles.iter().enumerate() {
+                    let values = unsafe { dot8x4_q4k_q8k_neon(weights, xq) };
+                    for input_lane in 0..4 {
+                        let input_row = input_tile * 4 + input_lane;
+                        for output_lane in 0..8 {
+                            group_dst[output_lane * lhs_rows + input_row] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for (tail_lane, xq) in tail_activations.iter().enumerate() {
+                    let input_row = tiled_rows + tail_lane;
+                    let values = if let Some(tail_tiles) = &tail_tiles {
+                        unsafe { dot8x4_q4k_q8k_neon(weights, &tail_tiles[tail_lane])[0] }
+                    } else {
+                        unsafe { dot8_q4k_q8k_neon(weights, xq) }
+                    };
                     for output_lane in 0..8 {
                         group_dst[output_lane * lhs_rows + input_row] = values[output_lane];
                     }
@@ -746,6 +876,10 @@ fn matmul_q6k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    #[cfg(target_arch = "x86_64")]
+    if x86_kernel_kind() == X86KernelKind::AvxVnni {
+        return matmul_q6k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+    }
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
     let chunk_values = 64 * lhs_rows;
     transposed
@@ -780,6 +914,72 @@ fn matmul_q6k_batched(
     transpose_batched_output(&transposed, lhs_rows, matrix_rows)
 }
 
+#[cfg(target_arch = "x86_64")]
+fn matmul_q6k_batched_avxvnni(
+    rhs: &[BlockQ6K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
+    let tiled_input_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let weights = [
+                    &rhs[output_row * row_blocks..(output_row + 1) * row_blocks],
+                    &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks],
+                    &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks],
+                    &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks],
+                ];
+                for input_row in (0..tiled_input_rows).step_by(4) {
+                    let inputs = [
+                        activations[input_row].as_slice(),
+                        activations[input_row + 1].as_slice(),
+                        activations[input_row + 2].as_slice(),
+                        activations[input_row + 3].as_slice(),
+                    ];
+                    let values = unsafe { dot4x4_q6k_q8k_avxvnni(weights, inputs) };
+                    for input_lane in 0..4 {
+                        for output_lane in 0..4 {
+                            chunk[(local + output_lane) * lhs_rows + input_row + input_lane] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for input_row in tiled_input_rows..lhs_rows {
+                    let (d0, d1, d2, d3) = dot4_q6k_q8k(
+                        weights[0],
+                        weights[1],
+                        weights[2],
+                        weights[3],
+                        &activations[input_row],
+                    );
+                    chunk[local * lhs_rows + input_row] = d0;
+                    chunk[(local + 1) * lhs_rows + input_row] = d1;
+                    chunk[(local + 2) * lhs_rows + input_row] = d2;
+                    chunk[(local + 3) * lhs_rows + input_row] = d3;
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let weights = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q6k_q8k(weights, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
 fn matmul_q5k_batched(
     rhs: &[BlockQ5K],
     lhs: &[f32],
@@ -792,6 +992,10 @@ fn matmul_q5k_batched(
         .par_chunks(matrix_cols)
         .map(quantize_q8k)
         .collect::<Vec<_>>();
+    #[cfg(target_arch = "x86_64")]
+    if x86_kernel_kind() == X86KernelKind::AvxVnni {
+        return matmul_q5k_batched_avxvnni(rhs, &activations, lhs_rows, matrix_rows, row_blocks);
+    }
     let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
     let chunk_values = 64 * lhs_rows;
     transposed
@@ -805,6 +1009,65 @@ fn matmul_q5k_batched(
                 let y = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
                 for (input_row, xq) in activations.iter().enumerate() {
                     chunk[local * lhs_rows + input_row] = dot_q5k_q8k(y, xq);
+                }
+            }
+        });
+    transpose_batched_output(&transposed, lhs_rows, matrix_rows)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn matmul_q5k_batched_avxvnni(
+    rhs: &[BlockQ5K],
+    activations: &[Vec<BlockQ8K>],
+    lhs_rows: usize,
+    matrix_rows: usize,
+    row_blocks: usize,
+) -> Vec<f32> {
+    let tiled_input_rows = lhs_rows & !3;
+    let mut transposed = vec![0.0f32; matrix_rows * lhs_rows];
+    let chunk_values = 64 * lhs_rows;
+    transposed
+        .par_chunks_mut(chunk_values)
+        .enumerate()
+        .for_each(|(chunk_idx, chunk)| {
+            let first = chunk_idx * 64;
+            let output_rows = chunk.len() / lhs_rows;
+            let n_quad = output_rows & !3;
+            for local in (0..n_quad).step_by(4) {
+                let output_row = first + local;
+                let weights = [
+                    &rhs[output_row * row_blocks..(output_row + 1) * row_blocks],
+                    &rhs[(output_row + 1) * row_blocks..(output_row + 2) * row_blocks],
+                    &rhs[(output_row + 2) * row_blocks..(output_row + 3) * row_blocks],
+                    &rhs[(output_row + 3) * row_blocks..(output_row + 4) * row_blocks],
+                ];
+                for input_row in (0..tiled_input_rows).step_by(4) {
+                    let inputs = [
+                        activations[input_row].as_slice(),
+                        activations[input_row + 1].as_slice(),
+                        activations[input_row + 2].as_slice(),
+                        activations[input_row + 3].as_slice(),
+                    ];
+                    let values = unsafe { dot4x4_q5k_q8k_avxvnni(weights, inputs) };
+                    for input_lane in 0..4 {
+                        for output_lane in 0..4 {
+                            chunk[(local + output_lane) * lhs_rows + input_row + input_lane] =
+                                values[input_lane][output_lane];
+                        }
+                    }
+                }
+                for input_row in tiled_input_rows..lhs_rows {
+                    for output_lane in 0..4 {
+                        chunk[(local + output_lane) * lhs_rows + input_row] =
+                            dot_q5k_q8k(weights[output_lane], &activations[input_row]);
+                    }
+                }
+            }
+            for local in n_quad..output_rows {
+                let output_row = first + local;
+                let weights = &rhs[output_row * row_blocks..(output_row + 1) * row_blocks];
+                for (input_row, xq) in activations.iter().enumerate() {
+                    chunk[local * lhs_rows + input_row] = dot_q5k_q8k(weights, xq);
                 }
             }
         });
@@ -1083,7 +1346,7 @@ fn quantize_q8k(xs: &[f32]) -> Vec<BlockQ8K> {
         return out;
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         out.resize_with(xs.len() / QK_K, || BlockQ8K {
             d: 0.0,
             qs: [0; QK_K],
@@ -1124,6 +1387,76 @@ fn quantize_q8k(xs: &[f32]) -> Vec<BlockQ8K> {
             y.d = 1.0 / iscale;
         }
         out.push(y);
+    }
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn quantize_q8kx4(xs: &[f32], row_len: usize) -> Vec<BlockQ8Kx4> {
+    debug_assert_eq!(xs.len(), row_len * 4);
+    let rows: [Vec<BlockQ8K>; 4] =
+        std::array::from_fn(|row| quantize_q8k(&xs[row * row_len..(row + 1) * row_len]));
+    let blocks = row_len / QK_K;
+    let mut out = Vec::with_capacity(blocks);
+    for block in 0..blocks {
+        let src = [
+            &rows[0][block],
+            &rows[1][block],
+            &rows[2][block],
+            &rows[3][block],
+        ];
+        let mut packed = BlockQ8Kx4 {
+            d: std::array::from_fn(|row| src[row].d),
+            qs: [0; QK_K * 4],
+            bsums: [0; QK_K / 4],
+        };
+        for chunk in 0..QK_K / 8 {
+            for row in 0..4 {
+                let src_offset = chunk * 8;
+                let dst_offset = (chunk * 4 + row) * 8;
+                packed.qs[dst_offset..dst_offset + 8]
+                    .copy_from_slice(&src[row].qs[src_offset..src_offset + 8]);
+            }
+        }
+        for quarter in 0..4 {
+            for row in 0..4 {
+                let src_offset = quarter * 4;
+                let dst_offset = quarter * 16 + row * 4;
+                packed.bsums[dst_offset..dst_offset + 4]
+                    .copy_from_slice(&src[row].bsums[src_offset..src_offset + 4]);
+            }
+        }
+        out.push(packed);
+    }
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn pack_q8kx4_repeated(row: &[BlockQ8K]) -> Vec<BlockQ8Kx4> {
+    let mut out = Vec::with_capacity(row.len());
+    for src in row {
+        let mut packed = BlockQ8Kx4 {
+            d: [src.d; 4],
+            qs: [0; QK_K * 4],
+            bsums: [0; QK_K / 4],
+        };
+        for chunk in 0..QK_K / 8 {
+            for repeated_row in 0..4 {
+                let src_offset = chunk * 8;
+                let dst_offset = (chunk * 4 + repeated_row) * 8;
+                packed.qs[dst_offset..dst_offset + 8]
+                    .copy_from_slice(&src.qs[src_offset..src_offset + 8]);
+            }
+        }
+        for quarter in 0..4 {
+            for repeated_row in 0..4 {
+                let src_offset = quarter * 4;
+                let dst_offset = quarter * 16 + repeated_row * 4;
+                packed.bsums[dst_offset..dst_offset + 4]
+                    .copy_from_slice(&src.bsums[src_offset..src_offset + 4]);
+            }
+        }
+        out.push(packed);
     }
     out
 }
@@ -1233,7 +1566,7 @@ fn dot_q4k_q8k(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
         return dot_q4k_q8k_neon(xs, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return dot_q4k_q8k_avx2(xs, ys);
         }
@@ -1320,7 +1653,7 @@ fn dot_q5k_q8k(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
     }
 
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return dot_q5k_q8k_avx2(xs, ys);
         }
@@ -1347,7 +1680,7 @@ fn dot_q6k_q8k(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
         return dot_q6k_q8k_neon(xs, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return dot_q6k_q8k_avx2(xs, ys);
         }
@@ -1416,7 +1749,7 @@ fn dot_q8_0_q8_0(xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
         return dot_q8_0_q8_0_neon(xs, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return dot_q8_0_q8_0_avx2(xs, ys);
         }
@@ -1439,7 +1772,7 @@ fn dot_q8_0_q8_0_scalar(xs: &[BlockQ8_0], ys: &[BlockQ8_0]) -> f32 {
 
 fn dot_q5_0_q8_0(xs: &[BlockQ5_0], ys: &[BlockQ8_0]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return dot_q5_0_q8_0_avx2(xs, ys);
         }
@@ -1472,7 +1805,7 @@ fn dot4_q4k_q8k(
         return dot4_q4k_q8k_neon(xs0, xs1, xs2, xs3, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return dot4_q4k_q8k_avx2(xs0, xs1, xs2, xs3, ys);
         }
@@ -1498,7 +1831,7 @@ fn dot4_q6k_q8k(
         return dot4_q6k_q8k_neon(xs0, xs1, xs2, xs3, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return (
                 dot_q6k_q8k_avx2(xs0, ys),
@@ -1814,6 +2147,20 @@ unsafe fn sdot_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "i8mm")]
+unsafe fn smmla_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
+    let mut out = acc;
+    core::arch::asm!(
+        "smmla {out:v}.4s, {a:v}.16b, {b:v}.16b",
+        out = inout(vreg) out,
+        a = in(vreg) a,
+        b = in(vreg) b,
+        options(nostack, nomem),
+    );
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn decode_q4kx8_scales(scales_in: *const u8) -> (int16x8_t, int16x8_t) {
     const KMASK1: u32 = 0x3f3f3f3f;
@@ -1833,6 +2180,166 @@ unsafe fn decode_q4kx8_scales(scales_in: *const u8) -> (int16x8_t, int16x8_t) {
         (sc_0 as u64) | ((sc_1 as u64) << 32),
     ))));
     (out_mins, out_scales)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "i8mm")]
+unsafe fn dot8x4_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
+    debug_assert!(std::arch::is_aarch64_feature_detected!("i8mm"));
+    let mut out = [[0.0f32; 8]; 4];
+    let mut acc_f32 = [[vdupq_n_f32(0.0); 2]; 4];
+    let m4b = vdupq_n_u8(0x0f);
+
+    for (q4, q8) in xs.iter().zip(ys) {
+        let paired_bsums = [
+            vpaddq_s16(
+                vld1q_s16(q8.bsums.as_ptr()),
+                vld1q_s16(q8.bsums.as_ptr().add(8)),
+            ),
+            vpaddq_s16(
+                vld1q_s16(q8.bsums.as_ptr().add(16)),
+                vld1q_s16(q8.bsums.as_ptr().add(24)),
+            ),
+            vpaddq_s16(
+                vld1q_s16(q8.bsums.as_ptr().add(32)),
+                vld1q_s16(q8.bsums.as_ptr().add(40)),
+            ),
+            vpaddq_s16(
+                vld1q_s16(q8.bsums.as_ptr().add(48)),
+                vld1q_s16(q8.bsums.as_ptr().add(56)),
+            ),
+        ];
+        let mut bsums = [[0i16; 8]; 4];
+        for quarter in 0..4 {
+            vst1q_s16(bsums[quarter].as_mut_ptr(), paired_bsums[quarter]);
+        }
+
+        let mut integer_acc = [vdupq_n_s32(0); 8];
+        let mut bias_acc = [vdupq_n_s32(0); 8];
+        for sb in 0..4 {
+            let (mins0, scales0) = decode_q4kx8_scales(q4.scales.as_ptr().add(sb * 24));
+            let (mins1, scales1) = decode_q4kx8_scales(q4.scales.as_ptr().add(sb * 24 + 12));
+            let mut scales0_arr = [0i16; 8];
+            let mut scales1_arr = [0i16; 8];
+            vst1q_s16(scales0_arr.as_mut_ptr(), scales0);
+            vst1q_s16(scales1_arr.as_mut_ptr(), scales1);
+
+            let q8_base = q8.qs.as_ptr().add(sb * QK_K);
+            let q8_rows01 = [
+                vld1q_s8(q8_base),
+                vld1q_s8(q8_base.add(32)),
+                vld1q_s8(q8_base.add(64)),
+                vld1q_s8(q8_base.add(96)),
+                vld1q_s8(q8_base.add(128)),
+                vld1q_s8(q8_base.add(160)),
+                vld1q_s8(q8_base.add(192)),
+                vld1q_s8(q8_base.add(224)),
+            ];
+            let q8_rows23 = [
+                vld1q_s8(q8_base.add(16)),
+                vld1q_s8(q8_base.add(48)),
+                vld1q_s8(q8_base.add(80)),
+                vld1q_s8(q8_base.add(112)),
+                vld1q_s8(q8_base.add(144)),
+                vld1q_s8(q8_base.add(176)),
+                vld1q_s8(q8_base.add(208)),
+                vld1q_s8(q8_base.add(240)),
+            ];
+
+            for col_pair in 0..4 {
+                let q4_base = q4.qs.as_ptr().add(sb * QK_K + col_pair * 16);
+                let raw = [
+                    vld1q_u8(q4_base),
+                    vld1q_u8(q4_base.add(64)),
+                    vld1q_u8(q4_base.add(128)),
+                    vld1q_u8(q4_base.add(192)),
+                ];
+                let low = [
+                    vreinterpretq_s8_u8(vandq_u8(raw[0], m4b)),
+                    vreinterpretq_s8_u8(vandq_u8(raw[1], m4b)),
+                    vreinterpretq_s8_u8(vandq_u8(raw[2], m4b)),
+                    vreinterpretq_s8_u8(vandq_u8(raw[3], m4b)),
+                ];
+                let high = [
+                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw[0])),
+                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw[1])),
+                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw[2])),
+                    vreinterpretq_s8_u8(vshrq_n_u8::<4>(raw[3])),
+                ];
+                let mut partial = [vdupq_n_s32(0); 4];
+                for offset in 0..4 {
+                    partial[0] = smmla_acc(partial[0], low[offset], q8_rows01[offset]);
+                    partial[1] = smmla_acc(partial[1], high[offset], q8_rows01[offset + 4]);
+                    partial[2] = smmla_acc(partial[2], low[offset], q8_rows23[offset]);
+                    partial[3] = smmla_acc(partial[3], high[offset], q8_rows23[offset + 4]);
+                }
+                let scale_offset = col_pair * 2;
+                let scale_low = vcombine_s32(
+                    vdup_n_s32(scales0_arr[scale_offset] as i32),
+                    vdup_n_s32(scales0_arr[scale_offset + 1] as i32),
+                );
+                let scale_high = vcombine_s32(
+                    vdup_n_s32(scales1_arr[scale_offset] as i32),
+                    vdup_n_s32(scales1_arr[scale_offset + 1] as i32),
+                );
+                integer_acc[col_pair] = vmlaq_s32(integer_acc[col_pair], partial[0], scale_low);
+                integer_acc[col_pair] = vmlaq_s32(integer_acc[col_pair], partial[1], scale_high);
+                integer_acc[col_pair + 4] =
+                    vmlaq_s32(integer_acc[col_pair + 4], partial[2], scale_low);
+                integer_acc[col_pair + 4] =
+                    vmlaq_s32(integer_acc[col_pair + 4], partial[3], scale_high);
+            }
+
+            for row in 0..4 {
+                let bsum_low = vdup_n_s16(bsums[sb][row * 2]);
+                let bsum_high = vdup_n_s16(bsums[sb][row * 2 + 1]);
+                bias_acc[row * 2] = vmlal_s16(bias_acc[row * 2], bsum_low, vget_low_s16(mins0));
+                bias_acc[row * 2] = vmlal_s16(bias_acc[row * 2], bsum_high, vget_low_s16(mins1));
+                bias_acc[row * 2 + 1] =
+                    vmlal_s16(bias_acc[row * 2 + 1], bsum_low, vget_high_s16(mins0));
+                bias_acc[row * 2 + 1] =
+                    vmlal_s16(bias_acc[row * 2 + 1], bsum_high, vget_high_s16(mins1));
+            }
+        }
+
+        for value in &mut integer_acc {
+            let zipped = vzip_s32(vget_low_s32(*value), vget_high_s32(*value));
+            *value = vcombine_s32(zipped.0, zipped.1);
+        }
+        let reordered = [
+            vcombine_s32(vget_low_s32(integer_acc[0]), vget_low_s32(integer_acc[1])),
+            vcombine_s32(vget_low_s32(integer_acc[2]), vget_low_s32(integer_acc[3])),
+            vcombine_s32(vget_high_s32(integer_acc[0]), vget_high_s32(integer_acc[1])),
+            vcombine_s32(vget_high_s32(integer_acc[2]), vget_high_s32(integer_acc[3])),
+            vcombine_s32(vget_low_s32(integer_acc[4]), vget_low_s32(integer_acc[5])),
+            vcombine_s32(vget_low_s32(integer_acc[6]), vget_low_s32(integer_acc[7])),
+            vcombine_s32(vget_high_s32(integer_acc[4]), vget_high_s32(integer_acc[5])),
+            vcombine_s32(vget_high_s32(integer_acc[6]), vget_high_s32(integer_acc[7])),
+        ];
+        for row in 0..4 {
+            let q8d = vdupq_n_f32(q8.d[row]);
+            for pair in 0..2 {
+                let weight_scale = load_f16x4(q4.d.as_ptr().add(pair * 4));
+                let weight_min = load_f16x4(q4.dmin.as_ptr().add(pair * 4));
+                acc_f32[row][pair] = vmlsq_f32(
+                    acc_f32[row][pair],
+                    vcvtq_f32_s32(bias_acc[row * 2 + pair]),
+                    vmulq_f32(weight_min, q8d),
+                );
+                acc_f32[row][pair] = vfmaq_f32(
+                    acc_f32[row][pair],
+                    vmulq_f32(weight_scale, q8d),
+                    vcvtq_f32_s32(reordered[row * 2 + pair]),
+                );
+            }
+        }
+    }
+
+    for row in 0..4 {
+        vst1q_f32(out[row].as_mut_ptr(), acc_f32[row][0]);
+        vst1q_f32(out[row].as_mut_ptr().add(4), acc_f32[row][1]);
+    }
+    out
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2032,7 +2539,7 @@ fn dot4_q8_0_q8_0(
         return dot4_q8_0_q8_0_neon(xs0, xs1, xs2, xs3, ys);
     }
     #[cfg(target_arch = "x86_64")]
-    if x86_kernel_kind() == X86KernelKind::Avx2 {
+    if x86_kernel_kind().has_avx2() {
         unsafe {
             return (
                 dot_q8_0_q8_0_avx2(xs0, ys),
@@ -2410,7 +2917,7 @@ unsafe fn quantize_q8k_avx2(xs: &[f32], ys: &mut [BlockQ8K]) {
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q4k_q8k_avx2(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     let m4b = _mm256_set1_epi8(0x0f);
-    let mut sum = 0.0f64;
+    let mut sum = 0.0f32;
 
     for (x, y) in xs.iter().zip(ys) {
         let (scales, mins) = decode_q4k_scales_mins(&x.scales);
@@ -2418,7 +2925,7 @@ unsafe fn dot_q4k_q8k_avx2(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
         for j in 0..QK_K / 16 {
             bias += y.bsums[j] as i32 * mins[j / 2] as i32;
         }
-        sum -= (x.dmin.to_f32() * y.d) as f64 * bias as f64;
+        sum -= x.dmin.to_f32() * y.d * bias as f32;
 
         let mut isum = 0i32;
         for j in 0..QK_K / 64 {
@@ -2431,10 +2938,10 @@ unsafe fn dot_q4k_q8k_avx2(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
             let q8hi = _mm256_loadu_si256(y.qs.as_ptr().add(j * 64 + 32) as *const __m256i);
             isum += dot_u8_i8_32_avx2(q4hi, q8hi) * scales[2 * j + 1] as i32;
         }
-        sum += (x.d.to_f32() * y.d) as f64 * isum as f64;
+        sum += x.d.to_f32() * y.d * isum as f32;
     }
 
-    sum as f32
+    sum
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2447,10 +2954,10 @@ unsafe fn dot4_q4k_q8k_avx2(
     ys: &[BlockQ8K],
 ) -> (f32, f32, f32, f32) {
     let m4b = _mm256_set1_epi8(0x0f);
-    let mut sum0 = 0.0f64;
-    let mut sum1 = 0.0f64;
-    let mut sum2 = 0.0f64;
-    let mut sum3 = 0.0f64;
+    let mut sum0 = 0.0f32;
+    let mut sum1 = 0.0f32;
+    let mut sum2 = 0.0f32;
+    let mut sum3 = 0.0f32;
 
     for ((((x0, x1), x2), x3), y) in xs0.iter().zip(xs1).zip(xs2).zip(xs3).zip(ys) {
         let (sc0, mins0) = decode_q4k_scales_mins(&x0.scales);
@@ -2464,7 +2971,7 @@ unsafe fn dot4_q4k_q8k_avx2(
                 for j in 0..QK_K / 16 {
                     bias += y.bsums[j] as i32 * $mins[j / 2] as i32;
                 }
-                $sum -= ($x.dmin.to_f32() * y.d) as f64 * bias as f64;
+                $sum -= $x.dmin.to_f32() * y.d * bias as f32;
             }};
         }
         apply_bias!(x0, mins0, sum0);
@@ -2494,13 +3001,86 @@ unsafe fn dot4_q4k_q8k_avx2(
             dot_col!(x3, sc3, isum3);
         }
 
-        sum0 += (x0.d.to_f32() * y.d) as f64 * isum0 as f64;
-        sum1 += (x1.d.to_f32() * y.d) as f64 * isum1 as f64;
-        sum2 += (x2.d.to_f32() * y.d) as f64 * isum2 as f64;
-        sum3 += (x3.d.to_f32() * y.d) as f64 * isum3 as f64;
+        sum0 += x0.d.to_f32() * y.d * isum0 as f32;
+        sum1 += x1.d.to_f32() * y.d * isum1 as f32;
+        sum2 += x2.d.to_f32() * y.d * isum2 as f32;
+        sum3 += x3.d.to_f32() * y.d * isum3 as f32;
     }
 
-    (sum0 as f32, sum1 as f32, sum2 as f32, sum3 as f32)
+    (sum0, sum1, sum2, sum3)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot4x4_q4k_q8k_avxvnni(
+    weights: [&[BlockQ4K]; 4],
+    inputs: [&[BlockQ8K]; 4],
+) -> [[f32; 4]; 4] {
+    let m4b = _mm256_set1_epi8(0x0f);
+    let mut sums = [[0.0f32; 4]; 4];
+    for block in 0..weights[0].len() {
+        let x = [
+            &weights[0][block],
+            &weights[1][block],
+            &weights[2][block],
+            &weights[3][block],
+        ];
+        let y = [
+            &inputs[0][block],
+            &inputs[1][block],
+            &inputs[2][block],
+            &inputs[3][block],
+        ];
+        let decoded: [([u8; 8], [u8; 8]); 4] =
+            std::array::from_fn(|output| decode_q4k_scales_mins(&x[output].scales));
+
+        for input in 0..4 {
+            for output in 0..4 {
+                let mut bias = 0i32;
+                for group in 0..QK_K / 16 {
+                    bias += y[input].bsums[group] as i32 * decoded[output].1[group / 2] as i32;
+                }
+                sums[input][output] -= x[output].dmin.to_f32() * y[input].d * bias as f32;
+            }
+        }
+
+        let mut integer_sums = [[_mm256_setzero_si256(); 4]; 4];
+        for sb in 0..QK_K / 64 {
+            let q8_low: [__m256i; 4] = std::array::from_fn(|input| {
+                _mm256_loadu_si256(y[input].qs.as_ptr().add(sb * 64) as *const __m256i)
+            });
+            let q8_high: [__m256i; 4] = std::array::from_fn(|input| {
+                _mm256_loadu_si256(y[input].qs.as_ptr().add(sb * 64 + 32) as *const __m256i)
+            });
+            for output in 0..4 {
+                let raw = _mm256_loadu_si256(x[output].qs.as_ptr().add(sb * 32) as *const __m256i);
+                let low = _mm256_and_si256(raw, m4b);
+                let high = _mm256_and_si256(_mm256_srli_epi16::<4>(raw), m4b);
+                let low_scale = _mm256_set1_epi32(decoded[output].0[sb * 2] as i32);
+                let high_scale = _mm256_set1_epi32(decoded[output].0[sb * 2 + 1] as i32);
+                for input in 0..4 {
+                    let low_dot =
+                        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), low, q8_low[input]);
+                    let high_dot =
+                        _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), high, q8_high[input]);
+                    integer_sums[input][output] = _mm256_add_epi32(
+                        integer_sums[input][output],
+                        _mm256_add_epi32(
+                            _mm256_mullo_epi32(low_dot, low_scale),
+                            _mm256_mullo_epi32(high_dot, high_scale),
+                        ),
+                    );
+                }
+            }
+        }
+        for input in 0..4 {
+            for output in 0..4 {
+                let integer_sum = hsum_i32x8_avx2(integer_sums[input][output]);
+                sums[input][output] += x[output].d.to_f32() * y[input].d * integer_sum as f32;
+            }
+        }
+    }
+    sums
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2555,9 +3135,80 @@ unsafe fn dot_q5k_q8k_avx2(xs: &[BlockQ5K], ys: &[BlockQ8K]) -> f32 {
 }
 
 #[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot4x4_q5k_q8k_avxvnni(
+    weights: [&[BlockQ5K]; 4],
+    inputs: [&[BlockQ8K]; 4],
+) -> [[f32; 4]; 4] {
+    let mut sums = [[0.0f32; 4]; 4];
+    let mut decoded = [[0u8; QK_K]; 4];
+    for block in 0..weights[0].len() {
+        let scale_mins: [([u8; 8], [u8; 8]); 4] = std::array::from_fn(|output| {
+            decode_q5k_u8(&weights[output][block], &mut decoded[output]);
+            decode_q4k_scales_mins(&weights[output][block].scales)
+        });
+        for input in 0..4 {
+            for output in 0..4 {
+                let x = &weights[output][block];
+                let y = &inputs[input][block];
+                let (scaled_sum, min_sum) =
+                    dot_q5k_u8_q8k_avxvnni(&decoded[output], &scale_mins[output], y);
+                sums[input][output] +=
+                    x.d.to_f32() * y.d * scaled_sum as f32 - x.dmin.to_f32() * y.d * min_sum as f32;
+            }
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+fn decode_q5k_u8(x: &BlockQ5K, out: &mut [u8; QK_K]) {
+    let mut qs_base = 0;
+    let mut high_low = 1u8;
+    let mut high_high = 2u8;
+    for output_base in (0..QK_K).step_by(64) {
+        for idx in 0..32 {
+            let low = x.qs[qs_base + idx] & 0x0f;
+            let high = u8::from(x.qh[idx] & high_low != 0) << 4;
+            out[output_base + idx] = low | high;
+        }
+        for idx in 0..32 {
+            let low = x.qs[qs_base + idx] >> 4;
+            let high = u8::from(x.qh[idx] & high_high != 0) << 4;
+            out[output_base + 32 + idx] = low | high;
+        }
+        qs_base += 32;
+        high_low <<= 2;
+        high_high <<= 2;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot_q5k_u8_q8k_avxvnni(
+    decoded: &[u8; QK_K],
+    scale_mins: &([u8; 8], [u8; 8]),
+    input: &BlockQ8K,
+) -> (i32, i32) {
+    let mut accumulator = _mm256_setzero_si256();
+    let mut min_sum = 0i32;
+    for pair in 0..QK_K / 32 {
+        let scale_value = scale_mins.0[pair] as i32;
+        let values = _mm256_loadu_si256(decoded.as_ptr().add(pair * 32) as *const __m256i);
+        let quantized = _mm256_loadu_si256(input.qs.as_ptr().add(pair * 32) as *const __m256i);
+        let dot = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), values, quantized);
+        let scale = _mm256_set1_epi32(scale_value);
+        accumulator = _mm256_add_epi32(accumulator, _mm256_mullo_epi32(dot, scale));
+        min_sum += (input.bsums[pair * 2] as i32 + input.bsums[pair * 2 + 1] as i32)
+            * scale_mins.1[pair] as i32;
+    }
+    (hsum_i32x8_avx2(accumulator), min_sum)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn dot_q6k_q8k_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
-    let mut sum = 0.0f64;
+    let mut sum = 0.0f32;
     let mut aux8 = [0i8; QK_K];
 
     for (x, y) in xs.iter().zip(ys) {
@@ -2567,10 +3218,63 @@ unsafe fn dot_q6k_q8k_avx2(xs: &[BlockQ6K], ys: &[BlockQ8K]) -> f32 {
             let dot = dot_i8_i8_16_avx2(aux8.as_ptr().add(j * 16), y.qs.as_ptr().add(j * 16));
             isum += dot * x.scales[j] as i32;
         }
-        sum += x.d.to_f32() as f64 * y.d as f64 * isum as f64;
+        sum += x.d.to_f32() * y.d * isum as f32;
     }
 
-    sum as f32
+    sum
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot4x4_q6k_q8k_avxvnni(
+    weights: [&[BlockQ6K]; 4],
+    inputs: [&[BlockQ8K]; 4],
+) -> [[f32; 4]; 4] {
+    let mut sums = [[0.0f32; 4]; 4];
+    let mut decoded_i8 = [[0i8; QK_K]; 4];
+    let mut decoded_u8 = [[0u8; QK_K]; 4];
+    for block in 0..weights[0].len() {
+        for output in 0..4 {
+            decode_q6k_i8(&weights[output][block], &mut decoded_i8[output]);
+            for idx in 0..QK_K {
+                decoded_u8[output][idx] = (decoded_i8[output][idx] as i32 + 32) as u8;
+            }
+        }
+        for input in 0..4 {
+            for output in 0..4 {
+                let x = &weights[output][block];
+                let y = &inputs[input][block];
+                let integer_sum = dot_q6k_u8_q8k_avxvnni(&decoded_u8[output], &x.scales, y);
+                sums[input][output] += x.d.to_f32() * y.d * integer_sum as f32;
+            }
+        }
+    }
+    sums
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,avxvnni")]
+unsafe fn dot_q6k_u8_q8k_avxvnni(
+    decoded: &[u8; QK_K],
+    scales: &[i8; QK_K / 16],
+    input: &BlockQ8K,
+) -> i32 {
+    let mut accumulator = _mm256_setzero_si256();
+    let mut correction = 0i32;
+    for pair in 0..QK_K / 32 {
+        let scale0 = scales[pair * 2] as i32;
+        let scale1 = scales[pair * 2 + 1] as i32;
+        let values = _mm256_loadu_si256(decoded.as_ptr().add(pair * 32) as *const __m256i);
+        let quantized = _mm256_loadu_si256(input.qs.as_ptr().add(pair * 32) as *const __m256i);
+        let dot = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), values, quantized);
+        let scale = _mm256_set_epi32(
+            scale1, scale1, scale1, scale1, scale0, scale0, scale0, scale0,
+        );
+        accumulator = _mm256_add_epi32(accumulator, _mm256_mullo_epi32(dot, scale));
+        correction += 32
+            * (input.bsums[pair * 2] as i32 * scale0 + input.bsums[pair * 2 + 1] as i32 * scale1);
+    }
+    hsum_i32x8_avx2(accumulator) - correction
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -2836,6 +3540,117 @@ fn validate_f16_scale(name: &str, block_idx: usize, value: f16) -> Result<()> {
         Err(Error::InvalidGguf(format!(
             "{name} is non-finite in block {block_idx}"
         )))
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod arm_tests {
+    use super::*;
+
+    #[test]
+    fn q4kx8_q8kx4_i8mm_matches_four_dotprod_rows() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+        let row_blocks = 2;
+        let mut weights = Vec::with_capacity(8 * row_blocks);
+        for row in 0..8 {
+            for block in 0..row_blocks {
+                let mut scales = [0u8; 12];
+                let mut qs = [0u8; QK_K / 2];
+                for (idx, value) in scales.iter_mut().enumerate() {
+                    *value = ((row * 37 + block * 19 + idx * 13 + 7) & 0xff) as u8;
+                }
+                for (idx, value) in qs.iter_mut().enumerate() {
+                    *value = ((row * 29 + block * 41 + idx * 17 + 11) & 0xff) as u8;
+                }
+                weights.push(BlockQ4K {
+                    d: f16::from_f32(0.006 + row as f32 * 0.0003),
+                    dmin: f16::from_f32(0.002 + block as f32 * 0.0002),
+                    scales,
+                    qs,
+                });
+            }
+        }
+        let packed_weights = pack_to_q4kx8(&weights, 8);
+        let input = (0..4 * row_blocks * QK_K)
+            .map(|idx| ((idx * 31 % 251) as f32 - 125.0) / 47.0)
+            .collect::<Vec<_>>();
+        let quantized_rows = input
+            .chunks_exact(row_blocks * QK_K)
+            .map(quantize_q8k)
+            .collect::<Vec<_>>();
+        let packed_input = quantize_q8kx4(&input, row_blocks * QK_K);
+        let actual = unsafe { dot8x4_q4k_q8k_neon(&packed_weights, &packed_input) };
+        for row in 0..4 {
+            let expected = unsafe { dot8_q4k_q8k_neon(&packed_weights, &quantized_rows[row]) };
+            for col in 0..8 {
+                let tolerance = 2.0e-4 * expected[col].abs().max(1.0);
+                assert!(
+                    (actual[row][col] - expected[col]).abs() <= tolerance,
+                    "I8MM tile mismatch row={row} col={col}: actual={} expected={} tolerance={tolerance}",
+                    actual[row][col],
+                    expected[col],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4kx8_batched_i8mm_matches_rowwise_dotprod() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            return;
+        }
+        let matrix_rows = 64;
+        let matrix_cols = QK_K * 4;
+        let row_blocks = matrix_cols / QK_K;
+        let lhs_rows = 7;
+        let mut weights = Vec::with_capacity(matrix_rows * row_blocks);
+        for row in 0..matrix_rows {
+            for block in 0..row_blocks {
+                let mut scales = [0u8; 12];
+                let mut qs = [0u8; QK_K / 2];
+                for (idx, value) in scales.iter_mut().enumerate() {
+                    *value = ((row * 37 + block * 19 + idx * 13 + 7) & 0xff) as u8;
+                }
+                for (idx, value) in qs.iter_mut().enumerate() {
+                    *value = ((row * 29 + block * 41 + idx * 17 + 11) & 0xff) as u8;
+                }
+                weights.push(BlockQ4K {
+                    d: f16::from_f32(0.006 + (row % 8) as f32 * 0.0003),
+                    dmin: f16::from_f32(0.002 + block as f32 * 0.0002),
+                    scales,
+                    qs,
+                });
+            }
+        }
+        let packed_weights = pack_to_q4kx8(&weights, matrix_rows);
+        let input = (0..lhs_rows * matrix_cols)
+            .map(|idx| ((idx * 31 % 251) as f32 - 125.0) / 47.0)
+            .collect::<Vec<_>>();
+        let actual =
+            matmul_q4kx8_batched(&packed_weights, &input, lhs_rows, matrix_rows, matrix_cols);
+        for row in 0..lhs_rows {
+            let quantized = quantize_q8k(&input[row * matrix_cols..(row + 1) * matrix_cols]);
+            for group in 0..matrix_rows / 8 {
+                let expected = unsafe {
+                    dot8_q4k_q8k_neon(
+                        &packed_weights[group * row_blocks..(group + 1) * row_blocks],
+                        &quantized,
+                    )
+                };
+                for col in 0..8 {
+                    let actual = actual[row * matrix_rows + group * 8 + col];
+                    let tolerance = 2.0e-4 * expected[col].abs().max(1.0);
+                    assert!(
+                        (actual - expected[col]).abs() <= tolerance,
+                        "batched I8MM mismatch row={row} col={}: actual={actual} expected={} tolerance={tolerance}",
+                        group * 8 + col,
+                        expected[col],
+                    );
+                }
+            }
+        }
     }
 }
 
