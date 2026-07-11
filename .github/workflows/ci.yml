@@ -190,6 +190,11 @@ jobs:
             Write-Error 'Windows CPU registry selection failed'
             exit 1
           }
+          if (-not $doctor.inference.daemons.embedding.state -or -not $doctor.inference.daemons.summary.state) {
+            Write-Error 'Windows daemon diagnostics are incomplete'
+            exit 1
+          }
+          exit 0
 
   # Heavier validation: the soak/stress loop + the release-build
   # invariant. Runs only on pull_request and on the default branch to
