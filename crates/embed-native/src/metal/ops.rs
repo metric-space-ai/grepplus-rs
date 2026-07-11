@@ -3375,15 +3375,28 @@ pub fn op_mul_mv(
     // dst dims
     ne0: i32,
     ne1: i32,
+    accumulate: bool,
 ) -> bool {
     // ref: ggml-metal-ops.cpp:2047-2048
     let r2: i16 = (ne12 / ne02) as i16;
     let r3: i16 = (ne13 / ne03) as i16;
 
-    let (name, shape) = pipeline_name_mul_mv(tsrc0, tsrc1, ne00);
-    let cache_key = format!("{name}_nsg={}", shape.nsg);
+    let (base_name, shape) = pipeline_name_mul_mv(tsrc0, tsrc1, ne00);
+    if accumulate && !matches!(tsrc0, GgmlType::Q4_K | GgmlType::Q6_K) {
+        set_last_error(format!(
+            "op_mul_mv: accumulation is unsupported for {tsrc0:?}"
+        ));
+        return false;
+    }
+    let name = if accumulate {
+        format!("{base_name}_add")
+    } else {
+        base_name
+    };
+    let cache_key = format!("{name}_nsg={}_acc={accumulate}", shape.nsg);
     let Some(pso) = dev.pipeline_with_constants(&cache_key, &name, |cv| {
         cv_set_int16(cv, shape.nsg as i16, FC_MUL_MV + 0);
+        cv_set_bool(cv, accumulate, FC_MUL_MV + 2);
     }) else {
         set_last_error(format!("op_mul_mv: pipeline `{name}` not found"));
         return false;

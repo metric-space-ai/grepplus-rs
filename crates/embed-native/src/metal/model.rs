@@ -1517,6 +1517,7 @@ impl MetalEmbeddingModel {
                 src_total_bytes as u64,
                 w_rows,
                 rows_i32,
+                false,
             ));
         }
         ok(ops::op_mul_mm(

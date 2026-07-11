@@ -3353,6 +3353,7 @@ static inline void helper_mv_reduce_and_write(
 
 constant short FC_mul_mv_nsg   [[function_constant(FC_MUL_MV + 0)]];
 constant short FC_mul_mv_nxpsg [[function_constant(FC_MUL_MV + 1)]];
+constant bool  FC_mul_mv_accumulate [[function_constant(FC_MUL_MV + 2)]];
 
 template<typename block_q_type, short NR0, typename args_t>
 void mul_vec_q_n_f32_impl(
@@ -7817,13 +7818,30 @@ void kernel_mul_mv_q4_K_f32_impl(
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
+            if (FC_mul_mv_accumulate) {
+                dst_f32[first_row + row] += sum_all;
+            } else {
+                dst_f32[first_row + row] = sum_all;
+            }
         }
     }
 }
 
 [[host_name("kernel_mul_mv_q4_K_f32")]]
 kernel void kernel_mul_mv_q4_K_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q4_K_f32_impl<N_R0_Q4_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q4_K_f32_add")]]
+kernel void kernel_mul_mv_q4_K_f32_add(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -8056,13 +8074,30 @@ void kernel_mul_mv_q6_K_f32_impl(
     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
         float sum_all = simd_sum(sumf[row]);
         if (tiisg == 0) {
-            dst_f32[first_row + row] = sum_all;
+            if (FC_mul_mv_accumulate) {
+                dst_f32[first_row + row] += sum_all;
+            } else {
+                dst_f32[first_row + row] = sum_all;
+            }
         }
     }
 }
 
 [[host_name("kernel_mul_mv_q6_K_f32")]]
 kernel void kernel_mul_mv_q6_K_f32(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q6_K_f32_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q6_K_f32_add")]]
+kernel void kernel_mul_mv_q6_K_f32_add(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
         device const char * src1,

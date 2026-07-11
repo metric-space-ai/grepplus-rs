@@ -1363,14 +1363,6 @@ impl MetalQwen35Model {
             enc.memory_barrier_buffers();
             self.encode_ffn_block(enc, layer, ws)?;
             enc.memory_barrier_buffers();
-            self.encode_add(
-                enc,
-                &ws.hidden,
-                &ws.attn_out,
-                &ws.hidden,
-                self.inventory.hidden_size,
-            )?;
-            enc.memory_barrier_buffers();
         }
         Ok(())
     }
@@ -1499,6 +1491,7 @@ impl MetalQwen35Model {
             (cols * std::mem::size_of::<f32>()) as u64,
             checked_i32(rows, "matvec dst ne0")?,
             1,
+            false,
         ))?;
         enc.end();
         cb.commit_and_wait().map_err(|e| {
@@ -2085,6 +2078,7 @@ impl MetalQwen35Model {
             (cols * std::mem::size_of::<f32>()) as u64,
             checked_i32(rows, "matvec dst ne0")?,
             1,
+            false,
         ))
     }
 
@@ -2240,14 +2234,44 @@ impl MetalQwen35Model {
             checked_i32(self.inventory.feed_forward_size, "SwiGLU total")?,
         ))?;
         enc.memory_barrier_buffers();
-        self.encode_matvec_to(
+        let down_name = format!("{prefix}.ffn_down.weight");
+        let down = self.weights.require(&down_name)?;
+        let cols = self.inventory.feed_forward_size;
+        let rows = self.inventory.hidden_size;
+        if tensor_cols(down)? != cols || tensor_rows(down)? != rows {
+            return Err(Error::InvalidRequest(format!(
+                "{down_name} has invalid FFN down-projection shape"
+            )));
+        }
+        ok(ops::op_mul_mv(
             enc,
-            &format!("{prefix}.ffn_down.weight"),
+            self.dev,
+            op_type(down.dtype)?,
+            OpType::F32,
+            &down.buffer,
+            down.offset,
             &ws.ffn_gate,
-            self.inventory.feed_forward_size,
-            &ws.attn_out,
-            self.inventory.hidden_size,
-        )
+            &ws.hidden,
+            checked_i32(cols, "FFN down cols")?,
+            checked_i32(rows, "FFN down rows")?,
+            1,
+            1,
+            down.nb[0],
+            down.nb[1],
+            down.nb[2],
+            down.nb[3],
+            checked_i32(cols, "FFN down src ne10")?,
+            1,
+            1,
+            1,
+            std::mem::size_of::<f32>() as u64,
+            (cols * std::mem::size_of::<f32>()) as u64,
+            (cols * std::mem::size_of::<f32>()) as u64,
+            (cols * std::mem::size_of::<f32>()) as u64,
+            checked_i32(rows, "FFN down dst ne0")?,
+            1,
+            true,
+        ))
     }
 
     fn encode_ffn_block_rows(
