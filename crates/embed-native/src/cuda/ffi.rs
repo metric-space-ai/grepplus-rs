@@ -1,4 +1,6 @@
 use std::ffi::{c_char, c_void, CStr};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 
@@ -7,6 +9,7 @@ use libloading::Library;
 use crate::{Error, Result};
 
 const CUDA_BACKEND_UNAVAILABLE: i32 = 20000;
+const CUDA_BACKEND_ABI_VERSION: u32 = 1;
 
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
@@ -21,8 +24,41 @@ const CUDA_DYLIB_BLOB: &[u8] = include_bytes!(env!("GREPPY_EMBED_NATIVE_CUDA_DYL
 const CUDA_DYLIB_BLOB: &[u8] = &[];
 
 type GpCudaErrorString = unsafe extern "C" fn(i32) -> *const c_char;
+type GpBackendAbiVersion = unsafe extern "C" fn() -> u32;
+type GpBackendBuildInfo = unsafe extern "C" fn() -> *const c_char;
+type GpBackendProbe = unsafe extern "C" fn() -> i32;
+type GpCudaDeviceCount = unsafe extern "C" fn(*mut i32) -> i32;
+type GpCudaDevicePropertiesAt = unsafe extern "C" fn(i32, *mut RawCudaDeviceProperties) -> i32;
 type GpCudaInit = unsafe extern "C" fn(i32, *mut *mut c_void, *mut *mut c_void) -> i32;
 type GpCudaDestroy = unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCudaDeviceProperties {
+    index: i32,
+    compatible: i32,
+    cc_major: i32,
+    cc_minor: i32,
+    memory_free: u64,
+    memory_total: u64,
+    name: [c_char; 256],
+    reason: [c_char; 256],
+}
+
+impl Default for RawCudaDeviceProperties {
+    fn default() -> Self {
+        Self {
+            index: 0,
+            compatible: 0,
+            cc_major: 0,
+            cc_minor: 0,
+            memory_free: 0,
+            memory_total: 0,
+            name: [0; 256],
+            reason: [0; 256],
+        }
+    }
+}
 type GpCudaMalloc = unsafe extern "C" fn(*mut *mut c_void, usize) -> i32;
 type GpCudaFree = unsafe extern "C" fn(*mut c_void) -> i32;
 type GpCudaMemcpyH2DAsync =
@@ -323,6 +359,11 @@ type GpMmvqMatvecQ8 = unsafe extern "C" fn(
 
 struct CudaApi {
     _lib: Library,
+    gp_backend_abi_version: GpBackendAbiVersion,
+    gp_backend_build_info: GpBackendBuildInfo,
+    gp_backend_probe: GpBackendProbe,
+    gp_cuda_device_count: GpCudaDeviceCount,
+    gp_cuda_device_properties_at: GpCudaDevicePropertiesAt,
     gp_cuda_error_string: GpCudaErrorString,
     gp_cuda_init: GpCudaInit,
     gp_cuda_destroy: GpCudaDestroy,
@@ -413,7 +454,24 @@ fn cuda_api() -> Result<&'static CudaApi> {
 fn load_cuda_api() -> std::result::Result<CudaApi, String> {
     let lib = load_cuda_library()?;
     unsafe {
+        let gp_backend_abi_version: GpBackendAbiVersion =
+            load_symbol(&lib, b"gp_backend_abi_version\0")?;
+        let abi_version = gp_backend_abi_version();
+        if abi_version != CUDA_BACKEND_ABI_VERSION {
+            return Err(format!(
+                "CUDA backend ABI mismatch: backend={abi_version}, expected={CUDA_BACKEND_ABI_VERSION}"
+            ));
+        }
+        let gp_backend_build_info = load_symbol(&lib, b"gp_backend_build_info\0")?;
+        let gp_backend_probe = load_symbol(&lib, b"gp_backend_probe\0")?;
+        let gp_cuda_device_count = load_symbol(&lib, b"gp_cuda_device_count\0")?;
+        let gp_cuda_device_properties_at = load_symbol(&lib, b"gp_cuda_device_properties_at\0")?;
         Ok(CudaApi {
+            gp_backend_abi_version,
+            gp_backend_build_info,
+            gp_backend_probe,
+            gp_cuda_device_count,
+            gp_cuda_device_properties_at,
             gp_cuda_error_string: load_symbol(&lib, b"gp_cuda_error_string\0")?,
             gp_cuda_init: load_symbol(&lib, b"gp_cuda_init\0")?,
             gp_cuda_destroy: load_symbol(&lib, b"gp_cuda_destroy\0")?,
@@ -515,6 +573,7 @@ fn load_cuda_api() -> std::result::Result<CudaApi, String> {
 }
 
 fn load_cuda_library() -> std::result::Result<Library, String> {
+    #[cfg(debug_assertions)]
     if let Ok(path) = std::env::var("EMBED_NATIVE_CUDA_LIBRARY") {
         let path = path.trim();
         if !path.is_empty() {
@@ -527,28 +586,170 @@ fn load_cuda_library() -> std::result::Result<Library, String> {
         return Err("CUDA backend library was not built into this binary".into());
     }
 
-    let ext = if cfg!(target_os = "windows") {
-        "dll"
-    } else {
-        "so"
-    };
-    let path = std::env::temp_dir().join(format!(
-        "greppy_embed_native_cuda_{}.{}",
-        std::process::id(),
-        ext
-    ));
-    std::fs::write(&path, CUDA_DYLIB_BLOB).map_err(|e| {
-        format!(
-            "failed to write bundled CUDA backend {}: {e}",
-            path.display()
-        )
-    })?;
+    let path = materialize_cuda_library(CUDA_DYLIB_BLOB)?;
     unsafe { Library::new(&path) }.map_err(|e| {
         format!(
             "failed to load bundled CUDA backend {}: {e}",
             path.display()
         )
     })
+}
+
+fn materialize_cuda_library(blob: &[u8]) -> std::result::Result<PathBuf, String> {
+    use sha2::{Digest, Sha256};
+
+    let digest = format!("{:x}", Sha256::digest(blob));
+    let extension = if cfg!(target_os = "windows") {
+        "dll"
+    } else {
+        "so"
+    };
+    let dir = cuda_runtime_cache_root().join(&digest);
+    ensure_private_runtime_dir(&dir)?;
+    let path = dir.join(format!("greppy-cuda-backend.{extension}"));
+    if verified_cuda_library(&path, blob.len(), &digest) {
+        return Ok(path);
+    }
+
+    static NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nonce = NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temporary = dir.join(format!(
+        ".greppy-cuda-backend.{}.{}.tmp",
+        std::process::id(),
+        nonce
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temporary)
+        .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    if let Err(error) = file.write_all(blob).and_then(|_| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(format!("write {}: {error}", temporary.display()));
+    }
+    drop(file);
+    if !verified_cuda_library(&temporary, blob.len(), &digest) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err("bundled CUDA backend failed post-write verification".into());
+    }
+    #[cfg(windows)]
+    if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+    std::fs::rename(&temporary, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("install bundled CUDA backend {}: {error}", path.display())
+    })?;
+    if verified_cuda_library(&path, blob.len(), &digest) {
+        Ok(path)
+    } else {
+        Err(format!(
+            "installed CUDA backend {} failed verification",
+            path.display()
+        ))
+    }
+}
+
+/// Materialize and verify the embedded CUDA backend without loading a model.
+/// Used by release diagnostics and cache-hardening acceptance tests.
+#[doc(hidden)]
+pub fn materialize_embedded_backend_for_diagnostics() -> Result<PathBuf> {
+    if CUDA_DYLIB_BLOB.is_empty() {
+        return Err(Error::InvalidGguf(
+            "CUDA backend library was not built into this binary".into(),
+        ));
+    }
+    materialize_cuda_library(CUDA_DYLIB_BLOB).map_err(Error::InvalidGguf)
+}
+
+fn cuda_runtime_cache_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("GREPPY_STORE_DIR") {
+        return PathBuf::from(path).join("runtime").join("cuda");
+    }
+    #[cfg(windows)]
+    if let Some(path) = std::env::var_os("LOCALAPPDATA") {
+        return PathBuf::from(path)
+            .join("greppy")
+            .join("runtime")
+            .join("cuda");
+    }
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(path)
+            .join("greppy")
+            .join("runtime")
+            .join("cuda");
+    }
+    if let Some(path) = std::env::var_os("HOME") {
+        return PathBuf::from(path)
+            .join(".cache")
+            .join("greppy")
+            .join("runtime")
+            .join("cuda");
+    }
+    std::env::temp_dir()
+        .join(format!("greppy-{}", std::process::id()))
+        .join("runtime")
+        .join("cuda")
+}
+
+fn ensure_private_runtime_dir(path: &Path) -> std::result::Result<(), String> {
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("create CUDA runtime cache {}: {error}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("inspect CUDA runtime cache {}: {error}", path.display()))?;
+        if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "CUDA runtime cache {} is not an owned directory",
+                path.display()
+            ));
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("secure CUDA runtime cache {}: {error}", path.display()))?;
+        let secured = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("verify CUDA runtime cache {}: {error}", path.display()))?;
+        if secured.permissions().mode() & 0o077 != 0 {
+            return Err(format!(
+                "CUDA runtime cache {} is accessible by other users",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verified_cuda_library(path: &Path, expected_len: usize, expected_sha: &str) -> bool {
+    use sha2::{Digest, Sha256};
+
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    let Ok(expected_len) = u64::try_from(expected_len) else {
+        return false;
+    };
+    if !metadata.file_type().is_file() || metadata.len() != expected_len {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return false;
+        }
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    format!("{:x}", Sha256::digest(bytes)) == expected_sha
 }
 
 unsafe fn load_symbol<T: Copy>(lib: &Library, name: &[u8]) -> std::result::Result<T, String> {
@@ -559,6 +760,148 @@ unsafe fn load_symbol<T: Copy>(lib: &Library, name: &[u8]) -> std::result::Resul
         )
     })?;
     Ok(*symbol)
+}
+
+pub fn backend_abi_version() -> Result<u32> {
+    let api = cuda_api()?;
+    Ok(unsafe { (api.gp_backend_abi_version)() })
+}
+
+pub fn backend_build_info() -> String {
+    let Ok(api) = cuda_api() else {
+        return "cuda-backend-unavailable".into();
+    };
+    unsafe {
+        let value = (api.gp_backend_build_info)();
+        if value.is_null() {
+            "cuda-backend-unknown".into()
+        } else {
+            CStr::from_ptr(value).to_string_lossy().into_owned()
+        }
+    }
+}
+
+pub fn probe_devices() -> Result<Vec<crate::backend::DeviceInfo>> {
+    let api = cuda_api()?;
+    check(unsafe { (api.gp_backend_probe)() }, "CUDA backend probe")?;
+    let mut count = 0i32;
+    check(
+        unsafe { (api.gp_cuda_device_count)(&mut count) },
+        "CUDA device enumeration",
+    )?;
+    if count < 0 {
+        return Err(Error::InvalidGguf(
+            "CUDA device enumeration returned a negative count".into(),
+        ));
+    }
+    let capacity = usize::try_from(count)
+        .map_err(|_| Error::InvalidGguf("CUDA device count does not fit usize".into()))?;
+    let mut devices = Vec::with_capacity(capacity);
+    for index in 0..count {
+        let mut raw = RawCudaDeviceProperties::default();
+        check(
+            unsafe { (api.gp_cuda_device_properties_at)(index, &mut raw) },
+            "CUDA device properties",
+        )?;
+        let name = raw_c_string(&raw.name);
+        let reason = raw_c_string(&raw.reason);
+        devices.push(crate::backend::DeviceInfo {
+            backend: crate::backend::BackendKind::Cuda,
+            id: format!("cuda:{index}"),
+            name: if name.is_empty() {
+                format!("CUDA device {index}")
+            } else {
+                name.clone()
+            },
+            description: name,
+            device_type: crate::backend::DeviceType::DiscreteGpu,
+            memory_free: (raw.memory_free > 0).then_some(raw.memory_free),
+            memory_total: (raw.memory_total > 0).then_some(raw.memory_total),
+            compute_capability: Some(format!("{}.{}", raw.cc_major, raw.cc_minor)),
+            metal_family: None,
+            capabilities: vec!["q4_k".into(), "mmq".into(), "cuda-graphs".into()],
+            rejection_reason: (!reason.is_empty()).then_some(reason),
+        });
+    }
+    Ok(devices)
+}
+
+pub fn select_cuda_device(required_memory: u64, requested: Option<i32>) -> Result<i32> {
+    let devices = probe_devices()?;
+    if let Some(requested) = requested {
+        if requested < 0 {
+            return Err(Error::InvalidGguf(format!(
+                "CUDA device index must be non-negative, got {requested}"
+            )));
+        }
+        let index = usize::try_from(requested)
+            .map_err(|_| Error::InvalidGguf("CUDA device index does not fit usize".into()))?;
+        let device = devices.get(index).ok_or_else(|| {
+            Error::InvalidGguf(format!(
+                "CUDA device {requested} does not exist; {} visible device(s)",
+                devices.len()
+            ))
+        })?;
+        ensure_cuda_device_usable(device, required_memory)?;
+        return Ok(requested);
+    }
+    for (index, device) in devices.iter().enumerate() {
+        if ensure_cuda_device_usable(device, required_memory).is_ok() {
+            return i32::try_from(index)
+                .map_err(|_| Error::InvalidGguf("CUDA device index does not fit i32".into()));
+        }
+    }
+    let details = devices
+        .iter()
+        .map(|device| {
+            device.rejection_reason.clone().unwrap_or_else(|| {
+                format!(
+                    "{} has {} bytes free, {} bytes plus safety margin required",
+                    device.name,
+                    device.memory_free.unwrap_or(0),
+                    required_memory
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(Error::InvalidGguf(format!(
+        "no compatible CUDA device has enough memory: {details}"
+    )))
+}
+
+fn ensure_cuda_device_usable(
+    device: &crate::backend::DeviceInfo,
+    required_memory: u64,
+) -> Result<()> {
+    if let Some(reason) = &device.rejection_reason {
+        return Err(Error::InvalidGguf(format!(
+            "CUDA device {} is incompatible: {reason}",
+            device.id
+        )));
+    }
+    if !crate::backend::device_has_memory(device, required_memory) {
+        return Err(Error::InvalidGguf(format!(
+            "CUDA device {} has {} bytes free; {} bytes plus {} safety margin required",
+            device.id,
+            device.memory_free.unwrap_or(0),
+            required_memory,
+            crate::backend::GPU_MEMORY_SAFETY_MARGIN
+        )));
+    }
+    Ok(())
+}
+
+fn raw_c_string(value: &[c_char]) -> String {
+    let len = value
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(value.len());
+    let bytes = value[..len]
+        .iter()
+        .map(|byte| u8::from_ne_bytes(byte.to_ne_bytes()))
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 pub struct CudaDevice {

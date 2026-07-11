@@ -186,6 +186,57 @@ impl Device {
         })
     }
 
+    pub fn runtime_ready(&self) -> bool {
+        self.base_library.is_some()
+    }
+
+    pub fn build_info(&self) -> String {
+        format!(
+            "embedded-metallib;metal4={}",
+            if self.supports_metal4 { "yes" } else { "no" }
+        )
+    }
+
+    pub fn device_info(&self) -> crate::backend::DeviceInfo {
+        let name = self.mtl.name().to_string();
+        let registry_id = self.mtl.registryID();
+        let memory_total = self.mtl.recommendedMaxWorkingSetSize();
+        let memory_used = u64::try_from(self.mtl.currentAllocatedSize()).unwrap_or(u64::MAX);
+        let memory_free = memory_total.saturating_sub(memory_used);
+        let apple_family = if self.mtl.supportsFamily(MTLGPUFamily::Apple9) {
+            "apple9"
+        } else if self.mtl.supportsFamily(MTLGPUFamily::Apple8) {
+            "apple8"
+        } else if self.mtl.supportsFamily(MTLGPUFamily::Apple7) {
+            "apple7"
+        } else {
+            "apple-legacy"
+        };
+        crate::backend::DeviceInfo {
+            backend: crate::backend::BackendKind::Metal,
+            id: format!("metal:{registry_id:016x}"),
+            name: name.clone(),
+            description: name,
+            device_type: crate::backend::DeviceType::IntegratedGpu,
+            memory_free: (memory_free > 0).then_some(memory_free),
+            memory_total: (memory_total > 0).then_some(memory_total),
+            compute_capability: None,
+            metal_family: Some(if self.supports_metal4 {
+                format!("{apple_family}+metal4")
+            } else {
+                apple_family.into()
+            }),
+            capabilities: vec![
+                "unified-memory".into(),
+                "simdgroup".into(),
+                self.supports_metal4
+                    .then_some("tensor-ops".into())
+                    .unwrap_or_else(|| "classic-pipelines".into()),
+            ],
+            rejection_reason: None,
+        }
+    }
+
     /// Cached pipeline for `kernel_name`. First lookup does a
     /// `newFunctionWithName:` + `newComputePipelineStateWithFunction:`
     /// roundtrip; subsequent lookups use the model-wide hash cache.

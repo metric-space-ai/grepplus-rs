@@ -62,9 +62,9 @@ jobs:
       - name: Verify bundled inference assets
         shell: bash
         run: |
-          git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-q4km/*'
+          git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-mtp-q4km/*'
           ls -lh crates/cli/assets/embeddinggemma-300m-q4k
-          ls -lh crates/cli/assets/qwen35-0.8b-q4km
+          ls -lh crates/cli/assets/qwen35-0.8b-mtp-q4km
 
       - name: Install Rust (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -87,6 +87,19 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
+
+      - name: Verify CUDA backend runtime dependencies
+        if: matrix.features == 'cuda'
+        shell: bash
+        run: |
+          backend="$(find target/release/build -path '*/out/greppy_embed_native_cuda.so' -print -quit)"
+          test -n "$backend" && test -f "$backend"
+          readelf -d "$backend"
+          ! readelf -d "$backend" | grep -E 'RPATH|RUNPATH'
+          needed="$(readelf -d "$backend" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p')"
+          bad="$(printf '%s\n' "$needed" | grep -Ev '^(libcuda\.so\.1|libc\.so\.6|libm\.so\.6|libpthread\.so\.0|librt\.so\.1|libdl\.so\.2|libgcc_s\.so\.1|libstdc\+\+\.so\.6|ld-linux-x86-64\.so\.2)$' || true)"
+          test -z "$bad" || { echo "::error::unexpected CUDA backend dependencies: $bad"; exit 1; }
+          ! printf '%s\n' "$needed" | grep -E 'cudart|cublas|nvrtc'
 
       # Tag builds must ship a binary whose --version matches the tag —
       # v0.1.1 shipped reporting "grep 0.1.0" because the workspace version
@@ -126,16 +139,119 @@ jobs:
           Copy-Item README.md,LICENSE dist/ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
 
-      - name: Upload workflow artifact (manual runs)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Smoke-test packaged artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          clean="$RUNNER_TEMP/greppy-package-smoke"
+          mkdir -p "$clean/bin" "$clean/store" "$clean/repo"
+          tar -C "$clean/bin" -xzf "${{ matrix.asset }}"
+          "$clean/bin/greppy" --help >/dev/null
+          set +e
+          GREPPY_STORE_DIR="$clean/store" "$clean/bin/greppy" --device cpu doctor --json --root "$clean/repo" > "$clean/doctor.json"
+          set -e
+          jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' "$clean/doctor.json"
+
+      - name: Smoke-test packaged artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $clean = Join-Path $env:RUNNER_TEMP 'greppy-package-smoke'
+          New-Item -ItemType Directory -Force "$clean/bin","$clean/store","$clean/repo" | Out-Null
+          Expand-Archive -Path "${{ matrix.asset }}" -DestinationPath "$clean/bin" -Force
+          & "$clean/bin/greppy.exe" --help | Out-Null
+          $env:GREPPY_STORE_DIR = "$clean/store"
+          $output = & "$clean/bin/greppy.exe" --device cpu doctor --json --root "$clean/repo"
+          $doctorExit = $LASTEXITCODE
+          $output | Out-File -Encoding utf8 "$clean/doctor.json"
+          if ($doctorExit -ne 0 -and $doctorExit -ne 1) {
+            Write-Error "packaged Windows doctor failed with unexpected exit code $doctorExit"
+            exit 1
+          }
+          $doctor = Get-Content "$clean/doctor.json" -Raw | ConvertFrom-Json
+          if ($doctor.command -ne 'doctor' -or $doctor.inference.registry.selected_backend -ne 'cpu') {
+            Write-Error 'packaged Windows doctor contract failed'
+            exit 1
+          }
+
+      - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}
 
-      - name: Attach to Release (tag runs)
-        if: startsWith(github.ref, 'refs/tags/')
+  verify-packages:
+    name: clean package (${{ matrix.name }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-arm64
+            os: macos-latest
+            asset: greppy-macos-arm64.tar.gz
+          - name: linux-x86_64-no-toolkit
+            os: ubuntu-22.04
+            asset: greppy-linux-x86_64.tar.gz
+          - name: windows-x86_64
+            os: windows-latest
+            asset: greppy-windows-x86_64.zip
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: package
+
+      - name: Verify clean Unix host
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p unpack store repo
+          tar -C unpack -xzf "package/${{ matrix.asset }}"
+          unpack/greppy --help >/dev/null
+          set +e
+          GREPPY_STORE_DIR="$PWD/store" unpack/greppy --device cpu doctor --json --root "$PWD/repo" > doctor.json
+          set -e
+          jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' doctor.json
+          if [ "${{ runner.os }}" = Linux ]; then
+            ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
+          fi
+
+      - name: Verify clean Windows host
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force unpack,store,repo | Out-Null
+          Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
+          & unpack/greppy.exe --help | Out-Null
+          $env:GREPPY_STORE_DIR = "$PWD/store"
+          $output = & unpack/greppy.exe --device cpu doctor --json --root "$PWD/repo"
+          $doctorExit = $LASTEXITCODE
+          $output | Out-File -Encoding utf8 doctor.json
+          if ($doctorExit -ne 0 -and $doctorExit -ne 1) {
+            Write-Error "clean Windows doctor failed with unexpected exit code $doctorExit"
+            exit 1
+          }
+          $doctor = Get-Content doctor.json -Raw | ConvertFrom-Json
+          if ($doctor.command -ne 'doctor' -or $doctor.inference.registry.selected_backend -ne 'cpu') {
+            Write-Error 'clean Windows package verification failed'
+            exit 1
+          }
+
+  publish:
+    name: publish gated release
+    needs: [build, verify-packages]
+    if: startsWith(github.ref, 'refs/tags/') && vars.GREPPY_INFERENCE_RELEASE_READY == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Attach verified packages to release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.asset }}
+          files: |
+            release-assets/**/*.tar.gz
+            release-assets/**/*.zip
           fail_on_unmatched_files: true

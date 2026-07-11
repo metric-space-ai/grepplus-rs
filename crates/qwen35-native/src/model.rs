@@ -11,36 +11,7 @@ use crate::sampler::{
 };
 use crate::{Error, Result};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DevicePreference {
-    Auto,
-    Cpu,
-    Metal,
-    Cuda,
-}
-
-impl DevicePreference {
-    pub fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Ok(Self::Auto),
-            "cpu" => Ok(Self::Cpu),
-            "metal" => Ok(Self::Metal),
-            "cuda" => Ok(Self::Cuda),
-            other => Err(Error::InvalidRequest(format!(
-                "unsupported device `{other}`; expected auto|cpu|metal|cuda"
-            ))),
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Cpu => "cpu",
-            Self::Metal => "metal",
-            Self::Cuda => "cuda",
-        }
-    }
-}
+pub use greppy_embed_native::DevicePreference;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadOptions {
@@ -75,7 +46,29 @@ impl Qwen35Summarizer {
         tokenizer_json_path: impl AsRef<Path>,
         options: LoadOptions,
     ) -> Result<Self> {
-        let model = greppy_embed_native::GgufModel::open(gguf_path.as_ref())?;
+        let gguf_path = gguf_path.as_ref();
+        if matches!(
+            options.device,
+            DevicePreference::Metal | DevicePreference::Cuda
+        ) {
+            let selector = if options.device == DevicePreference::Cuda {
+                std::env::var("GREPPY_QWEN35_CUDA_DEVICE")
+                    .or_else(|_| std::env::var("EMBED_NATIVE_CUDA_DEVICE"))
+                    .ok()
+                    .map(|index| format!("cuda:{index}"))
+                    .unwrap_or_else(|| "cuda".into())
+            } else {
+                "metal".into()
+            };
+            let policy =
+                greppy_embed_native::InferencePolicy::from_selector(Some(&selector), false)?;
+            greppy_embed_native::preflight_explicit_model(
+                &policy,
+                greppy_embed_native::InferenceModelKind::Qwen35,
+                std::fs::metadata(gguf_path)?.len(),
+            )?;
+        }
+        let model = greppy_embed_native::GgufModel::open(gguf_path)?;
         let inventory = Qwen35Inventory::from_gguf(&model)?;
         inventory.validate_core_tensors(&model)?;
         let tokenizer = Tokenizer::from_file(tokenizer_json_path.as_ref())
@@ -499,8 +492,8 @@ fn load_backend(
     match options.device {
         DevicePreference::Cpu => load_cpu_backend(model, inventory, eos_token_id),
         DevicePreference::Auto => load_auto_backend(model, inventory, eos_token_id),
-        DevicePreference::Metal => load_metal_with_cpu_fallback(model, inventory, eos_token_id),
-        DevicePreference::Cuda => load_cuda_with_cpu_fallback(model, inventory, eos_token_id),
+        DevicePreference::Metal => load_metal_backend(model, inventory, eos_token_id),
+        DevicePreference::Cuda => load_cuda_backend(model, inventory, eos_token_id),
     }
 }
 
@@ -534,6 +527,7 @@ fn load_auto_backend(
     }
 }
 
+#[cfg(all(feature = "metal", target_os = "macos"))]
 fn load_metal_with_cpu_fallback(
     model: &greppy_embed_native::GgufModel,
     inventory: Qwen35Inventory,
@@ -548,6 +542,7 @@ fn load_metal_with_cpu_fallback(
     }
 }
 
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 fn load_cuda_with_cpu_fallback(
     model: &greppy_embed_native::GgufModel,
     inventory: Qwen35Inventory,

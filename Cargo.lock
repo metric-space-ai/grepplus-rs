@@ -642,11 +642,13 @@ dependencies = [
  "greppy-qwen35-native",
  "greppy-search",
  "greppy-store",
+ "libc",
  "rusqlite",
  "serde_json",
  "sha2",
  "thiserror 1.0.69",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -657,6 +659,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -687,8 +690,10 @@ dependencies = [
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokenizers",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

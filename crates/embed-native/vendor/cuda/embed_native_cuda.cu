@@ -19,6 +19,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "mmq.cuh"
 #include "quantize.cuh"
@@ -93,6 +94,71 @@ GP_CUDA_EXPORT const char * gp_cuda_error_string(int code) {
         case 10000 + CUBLAS_STATUS_NOT_SUPPORTED: return "CUBLAS_STATUS_NOT_SUPPORTED";
         default: return "unknown CUDA/cuBLAS error";
     }
+}
+
+#define GP_CUDA_BACKEND_ABI_VERSION 1
+
+struct gp_cuda_device_properties {
+    int index;
+    int compatible;
+    int cc_major;
+    int cc_minor;
+    unsigned long long memory_free;
+    unsigned long long memory_total;
+    char name[256];
+    char reason[256];
+};
+
+GP_CUDA_EXPORT unsigned int gp_backend_abi_version() {
+    return GP_CUDA_BACKEND_ABI_VERSION;
+}
+
+GP_CUDA_EXPORT const char * gp_backend_build_info() {
+    return "greppy-cuda-q4k;abi=1;min-cc=7.5";
+}
+
+GP_CUDA_EXPORT int gp_backend_probe() {
+    CUresult cu = cuInit(0);
+    if (cu != CUDA_SUCCESS) return GP_CUDA_DRIVER_ERROR_BASE + (int) cu;
+    int count = 0;
+    cudaError_t err = cudaGetDeviceCount(&count);
+    if (err != cudaSuccess) return (int) err;
+    return count > 0 ? 0 : (int) cudaErrorNoDevice;
+}
+
+GP_CUDA_EXPORT int gp_cuda_device_count(int * count_out) {
+    if (count_out == nullptr) return (int) cudaErrorInvalidValue;
+    CUresult cu = cuInit(0);
+    if (cu != CUDA_SUCCESS) return GP_CUDA_DRIVER_ERROR_BASE + (int) cu;
+    return (int) cudaGetDeviceCount(count_out);
+}
+
+GP_CUDA_EXPORT int gp_cuda_device_properties_at(int device, gp_cuda_device_properties * out) {
+    if (out == nullptr) return (int) cudaErrorInvalidValue;
+    memset(out, 0, sizeof(*out));
+    out->index = device;
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) return (int) err;
+    out->cc_major = prop.major;
+    out->cc_minor = prop.minor;
+    out->compatible = prop.major * 10 + prop.minor >= 75;
+    snprintf(out->name, sizeof(out->name), "%s", prop.name);
+    if (!out->compatible) {
+        snprintf(out->reason, sizeof(out->reason), "compute capability %d.%d is below 7.5", prop.major, prop.minor);
+    }
+    int previous = 0;
+    const bool had_previous = cudaGetDevice(&previous) == cudaSuccess;
+    err = cudaSetDevice(device);
+    if (err != cudaSuccess) return (int) err;
+    size_t free_vram = 0;
+    size_t total_vram = 0;
+    err = cudaMemGetInfo(&free_vram, &total_vram);
+    if (had_previous && previous != device) cudaSetDevice(previous);
+    if (err != cudaSuccess) return (int) err;
+    out->memory_free = (unsigned long long) free_vram;
+    out->memory_total = (unsigned long long) total_vram;
+    return 0;
 }
 
 GP_CUDA_EXPORT int gp_cuda_init(int device, void ** stream_out, void ** blas_out) {

@@ -17,6 +17,8 @@
 
 #![deny(rust_2018_idioms)]
 
+pub mod backend;
+pub mod cpu_features;
 pub mod gguf;
 pub mod matmul;
 pub mod model;
@@ -30,6 +32,11 @@ pub mod metal;
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 pub mod cuda;
 
+pub use backend::{
+    device_has_memory, estimated_gpu_memory, preflight_explicit_model, BackendKind, BackendProbe,
+    DeviceInfo, DeviceType, InferenceBackendRegistry, InferenceModelKind, InferencePolicy,
+    BACKEND_REGISTRY_VERSION, GPU_MEMORY_SAFETY_MARGIN,
+};
 pub use gguf::{GgufModel, TensorInfo, TensorView, Value, ValueType, VersionedMagic};
 pub use model::{CpuEmbeddingModel, StageOutput};
 pub use quant::GgmlDType;
@@ -51,7 +58,8 @@ pub const PROMPT_VERSION: &str = "embeddinggemma-code-retrieval-st-v2";
 /// greppy vector-store profile key for code retrieval.
 pub const CODE_RETRIEVAL_PROFILE: &str = "embeddinggemma_code_retrieval";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DevicePreference {
     Auto,
     Cpu,
@@ -61,13 +69,24 @@ pub enum DevicePreference {
 
 impl DevicePreference {
     pub fn parse(value: &str) -> Result<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
+        let normalized = value.trim().to_ascii_lowercase();
+        match normalized.as_str() {
             "auto" => Ok(Self::Auto),
             "cpu" => Ok(Self::Cpu),
             "metal" => Ok(Self::Metal),
             "cuda" => Ok(Self::Cuda),
+            selector if selector.starts_with("cuda:") => {
+                let index = selector.trim_start_matches("cuda:");
+                if index.parse::<i32>().is_ok_and(|index| index >= 0) {
+                    Ok(Self::Cuda)
+                } else {
+                    Err(Error::InvalidGguf(format!(
+                        "unsupported CUDA device selector `{value}`; expected cuda:INDEX"
+                    )))
+                }
+            }
             other => Err(Error::InvalidGguf(format!(
-                "unsupported device `{other}`; expected auto|cpu|metal|cuda"
+                "unsupported device `{other}`; expected auto|cpu|metal|cuda[:INDEX]"
             ))),
         }
     }
@@ -143,6 +162,26 @@ impl EmbeddingGemma {
         tokenizer_json_path: Q,
         options: LoadOptions,
     ) -> Result<Self> {
+        let gguf_path = gguf_path.as_ref();
+        if matches!(
+            options.device,
+            DevicePreference::Metal | DevicePreference::Cuda
+        ) {
+            let selector = if options.device == DevicePreference::Cuda {
+                std::env::var("EMBED_NATIVE_CUDA_DEVICE")
+                    .ok()
+                    .map(|index| format!("cuda:{index}"))
+                    .unwrap_or_else(|| "cuda".into())
+            } else {
+                "metal".into()
+            };
+            let policy = InferencePolicy::from_selector(Some(&selector), false)?;
+            preflight_explicit_model(
+                &policy,
+                InferenceModelKind::EmbeddingGemma,
+                std::fs::metadata(gguf_path)?.len(),
+            )?;
+        }
         let gguf = GgufModel::open(gguf_path)?;
         let mut tokenizer_config = TokenizerConfig::from_gguf(&gguf)?;
         if let Some(max_length) = options.max_length {
@@ -225,23 +264,19 @@ fn load_backend(model: &GgufModel, preference: &DevicePreference) -> Result<Embe
         DevicePreference::Cpu => CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu),
         DevicePreference::Auto => load_auto_backend(model),
         #[cfg(all(feature = "metal", target_os = "macos"))]
-        DevicePreference::Metal => load_metal_with_cpu_fallback(model),
-        #[cfg(not(all(feature = "metal", target_os = "macos")))]
         DevicePreference::Metal => {
-            eprintln!(
-                "greppy_embed_native: Metal backend not available in this build, falling back to CPU"
-            );
-            CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
+            MetalEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Metal)
         }
+        #[cfg(not(all(feature = "metal", target_os = "macos")))]
+        DevicePreference::Metal => Err(Error::InvalidGguf(
+            "Metal was explicitly requested but is unavailable in this build/platform".into(),
+        )),
         #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-        DevicePreference::Cuda => load_cuda_with_cpu_fallback(model),
+        DevicePreference::Cuda => CudaEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cuda),
         #[cfg(not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))))]
-        DevicePreference::Cuda => {
-            eprintln!(
-                "greppy_embed_native: CUDA backend not available in this build, falling back to CPU"
-            );
-            CpuEmbeddingModel::from_gguf(model).map(EmbeddingBackend::Cpu)
-        }
+        DevicePreference::Cuda => Err(Error::InvalidGguf(
+            "CUDA was explicitly requested but is unavailable in this build/platform".into(),
+        )),
     }
 }
 

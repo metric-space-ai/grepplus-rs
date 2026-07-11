@@ -78,16 +78,16 @@ fn x86_kernel_kind() -> X86KernelKind {
             .map(|v| v.trim().to_ascii_lowercase());
         match requested.as_deref() {
             Some("scalar" | "none" | "off" | "0") => return X86KernelKind::Scalar,
-            Some("avx2") if is_x86_feature_detected!("avx2") => return X86KernelKind::Avx2,
-            Some("avx-vnni" | "avxvnni" | "vnni") if is_x86_feature_detected!("avxvnni") => {
+            Some("avx2") if crate::cpu_features::has_avx2() => return X86KernelKind::Avx2,
+            Some("avx-vnni" | "avxvnni" | "vnni") if crate::cpu_features::has_avx_vnni() => {
                 return X86KernelKind::AvxVnni;
             }
             _ => {}
         }
 
-        if is_x86_feature_detected!("avxvnni") {
+        if crate::cpu_features::has_avx_vnni() {
             X86KernelKind::AvxVnni
-        } else if is_x86_feature_detected!("avx2") {
+        } else if crate::cpu_features::has_avx2() {
             X86KernelKind::Avx2
         } else {
             X86KernelKind::Scalar
@@ -6630,6 +6630,20 @@ mod arm_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod x86_tests {
     use super::*;
+
+    #[test]
+    fn cpu_simd_override_selects_requested_supported_kernel() {
+        let requested = std::env::var("EMBED_NATIVE_CPU_SIMD").unwrap_or_default();
+        let expected = match requested.as_str() {
+            "scalar" => Some("scalar"),
+            "avx2" if crate::cpu_features::has_avx2() => Some("avx2"),
+            "avx-vnni" if crate::cpu_features::has_avx_vnni() => Some("avx-vnni"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            assert_eq!(cpu_simd_backend(), expected);
+        }
+    }
 
     #[test]
     fn q5kx8_q8kx4_avxvnni_matches_rowwise_avx2() {

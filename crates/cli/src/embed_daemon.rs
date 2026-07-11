@@ -1,76 +1,42 @@
-//! Warm embedding daemon: keeps the EmbeddingGemma model resident across CLI
-//! invocations so a query-cache miss costs one local IPC round-trip (~ms)
-//! instead of a full model load (~0.2–0.4s CPU, more with GPU init).
-//!
-//! Resource lifecycle (owner requirement — never hold GPU memory while idle):
-//! the daemon lazy-loads the model on the FIRST request, DROPS it after
-//! `GREPPY_EMBED_DAEMON_MODEL_TTL_S` idle seconds (default 300 — frees VRAM
-//! via the backend Drop impls), and EXITS after
-//! `GREPPY_EMBED_DAEMON_EXIT_TTL_S` idle seconds (default 1800, socket
-//! unlinked). One socket per MODEL IDENTITY: the socket file name embeds a
-//! hash of the query-cache key (model id + prompt version + file
-//! fingerprints), so a swapped GGUF simply routes to a fresh daemon and the
-//! stale one idles out. Requests are served one connection at a time.
-//!
-//! The client treats the daemon as a pure accelerator: ANY failure (connect,
-//! spawn, protocol, version skew) silently falls back to the in-process
-//! load — behaviour is never worse than before. `GREPPY_NO_EMBED_DAEMON=1`
-//! disables it entirely.
-#![cfg(unix)]
+//! Warm EmbeddingGemma daemon built on the shared inference lifecycle.
+#![cfg(any(unix, windows))]
 
-use std::hash::{Hash, Hasher};
-use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use super::inference_daemon::{self, Endpoint, RequestOutcome, ServerPolicy, PROTOCOL_VERSION};
 
 const ENV_DISABLE: &str = "GREPPY_NO_EMBED_DAEMON";
 const ENV_MODEL_TTL: &str = "GREPPY_EMBED_DAEMON_MODEL_TTL_S";
 const ENV_EXIT_TTL: &str = "GREPPY_EMBED_DAEMON_EXIT_TTL_S";
-const ENV_LOG: &str = "GREPPY_EMBED_DAEMON_LOG";
 const DEFAULT_MODEL_TTL_S: u64 = 300;
 const DEFAULT_EXIT_TTL_S: u64 = 1800;
-/// Generous: the first request pays the lazy model load (incl. GPU init).
 const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(60);
-const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Cap a request line so a corrupt client can't balloon daemon memory.
-const MAX_REQUEST_BYTES: u64 = 1 << 20;
-
-fn log_enabled() -> bool {
-    std::env::var_os(ENV_LOG).is_some()
-}
+const MAX_REQUEST_BYTES: usize = 1 << 20;
+const MAX_RESPONSE_BYTES: usize = 4 << 20;
 
 fn env_secs(name: &str, default: u64) -> u64 {
     std::env::var(name)
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(default)
 }
 
-/// Deterministic per-model socket name. `DefaultHasher::new()` uses fixed
-/// SipHash keys (unlike `HashMap`'s `RandomState`), so the hash is stable
-/// across processes and rust versions in practice; a collision would only
-/// merge two of one user's model sockets, and the prompt-version handshake
-/// still guards correctness.
-fn socket_path(model_key: &str) -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let dir = PathBuf::from(home).join(".cache").join("greppy");
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    model_key.hash(&mut h);
-    Some(dir.join(format!("embedd-{:016x}.sock", h.finish())))
+fn endpoint(cfg: &super::EmbeddingModelConfig, model_key: &str) -> Option<Endpoint> {
+    Endpoint::for_identity(
+        "embedding",
+        &format!(
+            "{model_key}|{}",
+            super::inference_device_identity(&cfg.device)
+        ),
+    )
 }
 
-fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dir)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+pub(super) fn status(cfg: &super::EmbeddingModelConfig, model_key: &str) -> serde_json::Value {
+    endpoint(cfg, model_key)
+        .map(|endpoint| inference_daemon::diagnostic(&endpoint))
+        .unwrap_or_else(|| serde_json::json!({"state": "unsupported"}))
 }
 
-// ---------------------------------------------------------------- client --
-
-/// Try to embed `text` (already normalized) via a warm daemon for `cfg`'s
-/// model. Returns `None` on ANY problem — the caller falls back to the
-/// in-process load.
 pub(super) fn embed_query_via_daemon(
     cfg: &super::EmbeddingModelConfig,
     model_key: &str,
@@ -82,41 +48,73 @@ pub(super) fn embed_query_via_daemon(
     let super::EmbeddingModelSource::Gguf { .. } = &cfg.source else {
         return None;
     };
-    let sock = socket_path(model_key)?;
-
-    if let Some(v) = request(&sock, text) {
-        return Some(v);
+    let endpoint = endpoint(cfg, model_key)?;
+    match request_embedding(&endpoint, model_key, text) {
+        RequestOutcome::Response(vector) => return Some(vector),
+        RequestOutcome::Failed => return None,
+        RequestOutcome::NoDaemon => {}
     }
 
-    // No live daemon: remove a stale socket file, spawn one, retry briefly.
-    let _ = std::fs::remove_file(&sock);
-    spawn_daemon(cfg, &sock, false)?;
-
-    // The daemon binds the socket before serving; poll until it appears.
-    for _ in 0..30 {
-        std::thread::sleep(Duration::from_millis(100));
-        if let Some(v) = request(&sock, text) {
-            return Some(v);
+    inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, false));
+    for delay in inference_daemon::retry_delays() {
+        std::thread::sleep(delay);
+        match request_embedding(&endpoint, model_key, text) {
+            RequestOutcome::Response(vector) => return Some(vector),
+            RequestOutcome::Failed => return None,
+            RequestOutcome::NoDaemon => {}
         }
     }
+    inference_daemon::record_spawn_failure(&endpoint);
     None
 }
 
-/// Spawn the daemon process detached (new process group; survives this CLI).
+fn request_embedding(endpoint: &Endpoint, model_key: &str, text: &str) -> RequestOutcome<Vec<f32>> {
+    let request = serde_json::json!({
+        "pv": greppy_embed_native::PROMPT_VERSION,
+        "mk": model_key,
+        "text": text,
+    });
+    match inference_daemon::request(endpoint, request, CLIENT_READ_TIMEOUT, MAX_RESPONSE_BYTES) {
+        RequestOutcome::Response(response) => {
+            if response.get("error").is_some() {
+                return RequestOutcome::Failed;
+            }
+            let Some(values) = response.get("v_bits").and_then(serde_json::Value::as_array) else {
+                return RequestOutcome::Failed;
+            };
+            let vector = values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|bits| u32::try_from(bits).ok())
+                        .map(f32::from_bits)
+                })
+                .collect::<Option<Vec<_>>>();
+            match vector {
+                Some(vector) if !vector.is_empty() => RequestOutcome::Response(vector),
+                _ => RequestOutcome::Failed,
+            }
+        }
+        RequestOutcome::NoDaemon => RequestOutcome::NoDaemon,
+        RequestOutcome::Failed => RequestOutcome::Failed,
+    }
+}
+
 fn spawn_daemon(
     cfg: &super::EmbeddingModelConfig,
-    sock: &std::path::Path,
+    endpoint: &Endpoint,
     prewarm: bool,
 ) -> Option<()> {
     let super::EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source else {
         return None;
     };
-    ensure_private_dir(sock.parent()?).ok()?;
-    let exe = std::env::current_exe().ok()?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("embed-daemon")
+    let executable = std::env::current_exe().ok()?;
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg("embed-daemon")
         .arg("--socket")
-        .arg(sock)
+        .arg(endpoint.address())
         .arg("--gguf")
         .arg(gguf)
         .arg("--tokenizer")
@@ -125,219 +123,117 @@ fn spawn_daemon(
         .arg(&cfg.model_id)
         .arg("--device")
         .arg(cfg.device.as_str());
-    if let Some(len) = cfg.max_length {
-        cmd.arg("--max-length").arg(len.to_string());
+    if let Some(length) = cfg.max_length {
+        command.arg("--max-length").arg(length.to_string());
     }
     if prewarm {
-        cmd.arg("--prewarm");
+        command.arg("--prewarm");
     }
-    cmd.stdin(std::process::Stdio::null())
+    command
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    {
-        // New process group: the daemon must outlive this CLI invocation and
-        // not die with its (interactive) process group.
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    cmd.spawn().ok().map(|_| ())
+    inference_daemon::detach_command(&mut command);
+    command.spawn().ok().map(|_| ())
 }
 
-/// O5: nudge the daemon into existence (and model load) in the BACKGROUND
-/// from the first graph command of a session, so the session's first
-/// semantic query hits a warm model instead of paying the cold start.
-/// Fire-and-forget and strictly best-effort; respects the opt-out. Only
-/// fires when the caller has already established that semantic search is
-/// actually in play (model configured AND the store holds vectors) — a
-/// prewarm that loads a model nobody will query would hold GPU memory for
-/// a TTL for nothing.
 pub(super) fn prewarm_from_env(cfg: &super::EmbeddingModelConfig, model_key: &str) {
     if std::env::var_os(ENV_DISABLE).is_some() {
         return;
     }
-    let Some(sock) = socket_path(model_key) else {
+    let Some(endpoint) = endpoint(cfg, model_key) else {
         return;
     };
-    if UnixStream::connect(&sock).is_ok() {
-        return; // already warm (or warming)
+    let ping = serde_json::json!({"op": "ping"});
+    if matches!(
+        inference_daemon::request(&endpoint, ping, Duration::from_secs(1), 4096),
+        RequestOutcome::Response(_)
+    ) {
+        return;
     }
-    let _ = std::fs::remove_file(&sock);
-    let _ = spawn_daemon(cfg, &sock, true);
+    let _ = inference_daemon::spawn_once(&endpoint, || spawn_daemon(cfg, &endpoint, true));
 }
 
-/// One request/response over an existing daemon socket. `None` = any failure.
-fn request(sock: &std::path::Path, text: &str) -> Option<Vec<f32>> {
-    let stream = UnixStream::connect(sock).ok()?;
-    stream.set_write_timeout(Some(CLIENT_WRITE_TIMEOUT)).ok()?;
-    stream.set_read_timeout(Some(CLIENT_READ_TIMEOUT)).ok()?;
-    let mut writer = stream.try_clone().ok()?;
-    let req = serde_json::json!({
-        "pv": greppy_embed_native::PROMPT_VERSION,
-        "text": text,
-    });
-    writer.write_all(req.to_string().as_bytes()).ok()?;
-    writer.write_all(b"\n").ok()?;
-    writer.flush().ok()?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    let resp: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    if resp.get("error").is_some() {
-        return None;
-    }
-    let v = resp.get("v")?.as_array()?;
-    let out: Option<Vec<f32>> = v.iter().map(|x| x.as_f64().map(|f| f as f32)).collect();
-    out.filter(|o| !o.is_empty())
-}
-
-// ---------------------------------------------------------------- server --
-
-/// Daemon entry point (hidden `embed-daemon` subcommand). Never returns.
-/// With `prewarm` the model is loaded immediately at startup (spawned from
-/// a session's first graph command) instead of on the first request; the
-/// idle TTLs then govern its lifetime exactly as usual.
-pub(super) fn daemon_main(socket: PathBuf, cfg: super::EmbeddingModelConfig, prewarm: bool) -> ! {
-    let model_ttl = Duration::from_secs(env_secs(ENV_MODEL_TTL, DEFAULT_MODEL_TTL_S));
-    let exit_ttl = Duration::from_secs(env_secs(ENV_EXIT_TTL, DEFAULT_EXIT_TTL_S));
-
-    if let Some(parent) = socket.parent() {
-        if ensure_private_dir(parent).is_err() {
-            std::process::exit(1);
-        }
-    }
-    let listener = match UnixListener::bind(&socket) {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-            if UnixStream::connect(&socket).is_ok() {
-                // Lost a spawn race to a live daemon — defer to it.
-                std::process::exit(0);
-            }
-            let _ = std::fs::remove_file(&socket);
-            match UnixListener::bind(&socket) {
-                Ok(l) => l,
-                Err(_) => std::process::exit(1),
-            }
-        }
-        Err(_) => std::process::exit(1),
-    };
-    if listener.set_nonblocking(true).is_err() {
-        let _ = std::fs::remove_file(&socket);
+pub(super) fn daemon_main(socket: String, cfg: super::EmbeddingModelConfig, prewarm: bool) -> ! {
+    let model_key = super::embedding_query_cache_key(&cfg);
+    let Some(endpoint) = endpoint(&cfg, &model_key) else {
         std::process::exit(1);
-    }
-    if log_enabled() {
-        eprintln!(
-            "embed-daemon: serving {} (model ttl {:?}, exit ttl {:?})",
-            socket.display(),
-            model_ttl,
-            exit_ttl
-        );
-    }
-
-    let mut model: Option<super::LoadedEmbeddingModel> = None;
-    let mut last_used = Instant::now();
-    if prewarm {
-        let t0 = Instant::now();
-        match super::load_embedding_model(&cfg, None) {
-            Ok(m) => {
-                if log_enabled() {
-                    eprintln!("embed-daemon: prewarmed model in {:?}", t0.elapsed());
-                }
-                model = Some(m);
-                last_used = Instant::now();
-            }
-            Err(_) => { /* first request will retry (and report) the load */ }
-        }
-    }
-
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                handle_connection(stream, &cfg, &mut model);
-                last_used = Instant::now();
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(_) => std::thread::sleep(Duration::from_millis(200)),
-        }
-        let idle = last_used.elapsed();
-        if model.is_some() && idle >= model_ttl {
-            model = None; // Drop frees weights + GPU buffers (VRAM).
-            if log_enabled() {
-                eprintln!("embed-daemon: model dropped after {idle:?} idle");
-            }
-        }
-        if idle >= exit_ttl {
-            let _ = std::fs::remove_file(&socket);
-            if log_enabled() {
-                eprintln!("embed-daemon: exiting after {idle:?} idle");
-            }
-            std::process::exit(0);
-        }
-    }
+    };
+    let policy = ServerPolicy {
+        model_ttl: Duration::from_secs(env_secs(ENV_MODEL_TTL, DEFAULT_MODEL_TTL_S)),
+        exit_ttl: Duration::from_secs(env_secs(ENV_EXIT_TTL, DEFAULT_EXIT_TTL_S)),
+        request_deadline: CLIENT_READ_TIMEOUT,
+        max_request_bytes: MAX_REQUEST_BYTES,
+        max_response_bytes: MAX_RESPONSE_BYTES,
+    };
+    inference_daemon::serve(
+        endpoint,
+        &socket,
+        policy,
+        prewarm,
+        || super::load_embedding_model(&cfg, None).map_err(|error| error.to_string()),
+        |raw| validate(raw, &model_key),
+        |raw, model| respond(raw, &model_key, model),
+        "embed-daemon",
+    )
 }
 
-fn handle_connection(
-    stream: UnixStream,
-    cfg: &super::EmbeddingModelConfig,
-    model: &mut Option<super::LoadedEmbeddingModel>,
-) {
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
-    let mut writer = match stream.try_clone() {
-        Ok(w) => w,
-        Err(_) => return,
-    };
-    let mut line = String::new();
+fn validate(raw: &str, model_key: &str) -> Result<(), serde_json::Value> {
+    let request: serde_json::Value = serde_json::from_str(raw.trim())
+        .map_err(|error| serde_json::json!({"error": format!("bad request: {error}")}))?;
+    if request.get("pv").and_then(serde_json::Value::as_str)
+        != Some(greppy_embed_native::PROMPT_VERSION)
     {
-        let mut reader = BufReader::new(&stream).take(MAX_REQUEST_BYTES);
-        if reader.read_line(&mut line).is_err() {
-            return;
-        }
+        return Err(serde_json::json!({"error": "prompt-version mismatch"}));
     }
-    let reply = respond(line.trim(), cfg, model);
-    let _ = writer.write_all(reply.to_string().as_bytes());
-    let _ = writer.write_all(b"\n");
-    let _ = writer.flush();
+    if request.get("mk").and_then(serde_json::Value::as_str) != Some(model_key) {
+        return Err(serde_json::json!({"error": "model-key mismatch"}));
+    }
+    if request
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Err(serde_json::json!({"error": "missing text"}));
+    }
+    Ok(())
 }
 
 fn respond(
     raw: &str,
-    cfg: &super::EmbeddingModelConfig,
+    model_key: &str,
     model: &mut Option<super::LoadedEmbeddingModel>,
 ) -> serde_json::Value {
-    let req: serde_json::Value = match serde_json::from_str(raw) {
-        Ok(v) => v,
-        Err(e) => return serde_json::json!({"error": format!("bad request: {e}")}),
+    let request: serde_json::Value = match serde_json::from_str(raw.trim()) {
+        Ok(request) => request,
+        Err(error) => return serde_json::json!({"error": format!("bad request: {error}")}),
     };
-    if req.get("pv").and_then(|v| v.as_str()) != Some(greppy_embed_native::PROMPT_VERSION) {
-        // Client built against a different prompt contract: make it fall
-        // back to its own in-process model rather than serve skewed vectors.
+    if request.get("protocol").and_then(serde_json::Value::as_u64)
+        != Some(u64::from(PROTOCOL_VERSION))
+    {
+        return serde_json::json!({"error": "protocol-version mismatch"});
+    }
+    if request.get("pv").and_then(serde_json::Value::as_str)
+        != Some(greppy_embed_native::PROMPT_VERSION)
+    {
         return serde_json::json!({"error": "prompt-version mismatch"});
     }
-    let Some(text) = req.get("text").and_then(|v| v.as_str()) else {
+    if request.get("mk").and_then(serde_json::Value::as_str) != Some(model_key) {
+        return serde_json::json!({"error": "model-key mismatch"});
+    }
+    let Some(text) = request.get("text").and_then(serde_json::Value::as_str) else {
         return serde_json::json!({"error": "missing text"});
     };
-    if model.is_none() {
-        let t0 = Instant::now();
-        match super::load_embedding_model(cfg, None) {
-            Ok(m) => {
-                if log_enabled() {
-                    eprintln!("embed-daemon: model loaded in {:?}", t0.elapsed());
-                }
-                *model = Some(m);
-            }
-            Err(e) => return serde_json::json!({"error": format!("model load: {e}")}),
-        }
-    }
-    let m = model.as_ref().expect("model just ensured above");
-    match greppy_search::embed_code_query(m, text) {
-        Ok(v) => serde_json::json!({ "v": v }),
-        Err(e) => {
-            // A failed inference may leave GPU state suspect: drop the model
-            // so the next request reloads cleanly (or the client falls back).
+    let Some(loaded) = model.as_ref() else {
+        return serde_json::json!({"error": "model unavailable"});
+    };
+    match greppy_search::embed_code_query(loaded, text) {
+        Ok(vector) => serde_json::json!({
+            "v_bits": vector.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        }),
+        Err(error) => {
             *model = None;
-            serde_json::json!({"error": format!("embed: {e}")})
+            serde_json::json!({"error": format!("embed: {error}")})
         }
     }
 }
@@ -350,5 +246,27 @@ mod tests {
     fn default_ttls_cover_agent_session_bursts() {
         assert_eq!(DEFAULT_MODEL_TTL_S, 300);
         assert_eq!(DEFAULT_EXIT_TTL_S, 1800);
+    }
+
+    #[test]
+    fn protocol_identity_is_rejected_before_model_loading() {
+        let request = serde_json::json!({
+            "pv": "old-prompt",
+            "mk": "model-key",
+            "text": "query",
+        });
+        assert_eq!(
+            validate(&request.to_string(), "model-key").unwrap_err()["error"],
+            "prompt-version mismatch"
+        );
+        let request = serde_json::json!({
+            "pv": greppy_embed_native::PROMPT_VERSION,
+            "mk": "other-model",
+            "text": "query",
+        });
+        assert_eq!(
+            validate(&request.to_string(), "model-key").unwrap_err()["error"],
+            "model-key mismatch"
+        );
     }
 }

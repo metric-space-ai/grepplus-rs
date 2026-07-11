@@ -19,7 +19,8 @@ const EXP_C9: f32 = f32::from_bits(0x3c07_2010);
 
 pub(crate) fn silu_in_place(values: &mut [f32]) {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+    if greppy_embed_native::cpu_features::has_avx2() && greppy_embed_native::cpu_features::has_fma()
+    {
         unsafe {
             silu_in_place_avx2(values);
         }
@@ -42,7 +43,8 @@ pub(crate) fn swiglu_in_place(gate: &mut [f32], up: &[f32]) {
     debug_assert_eq!(gate.len(), up.len());
 
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+    if greppy_embed_native::cpu_features::has_avx2() && greppy_embed_native::cpu_features::has_fma()
+    {
         unsafe {
             swiglu_in_place_avx2(gate, up);
         }
@@ -65,7 +67,8 @@ pub(crate) fn mul_silu_in_place(values: &mut [f32], gate: &[f32]) {
     debug_assert_eq!(values.len(), gate.len());
 
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+    if greppy_embed_native::cpu_features::has_avx2() && greppy_embed_native::cpu_features::has_fma()
+    {
         unsafe {
             mul_silu_in_place_avx2(values, gate);
         }
@@ -88,7 +91,8 @@ pub(crate) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) {
     debug_assert_eq!(values.len(), gate.len());
 
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+    if greppy_embed_native::cpu_features::has_avx2() && greppy_embed_native::cpu_features::has_fma()
+    {
         unsafe {
             mul_sigmoid_in_place_avx2(values, gate);
         }
@@ -109,7 +113,8 @@ pub(crate) fn mul_sigmoid_in_place(values: &mut [f32], gate: &[f32]) {
 
 pub(crate) fn exp_sum_shifted_in_place(values: &mut [f32], shift: f32) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+    if greppy_embed_native::cpu_features::has_avx2() && greppy_embed_native::cpu_features::has_fma()
+    {
         unsafe {
             return exp_sum_shifted_in_place_avx2(values, shift);
         }

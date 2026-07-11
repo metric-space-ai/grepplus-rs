@@ -58,18 +58,31 @@ fn build_cuda() {
     println!("cargo:rerun-if-changed={}", ggml_include.display());
 
     let nvcc = env::var("NVCC").unwrap_or_else(|_| "nvcc".into());
+    let nvcc_path = resolve_executable(&nvcc)
+        .unwrap_or_else(|| PathBuf::from(&nvcc))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(&nvcc));
     let arch_list = cuda_arch_list();
     let ext = if target_os == "windows" { "dll" } else { "so" };
     let lib = out_dir.join(format!("greppy_embed_native_cuda.{ext}"));
-    let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| {
-        if target_os == "windows" {
-            "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6".into()
-        } else {
-            "/usr/local/cuda".into()
-        }
-    });
+    let cuda_home = env::var("CUDA_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            nvcc_path
+                .canonicalize()
+                .ok()
+                .and_then(|path| path.parent()?.parent().map(Path::to_path_buf))
+        })
+        .unwrap_or_else(|| {
+            if target_os == "windows" {
+                PathBuf::from("C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.6")
+            } else {
+                PathBuf::from("/usr/local/cuda")
+            }
+        });
     compile_cuda_dylib(
-        &nvcc,
+        &nvcc_path,
         &arch_list,
         &target_os,
         &cuda_home,
@@ -85,6 +98,16 @@ fn build_cuda() {
         lib.display()
     );
     println!("cargo:rustc-cfg=embed_native_has_cuda_dylib");
+}
+
+fn resolve_executable(name: &str) -> Option<PathBuf> {
+    let candidate = PathBuf::from(name);
+    if candidate.components().count() > 1 {
+        return candidate.is_file().then_some(candidate);
+    }
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
 }
 
 fn cuda_arch_list() -> Vec<String> {
@@ -109,10 +132,10 @@ fn cuda_arch_list() -> Vec<String> {
 }
 
 fn compile_cuda_dylib(
-    nvcc: &str,
+    nvcc: &Path,
     arch_list: &[String],
     target_os: &str,
-    cuda_home: &str,
+    cuda_home: &Path,
     wrapper: &Path,
     quantize: &Path,
     lib: &Path,
@@ -121,7 +144,23 @@ fn compile_cuda_dylib(
     cuda_dir: &Path,
 ) {
     let mut cmd = Command::new(nvcc);
+    if let Some(toolkit_bin) = nvcc
+        .canonicalize()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        let mut search_path = vec![toolkit_bin, cuda_home.join("nvvm").join("bin")];
+        if let Some(current) = env::var_os("PATH") {
+            search_path.extend(env::split_paths(&current));
+        }
+        if let Ok(joined) = env::join_paths(search_path) {
+            cmd.env("PATH", joined);
+        }
+    }
     cmd.args(["-shared", "-std=c++17", "-O3", "--expt-relaxed-constexpr"]);
+    if target_os == "linux" {
+        cmd.arg("--cudart=static");
+    }
     if target_os != "windows" {
         cmd.args(["-Xcompiler", "-fPIC"]);
     }
@@ -139,16 +178,15 @@ fn compile_cuda_dylib(
         // Microsoft Visual Studio version"). Our kernels don't touch the
         // version-sensitive surface, so allow the newer host compiler.
         cmd.arg("-allow-unsupported-compiler");
-        let cuda_include = PathBuf::from(cuda_home).join("include");
+        let cuda_include = cuda_home.join("include");
         if cuda_include.is_dir() {
             cmd.arg(format!("-I{}", cuda_include.display()));
         }
-        let cuda_lib = PathBuf::from(cuda_home).join("lib").join("x64");
+        let cuda_lib = cuda_home.join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
         }
     } else {
-        let cuda_home = PathBuf::from(cuda_home);
         let cuda_include = cuda_home.join("include");
         let cuda_target = cuda_home.join("targets").join("x86_64-linux");
         let cuda_target_include = cuda_target.join("include");
@@ -164,15 +202,12 @@ fn compile_cuda_dylib(
         let cuda_target_stubs = cuda_target_lib.join("stubs");
         if cuda_lib64.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib64.display()));
-            cmd.args(["-Xlinker", "-rpath", "-Xlinker"]).arg(cuda_lib64);
         }
         if cuda_stubs.is_dir() {
             cmd.arg(format!("-L{}", cuda_stubs.display()));
         }
         if cuda_target_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_target_lib.display()));
-            cmd.args(["-Xlinker", "-rpath", "-Xlinker"])
-                .arg(cuda_target_lib);
         }
         if cuda_target_stubs.is_dir() {
             cmd.arg(format!("-L{}", cuda_target_stubs.display()));
@@ -187,9 +222,20 @@ fn compile_cuda_dylib(
         .arg("-o")
         .arg(lib)
         .arg(wrapper)
-        .arg(quantize)
-        .arg("-lcublas")
-        .arg("-lcuda");
+        .arg(quantize);
+    if target_os == "linux" {
+        cmd.args([
+            "-lcublas_static",
+            "-lcublasLt_static",
+            "-lculibos",
+            "-lcuda",
+            "-lpthread",
+            "-ldl",
+            "-lrt",
+        ]);
+    } else {
+        cmd.args(["-lcublas", "-lcuda"]);
+    }
 
     match cmd.output() {
         Ok(output) if output.status.success() => {}

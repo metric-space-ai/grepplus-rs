@@ -27,6 +27,18 @@ rusqlite = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 # EmbeddingGemma and Qwen3.5 are product assets, not optional features. Every
 # build bakes both models and tokenizers into the binary. The only inference

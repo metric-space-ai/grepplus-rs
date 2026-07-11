@@ -141,11 +141,24 @@ impl CudaQwen35Model {
         inventory: Qwen35Inventory,
         eos_token_id: u32,
     ) -> Result<Self> {
-        let device = std::env::var("GREPPY_QWEN35_CUDA_DEVICE")
+        let requested = std::env::var("GREPPY_QWEN35_CUDA_DEVICE")
             .or_else(|_| std::env::var("EMBED_NATIVE_CUDA_DEVICE"))
             .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0);
+            .map(|value| {
+                value.parse::<i32>().map_err(|_| {
+                    Error::InvalidRequest(format!(
+                        "CUDA device environment value must be an integer, got `{value}`"
+                    ))
+                })
+            })
+            .transpose()?;
+        let model_bytes = u64::try_from(model.file_len())
+            .map_err(|_| Error::InvalidRequest("GGUF length does not fit u64".into()))?;
+        let required = greppy_embed_native::estimated_gpu_memory(
+            greppy_embed_native::InferenceModelKind::Qwen35,
+            model_bytes,
+        );
+        let device = greppy_embed_native::cuda::ffi::select_cuda_device(required, requested)?;
         let dev = CudaDevice::new(device)?;
         let weights = CudaWeights::load(&dev, model)?;
         Ok(Self {

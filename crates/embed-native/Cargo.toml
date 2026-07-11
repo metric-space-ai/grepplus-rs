@@ -9,7 +9,7 @@ description = "Candle-free native Rust + ggml-kernel inference of EmbeddingGemma
 build = "build.rs"
 
 [lib]
-test = false
+test = true
 
 [[test]]
 name = "dequant_parity"
@@ -55,6 +55,7 @@ tokenizers = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 memmap2 = "0.9"
 half = "2"
 libc = { workspace = true }
@@ -85,6 +86,13 @@ objc2-metal = { version = "0.2", features = [
     "MTLFunctionConstantValues",
     "MTLArgument",
 ], optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 # golden-vector verification fixtures live in testdata/golden (minted from candle

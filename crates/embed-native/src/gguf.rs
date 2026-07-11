@@ -436,6 +436,10 @@ impl GgufModel {
         self.tensor_data_offset
     }
 
+    pub fn file_len(&self) -> usize {
+        self._mmap.len()
+    }
+
     pub fn metadata_str(&self, key: &str) -> Result<&str> {
         self.metadata
             .get(key)

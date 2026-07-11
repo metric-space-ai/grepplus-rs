@@ -19,9 +19,11 @@ use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
 use greppy_core::workspace as workspace_locator;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod embed_daemon;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+mod inference_daemon;
+#[cfg(any(unix, windows))]
 mod summarize_daemon;
 
 /// Exit code for subcommands that are recognised but not yet implemented
@@ -49,6 +51,8 @@ const ENV_EMBED_MODEL_ID: &str = "GREPPY_EMBEDDINGGEMMA_MODEL_ID";
 const ENV_EMBED_MAX_LENGTH: &str = "GREPPY_EMBEDDINGGEMMA_MAX_LENGTH";
 const ENV_DEVICE: &str = "GREPPY_DEVICE";
 const ENV_NO_GPU: &str = "GREPPY_NO_GPU";
+const ENV_EMBED_CUDA_DEVICE: &str = "EMBED_NATIVE_CUDA_DEVICE";
+const ENV_QWEN_CUDA_DEVICE: &str = "GREPPY_QWEN35_CUDA_DEVICE";
 const ENV_VECTOR_EXACT_CANDIDATE_LIMIT: &str = "GREPPY_VECTOR_EXACT_CANDIDATE_LIMIT";
 const ENV_PROVIDER_POLICY: &str = "GREPPY_PROVIDER_POLICY";
 const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
@@ -72,6 +76,27 @@ fn test_inference_skipped() -> bool {
 #[cfg(not(debug_assertions))]
 fn test_inference_skipped() -> bool {
     false
+}
+
+#[derive(Clone, Default)]
+struct CliInferenceOverride {
+    device: Option<String>,
+    no_gpu: bool,
+}
+
+thread_local! {
+    static CLI_INFERENCE_OVERRIDE: std::cell::RefCell<CliInferenceOverride> =
+        std::cell::RefCell::new(CliInferenceOverride::default());
+}
+
+fn set_cli_inference_override(device: Option<String>, no_gpu: bool) {
+    CLI_INFERENCE_OVERRIDE.with(|value| {
+        *value.borrow_mut() = CliInferenceOverride { device, no_gpu };
+    });
+}
+
+fn cli_inference_override() -> CliInferenceOverride {
+    CLI_INFERENCE_OVERRIDE.with(|value| value.borrow().clone())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,6 +182,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub root: Option<String>,
 
+    /// Native inference backend for both embedded models.
+    #[arg(long, global = true, value_name = "auto|cpu|metal|cuda[:INDEX]")]
+    pub device: Option<String>,
+
+    /// Legacy spelling for `--device cpu`.
+    #[arg(long, global = true, conflicts_with = "device")]
+    pub no_gpu: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -191,12 +224,6 @@ pub enum Command {
         /// Optional tokenizer/model truncation length.
         #[arg(long)]
         embedding_max_length: Option<usize>,
-        /// Embedding backend: auto, cpu, metal, or cuda.
-        #[arg(long, value_name = "auto|cpu|metal|cuda")]
-        device: Option<String>,
-        /// Force CPU embedding inference.
-        #[arg(long)]
-        no_gpu: bool,
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
@@ -527,12 +554,6 @@ pub enum Command {
         /// Override model max sequence length.
         #[arg(long)]
         embedding_max_length: Option<usize>,
-        /// Embedding backend: auto, cpu, metal, or cuda.
-        #[arg(long, value_name = "auto|cpu|metal|cuda")]
-        device: Option<String>,
-        /// Force CPU embedding inference.
-        #[arg(long)]
-        no_gpu: bool,
     },
     /// Semantic query using EmbeddingGemma vectors with Qwen purpose hints.
     #[command(name = "semantic-search", alias = "semantic")]
@@ -556,12 +577,6 @@ pub enum Command {
         /// Optional tokenizer/model truncation length.
         #[arg(long)]
         embedding_max_length: Option<usize>,
-        /// Embedding backend: auto, cpu, metal, or cuda.
-        #[arg(long, value_name = "auto|cpu|metal|cuda")]
-        device: Option<String>,
-        /// Force CPU embedding inference.
-        #[arg(long)]
-        no_gpu: bool,
     },
     /// Legacy compatibility command for resolving definitions. Prefer
     /// `semantic-search` for meaning-based search and `brief` for a compact
@@ -619,12 +634,6 @@ pub enum Command {
         /// Optional tokenizer/model truncation length.
         #[arg(long)]
         embedding_max_length: Option<usize>,
-        /// Embedding backend: auto, cpu, metal, or cuda.
-        #[arg(long, value_name = "auto|cpu|metal|cuda")]
-        device: Option<String>,
-        /// Force CPU embedding inference.
-        #[arg(long)]
-        no_gpu: bool,
     },
     /// Agent installer — out of scope.
     Install {
@@ -661,7 +670,7 @@ pub enum Command {
     /// commands; lazy-loads the model, drops it after an idle TTL to free
     /// GPU memory, exits after a longer idle TTL). Not part of the public
     /// surface.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[command(hide = true, name = "embed-daemon")]
     EmbedDaemon {
         #[arg(long)]
@@ -674,15 +683,13 @@ pub enum Command {
         model_id: String,
         #[arg(long)]
         max_length: Option<usize>,
-        #[arg(long, default_value = "auto")]
-        device: String,
         /// Load the model immediately at startup (session prewarm) instead
         /// of on the first request.
         #[arg(long)]
         prewarm: bool,
     },
     /// Internal: warm Qwen3.5 summarization daemon for `brief`.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[command(hide = true, name = "summarize-daemon")]
     SummarizeDaemon {
         #[arg(long)]
@@ -693,8 +700,6 @@ pub enum Command {
         tokenizer: String,
         #[arg(long)]
         model_id: String,
-        #[arg(long, default_value = "auto")]
-        device: String,
         /// Load the model immediately at startup instead of on first request.
         #[arg(long)]
         prewarm: bool,
@@ -1211,6 +1216,14 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
             i += 1;
             continue;
         }
+        if tok == "--device" {
+            i += 2;
+            continue;
+        }
+        if tok.to_string_lossy().starts_with("--device=") || tok == "--no-gpu" {
+            i += 1;
+            continue;
+        }
         // First non-skipped token. If it names a subcommand, defer to
         // clap; otherwise it's a grep passthrough.
         return match tok.to_str() {
@@ -1237,8 +1250,15 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     // The global `--root` (RV-006) is threaded down to every command so
     // index and the query subcommands share one root-resolution path.
     let root = cli.root.clone();
+    let device = cli.device.clone();
+    let no_gpu = cli.no_gpu;
+    let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
+    if !no_gpu {
+        configure_explicit_cuda_device(configured_device.as_deref())?;
+    }
+    set_cli_inference_override(device.clone(), no_gpu);
     if let Some(cmd) = cli.command {
-        return dispatch_subcommand(cmd, root.as_deref());
+        return dispatch_subcommand(cmd, root.as_deref(), device.as_deref(), no_gpu);
     }
     if !cli.passthrough.is_empty() {
         return dispatch_grep(&cli.passthrough);
@@ -1256,17 +1276,48 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     Ok(EXIT_USAGE as i32)
 }
 
-fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
+fn configure_explicit_cuda_device(device: Option<&str>) -> Result<()> {
+    let policy = greppy_embed_native::InferencePolicy::from_selector(device, false)
+        .map_err(|error| Error::Invalid(error.to_string()))?;
+    let Some(index) = policy.cuda_device_index else {
+        return Ok(());
+    };
+    let index = index.to_string();
+    // SAFETY: dispatch applies the global inference policy before spawning
+    // daemon/client threads; no concurrent environment access has begun.
+    unsafe {
+        std::env::set_var(ENV_EMBED_CUDA_DEVICE, &index);
+        std::env::set_var(ENV_QWEN_CUDA_DEVICE, index);
+    }
+    Ok(())
+}
+
+fn inference_device_identity(device: &greppy_embed_native::DevicePreference) -> String {
+    if *device == greppy_embed_native::DevicePreference::Cuda {
+        if let Some(index) =
+            env_nonempty(ENV_QWEN_CUDA_DEVICE).or_else(|| env_nonempty(ENV_EMBED_CUDA_DEVICE))
+        {
+            return format!("cuda:{index}");
+        }
+    }
+    device.as_str().to_string()
+}
+
+fn dispatch_subcommand(
+    cmd: Command,
+    root: Option<&str>,
+    device: Option<&str>,
+    no_gpu: bool,
+) -> Result<i32> {
     match cmd {
         Command::Passthrough(argv) => dispatch_grep(&argv),
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Command::EmbedDaemon {
             socket,
             gguf,
             tokenizer,
             model_id,
             max_length,
-            device,
             prewarm,
         } => {
             let cfg = EmbeddingModelConfig {
@@ -1276,28 +1327,25 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                     tokenizer: std::path::PathBuf::from(tokenizer),
                 },
                 max_length,
-                device: greppy_embed_native::DevicePreference::parse(&device)
-                    .map_err(|e| Error::Invalid(format!("embed-daemon --device: {e}")))?,
+                device: embedding_device_preference(device, no_gpu)?,
             };
-            embed_daemon::daemon_main(std::path::PathBuf::from(socket), cfg, prewarm)
+            embed_daemon::daemon_main(socket, cfg, prewarm)
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         Command::SummarizeDaemon {
             socket,
             gguf,
             tokenizer,
             model_id,
-            device,
             prewarm,
         } => {
             let cfg = QwenSummaryConfig {
                 model_id,
                 gguf: std::path::PathBuf::from(gguf),
                 tokenizer: std::path::PathBuf::from(tokenizer),
-                device: greppy_qwen35_native::DevicePreference::parse(&device)
-                    .map_err(|e| Error::Invalid(format!("summarize-daemon --device: {e}")))?,
+                device: qwen_summary_device_preference()?,
             };
-            summarize_daemon::daemon_main(std::path::PathBuf::from(socket), cfg, prewarm)
+            summarize_daemon::daemon_main(socket, cfg, prewarm)
         }
         Command::Index {
             path,
@@ -1306,8 +1354,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             embedding_tokenizer,
             embedding_model_id,
             embedding_max_length,
-            device,
-            no_gpu,
             json,
         } => {
             if path.as_deref() == Some("status") {
@@ -1316,8 +1362,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                     || embedding_tokenizer.is_some()
                     || embedding_model_id.is_some()
                     || embedding_max_length.is_some()
-                    || device.is_some()
-                    || no_gpu
                 {
                     return Err(Error::Invalid(
                         "index status does not accept embedding index flags".into(),
@@ -1339,7 +1383,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                         tokenizer: embedding_tokenizer.as_deref(),
                         model_id: embedding_model_id.as_deref(),
                         max_length: embedding_max_length,
-                        device: device.as_deref(),
+                        device,
                         no_gpu,
                     },
                 )
@@ -1482,8 +1526,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             embedding_tokenizer,
             embedding_model_id,
             embedding_max_length,
-            device,
-            no_gpu,
         } => dispatch_plus(
             query.as_deref(),
             k,
@@ -1497,7 +1539,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                 tokenizer: embedding_tokenizer.as_deref(),
                 model_id: embedding_model_id.as_deref(),
                 max_length: embedding_max_length,
-                device: device.as_deref(),
+                device,
                 no_gpu,
             },
             root,
@@ -1510,8 +1552,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             embedding_tokenizer,
             embedding_model_id,
             embedding_max_length,
-            device,
-            no_gpu,
         } => dispatch_semantic(
             query.as_deref(),
             json,
@@ -1521,7 +1561,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                 tokenizer: embedding_tokenizer.as_deref(),
                 model_id: embedding_model_id.as_deref(),
                 max_length: embedding_max_length,
-                device: device.as_deref(),
+                device,
                 no_gpu,
             },
             root,
@@ -1538,8 +1578,6 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
             embedding_tokenizer,
             embedding_model_id,
             embedding_max_length,
-            device,
-            no_gpu,
         } => dispatch_context(
             query.as_deref(),
             k,
@@ -1551,7 +1589,7 @@ fn dispatch_subcommand(cmd: Command, root: Option<&str>) -> Result<i32> {
                 tokenizer: embedding_tokenizer.as_deref(),
                 model_id: embedding_model_id.as_deref(),
                 max_length: embedding_max_length,
-                device: device.as_deref(),
+                device,
                 no_gpu,
             },
             root,
@@ -4780,10 +4818,30 @@ fn process_is_alive(pid: u32) -> bool {
         unsafe extern "C" {
             fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
         }
-        let rc = unsafe { kill(pid as std::ffi::c_int, 0) };
+        let Ok(pid) = std::ffi::c_int::try_from(pid) else {
+            return false;
+        };
+        let rc = unsafe { kill(pid, 0) };
         rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(1)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process.is_null() {
+            return false;
+        }
+        let mut exit_code = 0u32;
+        let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
+        unsafe {
+            CloseHandle(process);
+        }
+        queried && i32::try_from(exit_code).ok() == Some(STILL_ACTIVE)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         false
@@ -5790,14 +5848,14 @@ fn dispatch_impact_diff_scope(
 const BRIEF_LIMIT: usize = 15;
 
 fn summarize_definition_span(source_span: &str) -> Option<Vec<String>> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let cfg = qwen_summary_config_optional().ok().flatten()?;
         let model_key = qwen_summary_model_key(&cfg);
         summarize_daemon::summarize_source_via_daemon(&cfg, &model_key, source_span)
             .filter(|bullets| !bullets.is_empty())
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = source_span;
         None
@@ -6092,6 +6150,164 @@ fn dispatch_doctor(json: bool, root: Option<&str>) -> Result<i32> {
     dispatch_index_health("doctor", json, root)
 }
 
+fn inference_registry_status() -> Result<greppy_embed_native::InferenceBackendRegistry> {
+    let cli = cli_inference_override();
+    let no_gpu = cli.no_gpu || env_bool(ENV_NO_GPU)?;
+    let configured = cli.device.or_else(|| env_nonempty(ENV_DEVICE));
+    let policy = greppy_embed_native::InferencePolicy::from_selector(configured.as_deref(), no_gpu)
+        .map_err(|error| Error::Invalid(error.to_string()))?;
+    Ok(greppy_embed_native::InferenceBackendRegistry::probe_policy(
+        &policy,
+        combined_inference_gpu_memory(),
+    ))
+}
+
+fn combined_inference_gpu_memory() -> u64 {
+    let embedding_args = EmbeddingCliArgs {
+        model_dir: None,
+        gguf: None,
+        tokenizer: None,
+        model_id: None,
+        max_length: None,
+        device: None,
+        no_gpu: false,
+    };
+    let embedding = embedding_config_optional(embedding_args)
+        .ok()
+        .flatten()
+        .and_then(|cfg| match cfg.source {
+            EmbeddingModelSource::Gguf { gguf, .. } => std::fs::metadata(gguf).ok(),
+            EmbeddingModelSource::SafetensorsDir(_) => None,
+        })
+        .map(|metadata| {
+            greppy_embed_native::estimated_gpu_memory(
+                greppy_embed_native::InferenceModelKind::EmbeddingGemma,
+                metadata.len(),
+            )
+        })
+        .unwrap_or(0);
+    let summary = qwen_summary_config_optional()
+        .ok()
+        .flatten()
+        .and_then(|cfg| std::fs::metadata(cfg.gguf).ok())
+        .map(|metadata| {
+            greppy_embed_native::estimated_gpu_memory(
+                greppy_embed_native::InferenceModelKind::Qwen35,
+                metadata.len(),
+            )
+        })
+        .unwrap_or(0);
+    embedding.saturating_add(summary)
+}
+
+fn print_inference_registry(registry: &greppy_embed_native::InferenceBackendRegistry) {
+    println!(
+        "inference: preference={} explicit={} selected={} device={}",
+        registry.preference,
+        registry.explicit,
+        registry
+            .selected_backend
+            .map(greppy_embed_native::BackendKind::as_str)
+            .unwrap_or("none"),
+        registry.selected_device_id.as_deref().unwrap_or("none")
+    );
+    for probe in &registry.probes {
+        println!(
+            "  backend {} compiled={} available={} score={} abi={}{}",
+            probe.backend.as_str(),
+            probe.compiled,
+            probe.available,
+            probe.score,
+            probe.abi_version,
+            probe
+                .reason
+                .as_deref()
+                .map(|reason| format!(" reason={reason}"))
+                .unwrap_or_default()
+        );
+        for device in &probe.devices {
+            let memory = match (device.memory_free, device.memory_total) {
+                (Some(free), Some(total)) => format!(" memory_free={free} memory_total={total}"),
+                (None, Some(total)) => format!(" memory_total={total}"),
+                _ => String::new(),
+            };
+            println!(
+                "    device {} {}{}{}",
+                device.id,
+                device.name,
+                memory,
+                device
+                    .rejection_reason
+                    .as_deref()
+                    .map(|reason| format!(" rejected={reason}"))
+                    .unwrap_or_default()
+            );
+        }
+    }
+}
+
+fn inference_daemon_status() -> serde_json::Value {
+    #[cfg(any(unix, windows))]
+    {
+        let embedding_args = EmbeddingCliArgs {
+            model_dir: None,
+            gguf: None,
+            tokenizer: None,
+            model_id: None,
+            max_length: None,
+            device: None,
+            no_gpu: false,
+        };
+        let embedding = match embedding_config_optional(embedding_args) {
+            Ok(Some(cfg)) => {
+                let key = embedding_query_cache_key(&cfg);
+                embed_daemon::status(&cfg, &key)
+            }
+            Ok(None) => serde_json::json!({"state": "unavailable"}),
+            Err(error) => serde_json::json!({"state": "faulted", "last_error": error.to_string()}),
+        };
+        let summary = match qwen_summary_config_optional() {
+            Ok(Some(cfg)) => {
+                let key = qwen_summary_model_key(&cfg);
+                summarize_daemon::status(&key)
+            }
+            Ok(None) => serde_json::json!({"state": "unavailable"}),
+            Err(error) => serde_json::json!({"state": "faulted", "last_error": error.to_string()}),
+        };
+        serde_json::json!({"embedding": embedding, "summary": summary})
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        serde_json::json!({
+            "embedding": {"state": "unsupported"},
+            "summary": {"state": "unsupported"},
+        })
+    }
+}
+
+fn print_inference_daemons(daemons: &serde_json::Value) {
+    let Some(daemons) = daemons.as_object() else {
+        return;
+    };
+    for (name, status) in daemons {
+        let state = status
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let endpoint = status
+            .get("endpoint")
+            .and_then(serde_json::Value::as_str)
+            .map(|endpoint| format!(" endpoint={endpoint}"))
+            .unwrap_or_default();
+        let error = status
+            .get("last_error")
+            .and_then(serde_json::Value::as_str)
+            .map(|error| format!(" error={error}"))
+            .unwrap_or_default();
+        println!("  daemon {name} state={state}{endpoint}{error}");
+    }
+}
+
 fn dispatch_index_status(json: bool, root: Option<&str>) -> Result<i32> {
     dispatch_index_health("index-status", json, root)
 }
@@ -6286,6 +6502,16 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         job_state
     };
     let dirty_overlay = dirty_overlay(&effective_root)?;
+    let inference = (command == "doctor")
+        .then(inference_registry_status)
+        .transpose()?;
+    let inference_daemons = (command == "doctor").then(inference_daemon_status);
+    let inference_diagnostics = inference.as_ref().map(|registry| {
+        serde_json::json!({
+            "registry": registry,
+            "daemons": inference_daemons,
+        })
+    });
 
     if !store_path.exists() {
         let status = serde_json::json!({
@@ -6309,6 +6535,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "incomplete_provider_count": null,
             "skip_counts_by_reason": [],
             "dirty_overlay": dirty_overlay.to_json(),
+            "inference": inference_diagnostics,
             "message": "no active index; run grep index first",
         });
         if json {
@@ -6322,6 +6549,12 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             println!("root: {}", effective_root.display());
             println!("store: {}", store_path.display());
             println!("message: run `grep index {}` first", root.unwrap_or("."));
+            if let Some(inference) = &inference {
+                print_inference_registry(inference);
+            }
+            if let Some(daemons) = &inference_daemons {
+                print_inference_daemons(daemons);
+            }
             if dirty_overlay.git_available && !dirty_overlay.clean {
                 println!(
                     "dirty_overlay: total={} staged={} unstaged={} untracked={} deleted={} renamed={} ignored={}",
@@ -6436,6 +6669,9 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             .vector_model_ids(&project)
             .map(|v| v.is_empty())
             .unwrap_or(false);
+    let inference_healthy = inference
+        .as_ref()
+        .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
     let healthy = diag.schema_current
         && diag.integrity_ok
         && project_present
@@ -6443,6 +6679,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         && embedding_complete
         && incomplete_provider_count == 0
         && coverage_warning.is_none()
+        && inference_healthy
         && background_state != Some("refreshing");
     let status_label = if healthy { "ok" } else { "unhealthy" };
 
@@ -6477,6 +6714,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "coverage_warning": coverage_warning,
             "vectors_missing_with_model": vectors_missing_with_model,
             "dirty_overlay": dirty_overlay.to_json(),
+            "inference": inference_diagnostics,
         });
         println!(
             "{}",
@@ -6500,6 +6738,12 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         println!("store_format: {}", store_format.unwrap_or(0));
         println!("store_bytes: {store_bytes}");
         println!("embedding_complete: {embedding_complete}");
+        if let Some(inference) = &inference {
+            print_inference_registry(inference);
+        }
+        if let Some(daemons) = &inference_daemons {
+            print_inference_daemons(daemons);
+        }
         if let Some(state) = background_state {
             println!("background_job: {state}");
         }
@@ -10119,7 +10363,7 @@ fn semantic_vector_purposes(
         Ok(path) => path,
         Err(_) => return Ok(None),
     };
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let summary_runtime = if summarize {
         qwen_summary_config_optional().ok().flatten()
     } else {
@@ -10167,7 +10411,7 @@ fn semantic_vector_purposes(
             continue;
         };
         let mut bullets = Vec::new();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if semantic_signature_is_function_like(&signature, node.as_ref().map(|n| n.label.as_str()))
         {
             if let Some((cfg, model_key)) = summary_runtime.as_ref() {
@@ -11960,10 +12204,14 @@ fn qwen_summary_config_optional() -> Result<Option<QwenSummaryConfig>> {
 }
 
 fn qwen_summary_device_preference() -> Result<greppy_qwen35_native::DevicePreference> {
-    if env_bool(ENV_NO_GPU)? {
+    let cli = cli_inference_override();
+    if cli.no_gpu || env_bool(ENV_NO_GPU)? {
         return Ok(greppy_qwen35_native::DevicePreference::Cpu);
     }
-    let raw = env_nonempty(ENV_DEVICE).unwrap_or_else(|| "auto".to_string());
+    let raw = cli
+        .device
+        .or_else(|| env_nonempty(ENV_DEVICE))
+        .unwrap_or_else(|| "auto".to_string());
     greppy_qwen35_native::DevicePreference::parse(&raw).map_err(|e| Error::Invalid(e.to_string()))
 }
 
@@ -12000,7 +12248,7 @@ fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
         cfg.model_id,
         greppy_qwen35_native::PROMPT_VERSION,
         greppy_qwen35_native::TRIAGE_PROMPT_VERSION,
-        cfg.device.as_str(),
+        inference_device_identity(&cfg.device),
         model_file_digest(&cfg.gguf).unwrap_or_else(|_| "unknown".into()),
         model_file_digest(&cfg.tokenizer).unwrap_or_else(|_| "unknown".into())
     )
@@ -12252,9 +12500,9 @@ fn embed_query_cached(cfg: &EmbeddingModelConfig, root: Option<&str>, q: &str) -
     // in-process load below. Embed the NORMALIZED text either way so the
     // cached vector is exactly the vector any query normalizing to the
     // same key would compute.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let daemon_vector = embed_daemon::embed_query_via_daemon(cfg, &model_key, &normalized);
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     let daemon_vector: Option<Vec<f32>> = None;
     let vector = match daemon_vector {
         Some(v) => v,
@@ -12482,7 +12730,7 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     // fire only when semantic search is actually in play — env model
     // configured AND this store holds vectors — because prewarming a model
     // nobody will query would hold GPU memory for a TTL for nothing.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let no_args = EmbeddingCliArgs {
             model_dir: None,
@@ -14500,29 +14748,37 @@ mod tests {
             "semantic-search",
             "--device",
             "cuda",
-            "--no-gpu",
             "refund workflow",
         ])
         .unwrap();
+        assert_eq!(cli.device.as_deref(), Some("cuda"));
+        assert!(!cli.no_gpu);
         match cli.command {
-            Some(Command::Semantic {
-                query,
-                device,
-                no_gpu,
-                ..
-            }) => {
+            Some(Command::Semantic { query, .. }) => {
                 assert_eq!(query.as_deref(), Some("refund workflow"));
-                assert_eq!(device.as_deref(), Some("cuda"));
-                assert!(no_gpu);
             }
             other => panic!("unexpected command: {other:?}"),
         }
+        assert!(Cli::try_parse_from([
+            "grep",
+            "semantic-search",
+            "--device",
+            "cuda",
+            "--no-gpu",
+            "refund workflow",
+        ])
+        .is_err());
     }
 
     #[test]
     fn embedding_device_preference_obeys_cli_and_env() {
         let _guard = ENV_LOCK.lock().unwrap();
-        let _restore = EnvRestore::capture(&[ENV_DEVICE, ENV_NO_GPU]);
+        let _restore = EnvRestore::capture(&[
+            ENV_DEVICE,
+            ENV_NO_GPU,
+            ENV_EMBED_CUDA_DEVICE,
+            ENV_QWEN_CUDA_DEVICE,
+        ]);
         // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
         unsafe {
             std::env::remove_var(ENV_DEVICE);
@@ -14545,6 +14801,17 @@ mod tests {
         assert_eq!(
             embedding_device_preference(Some("cuda"), false).unwrap(),
             greppy_embed_native::DevicePreference::Cuda
+        );
+        assert_eq!(
+            embedding_device_preference(Some("cuda:2"), false).unwrap(),
+            greppy_embed_native::DevicePreference::Cuda
+        );
+        configure_explicit_cuda_device(Some("cuda:2")).unwrap();
+        assert_eq!(env_nonempty(ENV_EMBED_CUDA_DEVICE).as_deref(), Some("2"));
+        assert_eq!(env_nonempty(ENV_QWEN_CUDA_DEVICE).as_deref(), Some("2"));
+        assert_eq!(
+            inference_device_identity(&greppy_embed_native::DevicePreference::Cuda),
+            "cuda:2"
         );
         assert_eq!(
             embedding_device_preference(Some("cpu"), true).unwrap(),

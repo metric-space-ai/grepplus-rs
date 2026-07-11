@@ -1699,7 +1699,7 @@ fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
     debug_assert_eq!(lhs.len(), rhs.len());
 
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if greppy_embed_native::cpu_features::has_avx2() {
         unsafe {
             return dot_avx2(lhs, rhs);
         }
@@ -1769,7 +1769,7 @@ fn delta_recurrent_step(
     debug_assert_eq!(key.len(), LINEAR_HEAD_DIM);
 
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if greppy_embed_native::cpu_features::has_avx2() {
         unsafe {
             return delta_recurrent_step_avx2(state, query, key, value, beta, decay);
         }
@@ -1901,7 +1901,7 @@ fn rms_rstd(x: &[f32]) -> f32 {
 #[inline]
 fn sum_squares_f32(values: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("avx2") {
+    if greppy_embed_native::cpu_features::has_avx2() {
         unsafe {
             return sum_squares_f32_avx2(values);
         }
@@ -2165,7 +2165,7 @@ mod x86_tests {
 
     #[test]
     fn avx2_recurrent_step_stays_close_to_scalar() {
-        if !std::arch::is_x86_feature_detected!("avx2") {
+        if !greppy_embed_native::cpu_features::has_avx2() {
             return;
         }
         let mut scalar_state = (0..LINEAR_HEAD_DIM)

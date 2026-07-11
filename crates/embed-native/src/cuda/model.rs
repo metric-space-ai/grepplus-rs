@@ -97,10 +97,23 @@ impl CudaEmbeddingModel {
     }
 
     pub fn from_gguf(model: &GgufModel) -> Result<Self> {
-        let device = std::env::var("EMBED_NATIVE_CUDA_DEVICE")
+        let requested = std::env::var("EMBED_NATIVE_CUDA_DEVICE")
             .ok()
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0);
+            .map(|value| {
+                value.parse::<i32>().map_err(|_| {
+                    Error::InvalidGguf(format!(
+                        "EMBED_NATIVE_CUDA_DEVICE must be an integer, got `{value}`"
+                    ))
+                })
+            })
+            .transpose()?;
+        let model_bytes = u64::try_from(model.file_len())
+            .map_err(|_| Error::InvalidGguf("GGUF length does not fit u64".into()))?;
+        let required = crate::backend::estimated_gpu_memory(
+            crate::backend::InferenceModelKind::EmbeddingGemma,
+            model_bytes,
+        );
+        let device = crate::cuda::ffi::select_cuda_device(required, requested)?;
         let dev = CudaDevice::new(device)?;
         let cfg = CudaConfig::from_model(model)?;
         let weights = CudaWeights::load(&dev, model)?;

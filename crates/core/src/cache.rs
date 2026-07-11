@@ -1144,14 +1144,59 @@ extern "C" {
     fn libc_flock(fd: i32, operation: i32) -> i32;
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn lock_file(file: &File, mode: LockMode, nonblocking: bool) -> io::Result<bool> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut flags = match mode {
+        LockMode::Shared => 0,
+        LockMode::Exclusive => LOCKFILE_EXCLUSIVE_LOCK,
+    };
+    if nonblocking {
+        flags |= LOCKFILE_FAIL_IMMEDIATELY;
+    }
+    let mut overlapped = OVERLAPPED::default();
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            flags,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    };
+    if locked != 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if nonblocking && matches!(error.raw_os_error(), Some(32 | 33 | 158)) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(windows)]
+fn unlock_file(file: &File) {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let mut overlapped = OVERLAPPED::default();
+    let _ = unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
+}
+
+#[cfg(not(any(unix, windows)))]
 fn lock_file(_file: &File, _mode: LockMode, _nonblocking: bool) -> io::Result<bool> {
-    // Windows remains Tier 2 for this release.  Keep the API compiling while
-    // SQLite provides its own writer exclusion there.
     Ok(true)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn unlock_file(_file: &File) {}
 
 #[cfg(test)]

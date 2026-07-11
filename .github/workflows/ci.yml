@@ -88,6 +88,21 @@ jobs:
       - name: cargo test --workspace (single-threaded — env-var test isolation)
         run: cargo test --workspace -- --test-threads=1
 
+      - name: Apple Silicon Metal inference gates
+        if: runner.os == 'macOS'
+        env:
+          EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+        run: |
+          cargo test -p greppy-embed-native --features metal --lib -- --test-threads=1
+          cargo test -p greppy-embed-native --features metal --test metal_kernel_parity
+          cargo test -p greppy-embed-native --features metal --test metal_forward_parity
+
+      - name: x86 portable CPU dispatch gate
+        if: runner.os == 'Linux'
+        env:
+          EMBED_NATIVE_CPU_SIMD: scalar
+        run: cargo test -p greppy-embed-native --lib cpu_simd_override_selects_requested_supported_kernel
+
       # clippy is pinned to 1.95.0 (rust-toolchain.toml). The lints allowed below
       # are style/complexity lints (no bug/correctness lints) that clippy 1.95
       # newly flags on pre-existing, correct code. We hard-gate on rustc warnings
@@ -126,6 +141,55 @@ jobs:
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
           GREPPY_GREP_BIN: ${{ github.workspace }}/target/debug/greppy-grep
         run: bash bench/battle/run_battle.sh
+
+  windows-cpu:
+    name: Windows CPU + named-pipe daemons
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache cargo registry, git, and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: windows-cpu-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: windows-cpu-
+
+      - name: Build Windows CPU binary
+        run: cargo build --workspace
+
+      - name: Test Windows locks and daemon transport
+        run: cargo test -p greppy-core -p greppy-embed-native -p greppy --lib -- --test-threads=1
+
+      - name: Verify doctor registry
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/greppy-doctor-root","$env:RUNNER_TEMP/greppy-doctor-store" | Out-Null
+          $env:GREPPY_STORE_DIR = "$env:RUNNER_TEMP/greppy-doctor-store"
+          $output = & target/debug/greppy.exe --device cpu doctor --json --root "$env:RUNNER_TEMP/greppy-doctor-root"
+          $doctorExit = $LASTEXITCODE
+          $output | Out-File -Encoding utf8 doctor.json
+          if ($doctorExit -ne 0 -and $doctorExit -ne 1) {
+            Write-Error "Windows doctor failed with unexpected exit code $doctorExit"
+            exit 1
+          }
+          $doctor = Get-Content doctor.json -Raw | ConvertFrom-Json
+          if ($doctor.inference.registry.selected_backend -ne 'cpu') {
+            Write-Error 'Windows CPU registry selection failed'
+            exit 1
+          }
 
   # Heavier validation: the soak/stress loop + the release-build
   # invariant. Runs only on pull_request and on the default branch to
