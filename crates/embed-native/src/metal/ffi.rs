@@ -28,6 +28,7 @@
 //! doesn't need a companion file on disk — the shaders ship with the
 //! executable.
 
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -110,12 +111,7 @@ pub struct Device {
     base_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
     tensor_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
     supports_metal4: bool,
-    pipelines: Mutex<
-        Vec<(
-            String,
-            Retained<ProtocolObject<dyn MTLComputePipelineState>>,
-        )>,
-    >,
+    pipelines: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
 }
 
 unsafe impl Send for Device {}
@@ -153,14 +149,13 @@ impl Device {
             base_library,
             tensor_library,
             supports_metal4,
-            pipelines: Mutex::new(Vec::new()),
+            pipelines: Mutex::new(HashMap::new()),
         })
     }
 
     /// Cached pipeline for `kernel_name`. First lookup does a
     /// `newFunctionWithName:` + `newComputePipelineStateWithFunction:`
-    /// roundtrip; subsequent lookups are O(n) over the cache (small,
-    /// single-digits in practice).
+    /// roundtrip; subsequent lookups use the model-wide hash cache.
     ///
     /// Works for kernels that either (a) don't declare any
     /// function_constants, or (b) declare function_constants with
@@ -175,10 +170,8 @@ impl Device {
         let cache_key = format!("{flavor}:{kernel_name}");
         {
             let guard = self.pipelines.lock().ok()?;
-            for (name, pso) in guard.iter() {
-                if name == &cache_key {
-                    return Some(pso.clone());
-                }
+            if let Some(pso) = guard.get(&cache_key) {
+                return Some(pso.clone());
             }
         }
 
@@ -194,7 +187,7 @@ impl Device {
             })
             .ok()?;
 
-        self.pipelines.lock().ok()?.push((cache_key, pso.clone()));
+        self.pipelines.lock().ok()?.insert(cache_key, pso.clone());
         Some(pso)
     }
 
@@ -214,10 +207,8 @@ impl Device {
         let cache_key = format!("{flavor}:{cache_key}");
         {
             let guard = self.pipelines.lock().ok()?;
-            for (name, pso) in guard.iter() {
-                if name == &cache_key {
-                    return Some(pso.clone());
-                }
+            if let Some(pso) = guard.get(&cache_key) {
+                return Some(pso.clone());
             }
         }
 
@@ -245,10 +236,7 @@ impl Device {
             })
             .ok()?;
 
-        self.pipelines
-            .lock()
-            .ok()?
-            .push((cache_key.to_string(), pso.clone()));
+        self.pipelines.lock().ok()?.insert(cache_key, pso.clone());
         Some(pso)
     }
 
