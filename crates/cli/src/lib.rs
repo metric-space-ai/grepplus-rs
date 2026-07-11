@@ -14032,6 +14032,15 @@ fn sync_parent_dir(path: &std::path::Path) -> Result<()> {
     };
     let dir = open_directory_for_sync(parent)
         .map_err(|e| Error::io(format!("open parent dir {}", parent.display()), e))?;
+    #[cfg(windows)]
+    {
+        // Windows rejects FlushFileBuffers for directory handles opened with
+        // FILE_FLAG_BACKUP_SEMANTICS. Opening the parent still verifies that
+        // the destination directory exists; sync_file flushed the payload.
+        drop(dir);
+        return Ok(());
+    }
+    #[cfg(not(windows))]
     dir.sync_all()
         .map_err(|e| Error::io(format!("sync parent dir {}", parent.display()), e))
 }
