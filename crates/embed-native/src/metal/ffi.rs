@@ -111,7 +111,40 @@ pub struct Device {
     base_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
     tensor_library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
     supports_metal4: bool,
-    pipelines: Mutex<HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>>,
+    pipelines: Mutex<PipelineCache>,
+}
+
+#[derive(Default)]
+struct PipelineCache {
+    base: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    tensor: HashMap<String, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+}
+
+impl PipelineCache {
+    fn get(
+        &self,
+        flavor: &str,
+        key: &str,
+    ) -> Option<&Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
+        if flavor == "tensor" {
+            self.tensor.get(key)
+        } else {
+            self.base.get(key)
+        }
+    }
+
+    fn insert(
+        &mut self,
+        flavor: &str,
+        key: String,
+        pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    ) {
+        if flavor == "tensor" {
+            self.tensor.insert(key, pipeline);
+        } else {
+            self.base.insert(key, pipeline);
+        }
+    }
 }
 
 unsafe impl Send for Device {}
@@ -149,7 +182,7 @@ impl Device {
             base_library,
             tensor_library,
             supports_metal4,
-            pipelines: Mutex::new(HashMap::new()),
+            pipelines: Mutex::new(PipelineCache::default()),
         })
     }
 
@@ -167,10 +200,9 @@ impl Device {
         kernel_name: &str,
     ) -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
         let (library, flavor) = self.library_for_kernel(kernel_name)?;
-        let cache_key = format!("{flavor}:{kernel_name}");
         {
             let guard = self.pipelines.lock().ok()?;
-            if let Some(pso) = guard.get(&cache_key) {
+            if let Some(pso) = guard.get(flavor, kernel_name) {
                 return Some(pso.clone());
             }
         }
@@ -187,7 +219,10 @@ impl Device {
             })
             .ok()?;
 
-        self.pipelines.lock().ok()?.insert(cache_key, pso.clone());
+        self.pipelines
+            .lock()
+            .ok()?
+            .insert(flavor, kernel_name.to_owned(), pso.clone());
         Some(pso)
     }
 
@@ -204,10 +239,9 @@ impl Device {
         setup: impl FnOnce(&objc2_metal::MTLFunctionConstantValues),
     ) -> Option<Retained<ProtocolObject<dyn MTLComputePipelineState>>> {
         let (library, flavor) = self.library_for_kernel(kernel_name)?;
-        let cache_key = format!("{flavor}:{cache_key}");
         {
             let guard = self.pipelines.lock().ok()?;
-            if let Some(pso) = guard.get(&cache_key) {
+            if let Some(pso) = guard.get(flavor, cache_key) {
                 return Some(pso.clone());
             }
         }
@@ -236,7 +270,10 @@ impl Device {
             })
             .ok()?;
 
-        self.pipelines.lock().ok()?.insert(cache_key, pso.clone());
+        self.pipelines
+            .lock()
+            .ok()?
+            .insert(flavor, cache_key.to_owned(), pso.clone());
         Some(pso)
     }
 
