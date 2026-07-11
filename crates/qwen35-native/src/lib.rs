@@ -76,10 +76,10 @@ pub(crate) enum MtpPerfStage {
     MtpCommit,
 }
 
-const MTP_FALLBACK_MIN_DRAFTS: usize = 4;
+const MTP_FALLBACK_MIN_DRAFTS: usize = 2;
 
 pub(crate) fn mtp_should_fallback(drafted: usize, accepted: usize) -> bool {
-    drafted >= MTP_FALLBACK_MIN_DRAFTS && accepted.saturating_mul(4) < drafted.saturating_mul(3)
+    drafted >= MTP_FALLBACK_MIN_DRAFTS && accepted.saturating_mul(4) <= drafted.saturating_mul(3)
 }
 
 impl MtpPerfTimer {
@@ -190,10 +190,11 @@ impl MtpPerfTimer {
 mod mtp_tests {
     #[test]
     fn weak_draft_falls_back_only_after_evidence() {
-        assert!(!super::mtp_should_fallback(3, 0));
+        assert!(!super::mtp_should_fallback(1, 0));
+        assert!(super::mtp_should_fallback(2, 1));
         assert!(super::mtp_should_fallback(4, 2));
-        assert!(!super::mtp_should_fallback(4, 3));
-        assert!(!super::mtp_should_fallback(12, 9));
+        assert!(super::mtp_should_fallback(4, 3));
+        assert!(!super::mtp_should_fallback(4, 4));
     }
 }
 
