@@ -13,5 +13,31 @@ fn main() -> ExitCode {
     // clap rc=2 usage error. Recognised subcommands still flow through
     // clap.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
-    ExitCode::from(greppy::run_os(argv))
+    ExitCode::from(run(argv))
+}
+
+#[cfg(not(windows))]
+fn run(argv: Vec<std::ffi::OsString>) -> u8 {
+    greppy::run_os(argv)
+}
+
+#[cfg(windows)]
+fn run(argv: Vec<std::ffi::OsString>) -> u8 {
+    const WINDOWS_CLI_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+    let worker = match std::thread::Builder::new()
+        .name("greppy-main".into())
+        .stack_size(WINDOWS_CLI_STACK_BYTES)
+        .spawn(move || greppy::run_os(argv))
+    {
+        Ok(worker) => worker,
+        Err(error) => {
+            eprintln!("greppy: cannot start Windows worker thread: {error}");
+            return 2;
+        }
+    };
+    match worker.join() {
+        Ok(code) => code,
+        Err(_) => 2,
+    }
 }
