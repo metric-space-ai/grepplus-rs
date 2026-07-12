@@ -1257,14 +1257,14 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
 
     let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
     assert_eq!(
-        code, 73,
-        "index status --json should be non-zero while providers are incomplete; stderr={err}\nstdout={out}"
+        code, 0,
+        "index status --json should stay healthy when indexed code has no file failures; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "index-status");
-    assert_eq!(v["status"], "unhealthy");
-    assert_eq!(v["healthy"], false);
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["healthy"], true);
     assert_eq!(v["store_exists"], true);
     assert_eq!(v["project"], "repo");
     assert_eq!(v["project_present"], true);
@@ -1274,6 +1274,41 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
     assert!(v["graph_generation"].as_u64().unwrap_or(0) >= 1);
     assert!(v["stats"]["nodes"].as_u64().unwrap_or(0) >= 1);
     assert!(v["incomplete_provider_count"].as_u64().unwrap_or(0) >= 1);
+    assert_eq!(v["provider_failure_count"], 0);
+    assert!(
+        v["providers"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty()),
+        "health JSON must retain detailed provider capabilities: {v:?}"
+    );
+}
+
+#[test]
+fn index_status_is_unhealthy_for_real_provider_file_failures() {
+    let (repo, store) = make_repo("index-status-provider-failure", "provider_failure_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index should succeed; stderr={err}\nstdout={out}");
+
+    let db = find_graph_db(&store).expect("graph.db exists after index");
+    let graph = greppy_store::Store::open(&db).expect("open graph store");
+    graph
+        .conn()
+        .execute(
+            "UPDATE provider_state SET files_failed = 1 WHERE language = 'rust'",
+            [],
+        )
+        .expect("inject supported-provider file failure");
+    drop(graph);
+
+    let (code, out, err) = run(&["index", "status", "--json"], &repo, &store);
+    assert_eq!(
+        code, 73,
+        "a real provider file failure must fail health; stderr={err}\nstdout={out}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect("valid health JSON");
+    assert_eq!(v["status"], "unhealthy");
+    assert_eq!(v["healthy"], false);
+    assert_eq!(v["provider_failure_count"], 1);
 }
 
 #[test]

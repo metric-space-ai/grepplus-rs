@@ -5915,6 +5915,14 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
     let incomplete_provider_count = project_diag
         .map(|p| p.incomplete_provider_count)
         .unwrap_or(0);
+    let provider_states = project_diag
+        .map(|p| p.provider_states.clone())
+        .unwrap_or_default();
+    let provider_failure_count = provider_states
+        .iter()
+        .filter(|provider| provider.status != "unsupported")
+        .map(|provider| provider.files_failed.max(0) as u64)
+        .sum::<u64>();
     let skip_counts = project_diag
         .map(|p| {
             p.skip_counts_by_reason
@@ -5994,12 +6002,13 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
     let inference_healthy = inference
         .as_ref()
         .is_none_or(greppy_embed_native::InferenceBackendRegistry::is_satisfied);
+    let embedding_healthy = embedding_complete || test_inference_skipped();
     let healthy = diag.schema_current
         && diag.integrity_ok
         && project_present
         && fresh
-        && embedding_complete
-        && incomplete_provider_count == 0
+        && embedding_healthy
+        && provider_failure_count == 0
         && coverage_warning.is_none()
         && inference_healthy
         && background_state != Some("refreshing");
@@ -6031,6 +6040,8 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "graph_generation": graph_generation,
             "stats": stats,
             "incomplete_provider_count": incomplete_provider_count,
+            "provider_failure_count": provider_failure_count,
+            "providers": provider_states,
             "skip_counts_by_reason": skip_counts,
             "git_tracked_files": git_tracked,
             "coverage_warning": coverage_warning,
@@ -6103,6 +6114,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
                 project_diag.stats.total_edges
             );
             println!("incomplete_providers: {incomplete_provider_count}");
+            println!("provider_file_failures: {provider_failure_count}");
             for skip in &project_diag.skip_counts_by_reason {
                 println!("skipped {} {}", skip.reason, skip.count);
             }

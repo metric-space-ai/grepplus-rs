@@ -4,7 +4,6 @@
 
 **Local code navigation for coding agents: deterministic symbol-graph evidence, native semantic search, compact function briefings, and byte-exact real-`grep` passthrough. One native Rust binary.**
 
-[![Release](https://img.shields.io/github/v/release/metric-space-ai/greppy?display_name=tag&sort=semver&color=22c55e&label=release)](https://github.com/metric-space-ai/greppy/releases/latest)
 [![CI](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -55,10 +54,11 @@ on Linux/NVIDIA to include the accelerated backend. Runtime selection is
 automatic and can be made explicit with `--device cpu|metal|cuda[:INDEX]` or
 `GREPPY_DEVICE`.
 
-The first structured query builds its local workspace index. Prebuilt binaries
-for macOS, Linux, and Windows are published on the
-[Releases](https://github.com/metric-space-ai/greppy/releases) page. Do not
-rename or install the binary as `grep`.
+The first structured query builds its local workspace index. There is no
+current prebuilt production package while `v0.2.0` is completing the release
+gates listed below; the older model-bearing preview packages were withdrawn.
+Build the current `main` revision from source for evaluation. Do not rename or
+install the binary as `grep`.
 
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
@@ -112,6 +112,30 @@ Treat returned source paths, exact spans, signatures, and graph relations as
 evidence. The indented English sentence below a function signature is a local
 Qwen navigation hint. Read the source and verify changes with builds and tests.
 ```
+
+### Try it without committing to it
+
+Greppy does not modify a repository during evaluation. Install the single
+binary under its own `greppy` name, point an agent at the command guide above,
+and compare one representative task with and without the structured commands.
+The strongest tests are questions that normally require several searches and
+file opens, such as finding all callers or locating behavior whose symbol name
+is unknown.
+
+Record correctness, tool calls, opened source spans, input tokens, and elapsed
+time for both runs. Keep Greppy only if the result is better for the actual
+project and agent. Removing the binary and its local cache completely removes
+the trial:
+
+```bash
+greppy cache clear --root . --yes
+sudo rm /usr/local/bin/greppy
+```
+
+Ordinary grep-compatible invocations are covered by byte-for-byte passthrough
+tests and do not build an index or start either inference daemon. Structured
+commands are additive and can therefore be introduced to an agent one command
+at a time.
 
 ---
 
