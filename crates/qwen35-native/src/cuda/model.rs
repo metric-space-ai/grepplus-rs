@@ -795,6 +795,7 @@ impl CudaQwen35Model {
         Ok(logits)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn forward_token_logits_hidden(
         &self,
         token: u32,
@@ -854,6 +855,7 @@ impl CudaQwen35Model {
         self.prefill_tokens_impl(tokens, state, false)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn forward_tokens_logits_hidden(
         &self,
         tokens: &[u32],

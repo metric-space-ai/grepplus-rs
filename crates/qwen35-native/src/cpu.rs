@@ -1587,10 +1587,10 @@ impl CpuQwen35Model {
                 let qh = &workspace.full_q
                     [head * self.inventory.head_dim..(head + 1) * self.inventory.head_dim];
                 let scores = &mut score_scratch[..position + 1];
-                for pos in 0..=position {
+                for (pos, score) in scores.iter_mut().enumerate() {
                     let key_base = pos * kv_k_dim + kv_head * self.inventory.head_dim;
                     let kh = &state.k_cache[key_base..key_base + self.inventory.head_dim];
-                    scores[pos] = dot(qh, kh) * score_scale;
+                    *score = dot(qh, kh) * score_scale;
                 }
                 softmax_in_place(scores);
                 for (pos, score) in scores.iter().copied().enumerate() {
@@ -1693,6 +1693,7 @@ fn add_rows(dst: &mut [f32], lhs: &[f32], rhs: &[f32]) {
         });
 }
 
+#[allow(clippy::needless_return)]
 fn dot(lhs: &[f32], rhs: &[f32]) -> f32 {
     debug_assert_eq!(lhs.len(), rhs.len());
 
@@ -1754,6 +1755,7 @@ unsafe fn dot_neon(lhs: &[f32], rhs: &[f32]) -> f32 {
 }
 
 #[inline]
+#[allow(clippy::needless_return)]
 fn delta_recurrent_step(
     state: &mut [f32],
     query: &[f32],
@@ -1901,6 +1903,7 @@ fn rms_rstd(x: &[f32]) -> f32 {
 }
 
 #[inline]
+#[allow(clippy::needless_return)]
 fn sum_squares_f32(values: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     if greppy_embed_native::cpu_features::has_avx2() {
@@ -1996,17 +1999,17 @@ fn split_full_attention_q_gate_into(
 fn causal_conv1d_silu(values: &mut [f32], weights: &[f32], state: &mut [f32]) {
     debug_assert_eq!(state.len(), values.len() * CONV_KERNEL);
     debug_assert_eq!(weights.len(), values.len() * CONV_KERNEL);
-    for channel in 0..values.len() {
+    for (channel, value) in values.iter_mut().enumerate() {
         let base = channel * CONV_KERNEL;
         for i in 0..CONV_KERNEL - 1 {
             state[base + i] = state[base + i + 1];
         }
-        state[base + CONV_KERNEL - 1] = values[channel];
+        state[base + CONV_KERNEL - 1] = *value;
         let mut acc = 0.0f32;
         for i in 0..CONV_KERNEL {
             acc += state[base + i] * weights[base + i];
         }
-        values[channel] = acc;
+        *value = acc;
     }
     silu_in_place(values);
 }

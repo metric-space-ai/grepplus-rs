@@ -553,8 +553,13 @@ fn chunk_text(header: &str, body_lines: &[&str]) -> String {
 }
 
 fn signature_end_idx(lines: &[&str], start_idx: usize, def_end_idx: usize) -> usize {
-    for idx in start_idx..=def_end_idx {
-        let trimmed = lines[idx].trim_end();
+    for (idx, line) in lines
+        .iter()
+        .enumerate()
+        .take(def_end_idx + 1)
+        .skip(start_idx)
+    {
+        let trimmed = line.trim_end();
         if trimmed.contains('{') || trimmed.contains("=>") || trimmed.ends_with(':') {
             return idx;
         }

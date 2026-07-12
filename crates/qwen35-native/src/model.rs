@@ -716,6 +716,7 @@ fn load_cuda_backend(
 }
 
 #[cfg(test)]
+#[allow(clippy::infallible_destructuring_match)]
 mod cpu_perf_tests {
     use super::*;
     use greppy_embed_native::matmul::QuantMatrix;

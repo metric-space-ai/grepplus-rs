@@ -300,8 +300,7 @@ fn looks_like_prompt_echo(statement: &str, prompt: &str) -> bool {
     }
     let prompt_first_code_line = prompt
         .lines()
-        .skip_while(|line| !line.trim_start().starts_with("fn "))
-        .next()
+        .find(|line| line.trim_start().starts_with("fn "))
         .map(str::trim)
         .unwrap_or("");
     !prompt_first_code_line.is_empty() && statement.trim() == prompt_first_code_line

@@ -989,7 +989,7 @@ pub fn secure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
     }
     #[cfg(windows)]
     {
@@ -1006,7 +1006,7 @@ pub fn secure_private_file(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
     }
     #[cfg(windows)]
     {

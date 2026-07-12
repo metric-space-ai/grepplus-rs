@@ -55,4 +55,4 @@ accelerate = []
 cuda = ["greppy-embed-native/cuda", "greppy-indexer/cuda", "greppy-qwen35-native/cuda"]
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = { workspace = true }

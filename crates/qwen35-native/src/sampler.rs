@@ -236,7 +236,7 @@ mod tests {
     fn triage_params_are_greedy_and_tiny() {
         assert_eq!(TRIAGE_GENERATION_PARAMS.temperature, 0.0);
         assert_eq!(TRIAGE_GENERATION_PARAMS.top_k, 1);
-        assert!(TRIAGE_GENERATION_PARAMS.max_tokens <= 24);
+        assert_eq!(TRIAGE_GENERATION_PARAMS.max_tokens, 24);
     }
 
     #[test]

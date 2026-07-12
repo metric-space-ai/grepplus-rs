@@ -149,6 +149,7 @@ impl MtpPerfTimer {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn report(
         &self,
         backend: &str,
@@ -186,6 +187,12 @@ impl MtpPerfTimer {
     }
 }
 
+impl From<greppy_embed_native::Error> for Error {
+    fn from(value: greppy_embed_native::Error) -> Self {
+        Self::Gguf(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod mtp_tests {
     #[test]
@@ -195,11 +202,5 @@ mod mtp_tests {
         assert!(super::mtp_should_fallback(4, 2));
         assert!(super::mtp_should_fallback(4, 3));
         assert!(!super::mtp_should_fallback(4, 4));
-    }
-}
-
-impl From<greppy_embed_native::Error> for Error {
-    fn from(value: greppy_embed_native::Error) -> Self {
-        Self::Gguf(value.to_string())
     }
 }

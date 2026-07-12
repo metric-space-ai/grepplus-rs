@@ -2300,6 +2300,7 @@ fn expand_ttl_secs() -> u64 {
         .unwrap_or(greppy_store::DEFAULT_EXPAND_TTL_SECS)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_expand_pack_best_effort(
     store: &greppy_store::Store,
     project: &str,
@@ -4192,7 +4193,7 @@ fn read_source_line(root: &std::path::Path, file_path: &str, line: u32) -> Optio
             cut -= 1;
         }
         s.truncate(cut);
-        s.push_str("…");
+        s.push('…');
     }
     Some(s)
 }
@@ -9624,9 +9625,9 @@ fn dispatch_semantic(
                         println!("{}", expand.semantic_text_line(further_hits.len()));
                     }
                 }
-                return Ok(if hits.is_empty() { 1 } else { 0 });
+                Ok(if hits.is_empty() { 1 } else { 0 })
             }
-            Err(e) => return Err(e),
+            Err(e) => Err(e),
         }
     }
 }
@@ -11295,14 +11296,14 @@ fn embedded_asset_metadata_fingerprint(
                 ),
             ));
         }
-        return Ok(format!(
+        Ok(format!(
             "unix:{}:{}:{}:{}:{}",
             metadata.dev(),
             metadata.ino(),
             metadata.mtime(),
             metadata.mtime_nsec(),
             metadata.ctime_nsec()
-        ));
+        ))
     }
     #[cfg(not(unix))]
     {
@@ -11448,9 +11449,8 @@ mod embeddinggemma_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
-        static GGUF: &[u8] =
-            include_bytes!(concat!(env!("OUT_DIR"), "/embeddinggemma-300M-Q4_K.gguf"));
-        static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tokenizer.json"));
+        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_GGUF_PATH"));
+        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_TOK_PATH"));
         let root = greppy_core::cache::models_root().join("embeddinggemma-300m-q4k");
         let gguf = extract(&root, GGUF_SHA, "embeddinggemma-300M-Q4_K.gguf", GGUF)?;
         let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
@@ -11529,9 +11529,8 @@ mod qwen35_assets {
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
-        static GGUF: &[u8] =
-            include_bytes!(concat!(env!("OUT_DIR"), "/Qwen3.5-0.8B-MTP-Q4_K_M.gguf"));
-        static TOK: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/qwen35-tokenizer.json"));
+        static GGUF: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_GGUF_PATH"));
+        static TOK: &[u8] = include_bytes!(env!("GREPPY_EMBEDDED_QWEN35_TOK_PATH"));
         let root = greppy_core::cache::models_root().join("qwen35-0.8b-mtp-q4km");
         let gguf = extract(&root, GGUF_SHA, "Qwen3.5-0.8B-MTP-Q4_K_M.gguf", GGUF)?;
         let tok = extract(&root, TOK_SHA, "tokenizer.json", TOK)?;
@@ -14068,7 +14067,7 @@ mod tests {
 
     #[test]
     fn semantic_vector_purpose_lookup_is_embedding_id_keyed() {
-        let hits = vec![
+        let hits = [
             vector_hit_for_test("src/noise.rs", 30, 33, "noise", 0.99),
             vector_hit_for_test("src/read.rs", 10, 12, "read", 0.77),
         ];

@@ -270,6 +270,7 @@ pub(super) fn detach_command(command: &mut std::process::Command) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn serve<M, Load, Validate, Handle>(
     endpoint: Endpoint,
     supplied_address: &str,
@@ -298,6 +299,7 @@ where
     std::process::exit(code)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_server<M, Load, Validate, Handle>(
     endpoint: Endpoint,
     supplied_address: &str,
@@ -1743,11 +1745,19 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn hung prewarm daemon test child");
-        wait_for_server(&endpoint);
-        assert_eq!(
-            hung.wait().expect("reap prewarm watchdog daemon").code(),
-            Some(70)
-        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = hung.try_wait().expect("poll prewarm watchdog daemon") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = hung.kill();
+                let _ = hung.wait();
+                panic!("prewarm watchdog daemon did not terminate");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.code(), Some(70));
         #[cfg(unix)]
         let _ = std::fs::remove_file(endpoint.address());
     }

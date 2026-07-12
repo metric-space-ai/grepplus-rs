@@ -447,7 +447,6 @@ mod tests {
     fn default_ttls_cover_agent_session_bursts() {
         assert_eq!(DEFAULT_MODEL_TTL_S, 300);
         assert_eq!(DEFAULT_EXIT_TTL_S, 1800);
-        assert!(DEFAULT_MODEL_TTL_S < DEFAULT_EXIT_TTL_S);
     }
 
     #[test]
