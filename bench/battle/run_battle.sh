@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_battle.sh — aggregate the battle-proof validation suite.
 #
-# Black-box harness (Track C): drives the already-built greppy binaries
+# Black-box harness (Track C): drives the already-built greppy binary
 # and asserts production invariants. Touches NO crate source.
 #
 # Runs each focused battle script, parses its BATTLE_SUMMARY line, prints
@@ -26,20 +26,19 @@ export WORKSPACE_ROOT
 export GREPPY_TEST_SKIP_INFERENCE=1
 
 GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy}"
-GREPPY_GREP_BIN="${GREPPY_GREP_BIN:-$WORKSPACE_ROOT/target/debug/greppy-grep}"
 
-# Auto-build if binaries are missing (best-effort; report if it fails).
-if [[ ! -x "$GREPPY_BIN" || ! -x "$GREPPY_GREP_BIN" ]]; then
-    echo "[run_battle] binaries missing; running 'cargo build --bins' ..."
-    if ! ( cd "$WORKSPACE_ROOT" && cargo build --bins ); then
-        echo "[run_battle] cargo build --bins FAILED" >&2
+# Auto-build if the product binary is missing (best-effort; report if it fails).
+if [[ ! -x "$GREPPY_BIN" ]]; then
+    echo "[run_battle] binary missing; running 'cargo build --bin greppy' ..."
+    if ! ( cd "$WORKSPACE_ROOT" && cargo build --bin greppy ); then
+        echo "[run_battle] cargo build --bin greppy FAILED" >&2
         exit 1
     fi
 fi
 
 # Optional release-build invariant (BATTLE_RELEASE=1). Release builds are
 # slow, so this is opt-in. It asserts the release binaries (a) build and
-# (b) honour the byte-exact drop-in contract on a representative query —
+# (b) honour the byte-exact passthrough contract on a representative query -
 # the same property the debug suite checks, but on the optimised build
 # that actually ships. Failure here is counted in the combined summary.
 declare -i rel_pass=0
@@ -47,10 +46,10 @@ declare -i rel_fail=0
 if [[ "${BATTLE_RELEASE:-0}" == "1" ]]; then
     echo ""
     echo "================ release-invariant ================"
-    if ( cd "$WORKSPACE_ROOT" && cargo build --release --bins ); then
-        echo "PASS release binaries build"
+    if ( cd "$WORKSPACE_ROOT" && cargo build --release --bin greppy ); then
+        echo "PASS release binary builds"
         rel_pass=$((rel_pass + 1))
-        rel_grep="$WORKSPACE_ROOT/target/release/greppy-grep"
+        rel_grep="$WORKSPACE_ROOT/target/release/greppy"
         real_grep="${REAL_GREP:-/usr/bin/grep}"
         [[ -x "$real_grep" ]] || real_grep="$(command -v grep)"
         rel_tmp="$(mktemp -d "${TMPDIR:-/tmp}/battle-release-XXXXXX")"
@@ -58,15 +57,15 @@ if [[ "${BATTLE_RELEASE:-0}" == "1" ]]; then
         og="$("$rel_grep" -n foo "$rel_tmp/plain.txt" 2>/dev/null)"; rcg=$?
         or="$("$real_grep" -n foo "$rel_tmp/plain.txt" 2>/dev/null)"; rcr=$?
         if [[ "$og" == "$or" && "$rcg" -eq "$rcr" && "$rcg" -lt 128 ]]; then
-            echo "PASS release drop-in grep byte-exact vs $real_grep"
+            echo "PASS release grep passthrough byte-exact vs $real_grep"
             rel_pass=$((rel_pass + 1))
         else
-            echo "FAIL release drop-in grep byte-exact vs $real_grep (rc $rcg vs $rcr)"
+            echo "FAIL release grep passthrough byte-exact vs $real_grep (rc $rcg vs $rcr)"
             rel_fail=$((rel_fail + 1))
         fi
         rm -rf "$rel_tmp"
     else
-        echo "FAIL release binaries build"
+        echo "FAIL release binary build"
         rel_fail=$((rel_fail + 1))
     fi
 fi

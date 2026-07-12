@@ -637,8 +637,8 @@ dependencies = [
  "greppy-discover",
  "greppy-embed-native",
  "greppy-freshness",
- "greppy-grep",
  "greppy-indexer",
+ "greppy-passthrough",
  "greppy-qwen35-native",
  "greppy-search",
  "greppy-store",
@@ -709,18 +709,6 @@ dependencies = [
  "sha2",
  "thiserror 1.0.69",
  "tracing",
-]
-
-[[package]]
-name = "greppy-grep"
-version = "0.1.2"
-dependencies = [
- "greppy-core",
- "greppy-freshness",
- "greppy-indexer",
- "greppy-store",
- "serde_json",
- "which",
 ]
 
 [[package]]
@@ -819,6 +807,18 @@ dependencies = [
  "tree-sitter-vue-next",
  "tree-sitter-yaml",
  "tree-sitter-zig",
+]
+
+[[package]]
+name = "greppy-passthrough"
+version = "0.1.2"
+dependencies = [
+ "greppy-core",
+ "greppy-freshness",
+ "greppy-indexer",
+ "greppy-store",
+ "serde_json",
+ "which",
 ]
 
 [[package]]

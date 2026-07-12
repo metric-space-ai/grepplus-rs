@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Contract-level invocations for the standalone passthrough binary.
+# Contract-level invocations for the shipped Greppy passthrough path.
 # Every invocation must preserve stdout, stderr, and the exit code exactly and
 # must not create index, model, or sidecar state.
 
@@ -7,19 +7,19 @@ set -uo pipefail
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
-GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy-grep}"
+GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy}"
 FIXTURE_SRC="$WORKSPACE_ROOT/bench/fixtures/sample"
 
 if [[ ! -x "$GREPPY_BIN" ]]; then
     echo "grep_compat.sh: build first:"
-    echo "  cargo build -p greppy --bin greppy-grep"
+    echo "  cargo build --bin greppy"
     pass=0; fail=1
     echo "pass: $pass / fail: $fail"
     exit 1
 fi
 
 declare -i pass=0 fail=0
-TMP_BASE="${TMPDIR:-/tmp}/greppy-grep-compat-$$"
+TMP_BASE="${TMPDIR:-/tmp}/greppy-compat-$$"
 mkdir -p "$TMP_BASE"
 
 WORK=$(mktemp -d -p "$TMP_BASE")

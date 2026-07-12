@@ -54,7 +54,7 @@ diagnosed quickly.
 
 `freshness_bench.sh` prints `expect / actual / elapsed_ms` per
 scenario. Elapsed is the per-check wall time; the production
-`greppy-grep` gate is budgeted at 200 ms (per-invocation,
+The Greppy passthrough gate is budgeted at 200 ms (per invocation,
 search-path-scoped), while the bench probe uses 30 s because it
 walks the whole repo.
 

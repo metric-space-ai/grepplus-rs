@@ -66,7 +66,7 @@ fn run(root: &str, project: &str) -> Result<()> {
     // The freshness probe uses the per-file check so that
     // unstaged file edits are detected as Stale. Budget is generous
     // (30 s) because the per-file walk hashes every file in the
-    // search paths; the production `greppy-grep` gate uses 200 ms
+    // search paths; the production Greppy passthrough gate uses 200 ms
     // because it only walks the search paths, not the whole repo.
     let res = greppy_freshness::check_files(
         &store,

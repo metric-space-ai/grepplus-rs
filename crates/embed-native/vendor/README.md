@@ -10,6 +10,9 @@ Their license is preserved alongside them in [`LICENSE-ggml`](./LICENSE-ggml):
 
 > Copyright (c) 2023-2026 The ggml authors — MIT License.
 
+Exact upstream blob commits and modified-file lineage are pinned in
+[`UPSTREAM.md`](./UPSTREAM.md).
+
 The MIT notice is also reproduced at the top of several upstream headers
 (e.g. `cuda/ggml-include/ggml-cann.h`, `cuda/ggml-include/ggml-sycl.h`).
 
@@ -44,9 +47,12 @@ This small subset is compiled directly:
 - **Metal** (`--features metal`): the `.metal` shaders are compiled into a
   `.metallib` at build time.
 
-Neither backend is built by default (`default = []`).
+The accelerator crates use `default = []`, while every Greppy product binary
+still embeds both models and always includes CPU inference. Platform release
+builds enable Metal or CUDA explicitly.
 
 ## Updating
 
-When refreshing from upstream ggml, keep this file and `LICENSE-ggml` in sync
-with the upstream copyright year range, and re-record the upstream commit here.
+When refreshing from upstream ggml, keep this file, `LICENSE-ggml`, and
+`UPSTREAM.md` in sync. Record exact blob lineage, rerun CPU/GPU parity and MTP
+tests, and reject broad updates that remove Greppy fusion kernels.

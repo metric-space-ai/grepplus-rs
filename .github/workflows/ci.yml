@@ -138,7 +138,6 @@ jobs:
         env:
           # Point the harness at the debug binaries we just built.
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
-          GREPPY_GREP_BIN: ${{ github.workspace }}/target/debug/greppy-grep
         run: bash bench/battle/run_battle.sh
 
   windows-cpu:
@@ -240,7 +239,6 @@ jobs:
       - name: battle suite + soak
         env:
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
-          GREPPY_GREP_BIN: ${{ github.workspace }}/target/debug/greppy-grep
           BATTLE_SOAK: "1"
           BATTLE_SOAK_ITERS: "100"
           BATTLE_SOAK_FILES: "40"

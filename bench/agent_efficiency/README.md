@@ -1,104 +1,117 @@
-# Agent efficiency benchmark (greppy vs the uncoached grep agent)
+# Agent efficiency benchmark
 
-A **real**, multi-repo, multi-language measurement of how many tokens, tool-call
-loops, and seconds an LLM coding agent spends to answer code questions — once
-using plain `grep`, once using `greppy` — across a generated corpus of repos
-of varied size and language.
+A reproducible multi-repository measurement of correctness, input/output
+tokens, source-open loops, tool calls, and wall time for the same coding agent
+with and without Greppy. The pre-registered release rules are in
+[`BENCHMARK_CONTRACT.md`](BENCHMARK_CONTRACT.md).
 
-## Layout
+## Inputs
 
 | File | Purpose |
-|------|---------|
-| `gen_corpus.sh` / `gen_corpus.py` | Deterministically generate the `corpus/` repos (git-init each). |
-| `tasks.json` | ~100 benchmark tasks (locate + research) with machine-checkable ground truth. |
-| `task_classes.json` | R7 router/regression classes for all 100 tasks: direct similarity, hybrid seed-graph, literal controls and graph controls. |
-| `gen_tasks.py` | Regenerates `tasks.json`. |
-| `verify_tasks.py` | Indexes every corpus repo, asserts cross-file edges, and checks every task's ground truth against the live greppy graph. |
-| `verify_task_classes.py` | Verifies that every task belongs to exactly one regression/router class and that known hard-negative sets are present. |
-| `run_bench.py` | Runs the grep-agent and greppy-agent per task; records **input and output tokens separately**, tool calls, wall-clock; aggregate reporter. |
-| `grade_answers.py` | Conservative answer grader against `tasks.json`; `smoke` mode is triage, `mechanical --accept-mechanical` is the strict synthetic-bench gate. |
-| `forensics.py` | Mandatory post-run forensics: winner/loser classes, quality-gate status, raw command paths, optimization backlog. |
-| `acceptance_run.py` | Serial research orchestrator (product runs use `parallel_acceptance_run.py`); non-explorer baselines are stamped DIAGNOSTIC. |
-| `large_repo_stress.py` | R3/R8 black-box index stress gate: synthetic git Rust repo, initial index, one-file incremental reindex, RSS sampling, graph.db integrity/size and symbol proofs. |
-| `minimax-provider.js` | pi.dev provider registering MiniMax (API key from `$MINIMAX_API_KEY`). |
+|---|---|
+| `tasks.json`, `task_classes.json` | 100 deterministic synthetic control tasks and router classes. |
+| `tasks_v2.json`, `task_classes_v2.json` | 115 product tasks: six pinned real repositories plus synthetic controls. |
+| `realcorpus/MANIFEST.json` | Repository URLs, commits, languages, and licenses. |
+| `realcorpus/candidates.json` | Audited graph-oracle candidates used to generate real tasks. |
+| `gen_corpus.py`, `gen_corpus.sh` | Deterministically materialize synthetic repositories. |
+| `real_corpus.py` | Clone and verify pinned real repositories. |
+| `gen_tasks.py`, `gen_real_tasks.py` | Deterministically regenerate v1 and v2 task banks. |
+| `verify_tasks.py`, `verify_real_tasks.py` | API-free ground-truth and corpus verification. |
+| `run_bench.py` | Low-level per-task Pi runner and aggregate reporter. |
+| `parallel_acceptance_run.py` | Product runner with isolated stores, parallel tasks, grading, and gates. |
+| `grade_answers.py`, `forensics.py` | Machine-readable quality grading and regression analysis. |
+| `release_gate.py` | Fixed correctness, tool/source-open, and input-token thresholds. |
+| `large_repo_stress.py` | Reproducible index, integrity, incremental-update, and RSS stress gate. |
 
-## Corpus
+Synthetic corpus repositories are generated locally and intentionally not
+committed because each contains its own `.git` directory. Real repositories are
+also cloned locally, never redistributed, and must match the commits in
+`realcorpus/MANIFEST.json`.
 
-`gen_corpus.sh` produces six git-initialised repos under `corpus/`, spanning
-five languages and three size classes (small ≈ 15 files, medium ≈ 80, large ≈
-400+). Each repo is layered `core → service → app` so functions call across
-files, modules import each other, and a few hub symbols are called from many
-sites — giving graph/research questions real answers.
+## Task contract
 
-| repo | language | size | files | cross-file graph |
-|------|----------|------|------:|------------------|
-| `rust_medium`  | Rust       | medium | ~83  | full cross-file CALLS |
-| `python_large` | Python     | large  | ~425 | full cross-file CALLS |
-| `go_small`     | Go         | small  | ~16  | full cross-file CALLS |
-| `java_medium`  | Java       | medium | ~81  | full cross-file CALLS |
-| `js_small`     | JavaScript | small  | ~15  | same-file + resolved cross-file CALLS, IMPORTS |
-| `ts_large`     | TypeScript | large  | ~412 | same-file CALLS, IMPORTS |
-
-The corpus is **reproducible** (no randomness, no timestamps in content) and is
-**not committed** (see `.gitignore`) — regenerate it with `gen_corpus.sh`.
-
-## Tasks
-
-`tasks.json` holds ~100 tasks, each:
+Each task has a stable ID, repository/language, question type, question,
+ground truth, and a machine-checkable descriptor. Example:
 
 ```json
-{"id":"t001","repo":"rust_medium","lang":"rust","type":"locate",
- "q":"Who calls compute_checksum? ...",
- "ground_truth":"compute_checksum is called by ...",
- "check":{"kind":"who_calls","symbol":"compute_checksum","expect_members":[...],"min_count":70}}
+{
+  "id": "t001",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls compute_checksum?",
+  "check": {
+    "kind": "who_calls",
+    "symbol": "compute_checksum",
+    "expect_members": ["normalize_record"],
+    "min_count": 70
+  }
+}
 ```
 
-`type` is **`locate`** ("where is X / who calls X / find usages of X") or
-**`research`** ("how does subsystem X work", "what breaks if Y changes", "trace
-the data flow from A to B", "which module owns Z and what are its entry
-points"). The `check` descriptor makes each ground truth mechanically
-verifiable.
+`tasks_v2.json` contains 115 tasks over Rust, Python, Java, JavaScript,
+TypeScript, and Go. Real repository commits are pinned for Serde, Tokio, Flask,
+Django, Gson, and Zod.
 
-## Run it
+## Reproduce
 
 ```bash
-# 0. build greppy
-cargo build --bin greppy
+# Product binary. Both models are embedded and active.
+cargo build --release --bin greppy
 
-# 1. generate the corpus (git-inits each repo)
+# Synthetic controls.
 bash bench/agent_efficiency/gen_corpus.sh
-
-# 2. validate class coverage, corpus + ground truth WITHOUT any API key
 python3 bench/agent_efficiency/verify_task_classes.py
 python3 bench/agent_efficiency/verify_tasks.py --index
 
-# 3. provide the model key VIA ENV (never commit it) and run the A/B benchmark
-export MINIMAX_API_KEY=sk-...
-# macOS alternative for Codex/Desktop processes:
-# launchctl setenv MINIMAX_API_KEY sk-...
-python3 bench/agent_efficiency/parallel_acceptance_run.py   # product gate: greppy vs explorer
-python3 bench/agent_efficiency/run_bench.py            # raw runner only
-python3 bench/agent_efficiency/run_bench.py --repo go_small   # one repo
-python3 bench/agent_efficiency/run_bench.py t001 t042         # a subset
+# Pinned real repositories and v2 task contract.
+python3 bench/agent_efficiency/real_corpus.py setup \
+  --repos serde flask gson zod tokio django
+python3 bench/agent_efficiency/verify_real_tasks.py
 
-# 4. aggregate report: MEDIAN and MEAN factors for INPUT and OUTPUT tokens
-#    separately, by repo-size, task-type, and language
-python3 bench/agent_efficiency/run_bench.py --report
+# Same model, same tasks, Greppy vs uncoached explorer baseline.
+export MINIMAX_API_KEY=...
+python3 bench/agent_efficiency/parallel_acceptance_run.py \
+  --tasks tasks_v2.json \
+  --agents grep,greppy,explorer \
+  --parallel 5
+```
 
-# 5. mandatory post-benchmark forensics
-#    --enforce exits non-zero until every comparable row has quality evidence
-python3 bench/agent_efficiency/grade_answers.py \
-  --mode mechanical \
-  --accept-mechanical \
-  --output bench/agent_efficiency/results.mechanical-graded.json
-python3 bench/agent_efficiency/forensics.py \
-  --results bench/agent_efficiency/results.mechanical-graded.json \
-  --baseline explorer \
-  --candidate greppy \
-  --output bench/agent_efficiency/FORENSICS_explorer_VS_greppy.md \
-  --enforce
+Five workers is the default production setting. Higher concurrency can trigger
+provider rate limits and does not make a partial run decision-capable. The
+runner has bounded retry/backoff and a circuit breaker for sustained provider
+failure.
 
-# 6. R3/R8 large-repo index stress gate, no API key required
+## Artifacts
+
+Each acceptance run is isolated under
+`bench/agent_efficiency/acceptance_runs/<run-id>/` and produces:
+
+- `RUN_MANIFEST.json`: Git/binary/task/class/repository/prompt/model hashes;
+- `results.json`: per-task raw metrics and final answers;
+- `results.mechanical.json`: accepted machine-readable quality grades;
+- `aggregate.txt`: aggregate factors by class, size, type, and language;
+- `FORENSICS_explorer_VS_greppy.md`: product-baseline analysis;
+- `release-gate.json`: fixed release thresholds and pass/fail status;
+- `SUMMARY.md`: executed steps and exit codes.
+
+Raw Pi JSONL is retained locally for debugging and forensics. It may contain
+source snippets and full trajectories and is excluded from Git and release
+artifacts. The publishable files above contain per-task metrics and grading but
+no raw traces.
+
+## Release gates
+
+The result is accepted only when every comparable row has quality evidence,
+there is no statistically significant paired correctness regression, and on
+structural tasks Greppy uses at most 80% of the baseline's tool calls,
+source-open calls, and variable input tokens. `release_gate.py` enforces those
+thresholds; `forensics.py --enforce` additionally rejects missing evidence and
+router violations.
+
+## Large-repository stress
+
+```bash
 python3 bench/agent_efficiency/large_repo_stress.py \
   --files 300 \
   --functions-per-file 3 \
@@ -112,50 +125,8 @@ python3 bench/agent_efficiency/large_repo_stress.py \
   --json
 ```
 
-`run_bench.py` writes per-task rows to `results.json` incrementally (with input
-and output token usage recorded separately for both agents).
+## Secrets
 
-No benchmark run is accepted from the aggregate report alone. A matching
-forensics report must exist, and speed wins are only accepted when answer
-quality is machine-readable, marked `accepted_for_speed_claim=true`, and not
-worse than the baseline. Without that accepted quality evidence, wins are
-optimization hints only. Use `--mode smoke` for triage. Use `--mode mechanical
---accept-mechanical` only for the synthetic 100-task bench where `tasks.json`
-is the ground-truth contract. `forensics.py --enforce` also treats vector or
-EmbeddingGemma usage on `literal_control` / `graph_control` tasks as a router
-violation, even when the answer text happens to pass.
-
-The preferred full product command is (R8: parallel, never serial):
-
-```bash
-python3 bench/agent_efficiency/parallel_acceptance_run.py \
-  --agents grep,greppy,explorer --parallel 20
-```
-
-It writes isolated artifacts under `bench/agent_efficiency/acceptance_runs/<run-id>/`
-with a run-local `GREPPY_STORE_DIR`. The product GATE is fixed: `greppy`
-versus `explorer` (the uncoached "normales grep" agent, BENCHMARK_CONTRACT
-§Baselines); only the explorer forensics leg decides the exit code (exit 2 if
-not accepted). The coached `grep` agent is always co-reported as a marked
-diagnostic row — it is never the gate and never product status.
-
-Research-only ablation agents such as `plus` or `gemma` can still be requested
-explicitly (`run_bench.py --diagnostic`) to diagnose which internal mechanism
-helps or hurts. They are not separate greppy products and must not be
-reported as product status. The product claim is always the single `greppy`
-agent versus the uncoached explorer baseline.
-
-The greppy-agent's system prompt explicitly steers the model to greppy's
-**code-returning context queries** (`greppy context` / `--code` style
-retrieval, provided by `search-code`, which returns the matching source lines)
-on top of the graph commands (`who-calls`, `callees`, `find-usages`, `path`,
-`trace`), so it pulls real code, not just file:line pointers.
-
-## Security
-
-The API key is read from `$MINIMAX_API_KEY` at runtime and is **never** stored
-in any file here. On macOS, `run_bench.py` and `acceptance_run.py` also fall
-back to `launchctl getenv MINIMAX_API_KEY` when the current process did not
-inherit the shell environment. `minimax-provider.js` only references the env var
-(`apiKey: "$MINIMAX_API_KEY"`). The bench scripts never accept the key on argv,
-so they are safe to drive from an orchestrator.
+The provider key is read from `MINIMAX_API_KEY` or, on macOS, from the user's
+launchd environment. It is never accepted on argv or written to results,
+manifests, logs, or reports.

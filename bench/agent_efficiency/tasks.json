@@ -1,0 +1,1559 @@
+[
+ {
+  "id": "t001",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls the function compute_checksum? List the calling functions.",
+  "ground_truth": "compute_checksum is called by merge_checksums, by normalize_record, and by every process_svcNN service function (74 call sites total).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "compute_checksum",
+   "expect_members": [
+    "normalize_record",
+    "merge_checksums",
+    "process_svc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t002",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "What are the direct callees of normalize_record? List them with file:line.",
+  "ground_truth": "normalize_record calls clamp_value (src/core/clampval.rs) and compute_checksum (src/core/checksum.rs).",
+  "check": {
+   "kind": "callees",
+   "symbol": "normalize_record",
+   "expect_members": [
+    "clamp_value",
+    "compute_checksum"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t003",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls normalize_record? Name the calling functions.",
+  "ground_truth": "Every process_svcNN service function calls normalize_record (72 callers).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "normalize_record",
+   "expect_members": [
+    "process_svc00",
+    "process_svc01"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t004",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "What does run_pipeline call directly? List its callees.",
+  "ground_truth": "run_pipeline calls merge_checksums and every process_svcNN service entry.",
+  "check": {
+   "kind": "callees",
+   "symbol": "run_pipeline",
+   "expect_members": [
+    "merge_checksums",
+    "process_svc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t005",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Find the definition site of clamp_value.",
+  "ground_truth": "clamp_value is defined in src/core/clampval.rs.",
+  "check": {
+   "kind": "search_symbols",
+   "query": "clamp_value",
+   "expect_file": "clampval.rs"
+  }
+ },
+ {
+  "id": "t006",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Where is the FNV checksum loop implemented? Return the code.",
+  "ground_truth": "The rolling-checksum loop is in compute_checksum in src/core/checksum.rs.",
+  "check": {
+   "kind": "search_code",
+   "query": "wrapping_mul",
+   "expect_file": "checksum.rs"
+  }
+ },
+ {
+  "id": "t007",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "How does the normalisation subsystem work? Summarise the key functions and the core leaves they depend on.",
+  "ground_truth": "normalize_record (src/core/normalize.rs) is the junction: it clamps the score via clamp_value (clampval.rs) and hashes the payload via compute_checksum (checksum.rs), returning a Record. Services call it.",
+  "check": {
+   "kind": "callees",
+   "symbol": "normalize_record",
+   "expect_members": [
+    "clamp_value",
+    "compute_checksum"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t008",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "What would break if the signature of compute_checksum changed? List the impacted call sites / functions.",
+  "ground_truth": "All callers of compute_checksum break: merge_checksums, normalize_record, and every process_svcNN (74 sites).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "compute_checksum",
+   "expect_members": [
+    "normalize_record",
+    "merge_checksums"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t009",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "Trace the data flow from run_pipeline down to the core checksum leaf. Give the call path.",
+  "ground_truth": "run_pipeline -> process_svcNN -> normalize_record -> compute_checksum (in src/core/checksum.rs).",
+  "check": {
+   "kind": "path",
+   "frm": "run_pipeline",
+   "to": "compute_checksum"
+  }
+ },
+ {
+  "id": "t010",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "Trace from run_pipeline to clamp_value. Give the path of functions.",
+  "ground_truth": "run_pipeline -> process_svcNN -> normalize_record -> clamp_value.",
+  "check": {
+   "kind": "path",
+   "frm": "run_pipeline",
+   "to": "clamp_value"
+  }
+ },
+ {
+  "id": "t011",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "Which module owns record normalisation and what are its entry points (the functions other layers call into it)?",
+  "ground_truth": "src/core/normalize.rs owns normalisation; its entry point normalize_record is called by every service (process_svcNN).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "normalize_record",
+   "expect_members": [
+    "process_svc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t012",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "If you changed how scores are clamped, which single function must you edit and which functions call it?",
+  "ground_truth": "Edit clamp_value (src/core/clampval.rs); it is called by normalize_record.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "clamp_value",
+   "expect_members": [
+    "normalize_record"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t013",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls validate_currency? Name the calling functions.",
+  "ground_truth": "post-path to_minor_units? No -- validate_currency is called by money's to_minor_units and by every process_svcNNN (416 callers).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "validate_currency",
+   "expect_members": [
+    "to_minor_units",
+    "process_svc000"
+   ],
+   "min_count": 400
+  }
+ },
+ {
+  "id": "t014",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "What are the direct callees of to_minor_units?",
+  "ground_truth": "to_minor_units calls validate_amount and validate_currency (app/core/validate.py).",
+  "check": {
+   "kind": "callees",
+   "symbol": "to_minor_units",
+   "expect_members": [
+    "validate_amount",
+    "validate_currency"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t015",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls post_entry? List the calling functions.",
+  "ground_truth": "Every process_svcNNN service function calls post_entry (415 callers).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "post_entry",
+   "expect_members": [
+    "process_svc000",
+    "process_svc001"
+   ],
+   "min_count": 400
+  }
+ },
+ {
+  "id": "t016",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "What are the direct callees of post_entry?",
+  "ground_truth": "post_entry calls to_minor_units (app/core/money.py).",
+  "check": {
+   "kind": "callees",
+   "symbol": "post_entry",
+   "expect_members": [
+    "to_minor_units"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t017",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Find the definition of validate_amount.",
+  "ground_truth": "validate_amount is defined in app/core/validate.py.",
+  "check": {
+   "kind": "search_symbols",
+   "query": "validate_amount",
+   "expect_file": "validate.py"
+  }
+ },
+ {
+  "id": "t018",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Where is a major-to-minor currency conversion (amount * 100) implemented? Return the code.",
+  "ground_truth": "In to_minor_units in app/core/money.py (int(round(amount * 100))).",
+  "check": {
+   "kind": "search_code",
+   "query": "to_minor_units",
+   "expect_file": "money.py"
+  }
+ },
+ {
+  "id": "t019",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "How does the money subsystem convert amounts to minor units, and what validation does it perform first?",
+  "ground_truth": "to_minor_units (app/core/money.py) validates via validate_amount and validate_currency, then returns int(round(amount*100)).",
+  "check": {
+   "kind": "callees",
+   "symbol": "to_minor_units",
+   "expect_members": [
+    "validate_amount",
+    "validate_currency"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t020",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "What would break if post_entry changed its return shape? List impacted callers.",
+  "ground_truth": "Every process_svcNNN consumes post_entry's return (415 callers impacted).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "post_entry",
+   "expect_members": [
+    "process_svc000"
+   ],
+   "min_count": 400
+  }
+ },
+ {
+  "id": "t021",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "Trace the data flow from run_pipeline down to to_minor_units. Give the call path.",
+  "ground_truth": "run_pipeline -> process_svcNNN -> post_entry -> to_minor_units.",
+  "check": {
+   "kind": "path",
+   "frm": "run_pipeline",
+   "to": "to_minor_units"
+  }
+ },
+ {
+  "id": "t022",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "Trace from run_pipeline to validate_amount.",
+  "ground_truth": "run_pipeline -> process_svcNNN -> post_entry -> to_minor_units -> validate_amount.",
+  "check": {
+   "kind": "path",
+   "frm": "run_pipeline",
+   "to": "validate_amount"
+  }
+ },
+ {
+  "id": "t023",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "Which module owns the ledger and what is its public entry point?",
+  "ground_truth": "app/core/ledger.py owns the ledger; post_entry is the entry point called by every service.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "post_entry",
+   "expect_members": [
+    "process_svc000"
+   ],
+   "min_count": 400
+  }
+ },
+ {
+  "id": "t024",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "If currency validation rules change, which function must be edited and who depends on it?",
+  "ground_truth": "Edit validate_currency (app/core/validate.py); to_minor_units and every service depend on it.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "validate_currency",
+   "expect_members": [
+    "to_minor_units"
+   ],
+   "min_count": 400
+  }
+ },
+ {
+  "id": "t025",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Who calls NormalizeRecord? Name the callers.",
+  "ground_truth": "Every ProcessSvcNN calls NormalizeRecord (9 callers).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "NormalizeRecord",
+   "expect_members": [
+    "ProcessSvc00",
+    "ProcessSvc01"
+   ],
+   "min_count": 8
+  }
+ },
+ {
+  "id": "t026",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "What are the direct callees of NormalizeRecord?",
+  "ground_truth": "NormalizeRecord calls ClampInt (core/clamp.go) and ComputeHash (core/hash.go).",
+  "check": {
+   "kind": "callees",
+   "symbol": "NormalizeRecord",
+   "expect_members": [
+    "ClampInt",
+    "ComputeHash"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t027",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Who calls ComputeHash? List the callers.",
+  "ground_truth": "ComputeHash is called by NormalizeRecord and by every ProcessSvcNN.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "ComputeHash",
+   "expect_members": [
+    "NormalizeRecord",
+    "ProcessSvc00"
+   ],
+   "min_count": 8
+  }
+ },
+ {
+  "id": "t028",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "What does RunPipeline call directly?",
+  "ground_truth": "RunPipeline calls every ProcessSvcNN.",
+  "check": {
+   "kind": "callees",
+   "symbol": "RunPipeline",
+   "expect_members": [
+    "ProcessSvc00"
+   ],
+   "min_count": 8
+  }
+ },
+ {
+  "id": "t029",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Find the definition of ClampInt and return the clamping code.",
+  "ground_truth": "ClampInt is defined in core/clamp.go.",
+  "check": {
+   "kind": "search_code",
+   "query": "ClampInt",
+   "expect_file": "clamp.go"
+  }
+ },
+ {
+  "id": "t030",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "research",
+  "q": "How does NormalizeRecord build a Record? Summarise the leaves it calls.",
+  "ground_truth": "NormalizeRecord (core/normalize.go) sets Score via ClampInt and Hash via ComputeHash.",
+  "check": {
+   "kind": "callees",
+   "symbol": "NormalizeRecord",
+   "expect_members": [
+    "ClampInt",
+    "ComputeHash"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t031",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "research",
+  "q": "What would break if ComputeHash changed? List the impacted functions.",
+  "ground_truth": "NormalizeRecord and every ProcessSvcNN call ComputeHash.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "ComputeHash",
+   "expect_members": [
+    "NormalizeRecord"
+   ],
+   "min_count": 8
+  }
+ },
+ {
+  "id": "t032",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "research",
+  "q": "Trace the call path from RunPipeline to ComputeHash.",
+  "ground_truth": "RunPipeline -> ProcessSvcNN -> NormalizeRecord -> ComputeHash.",
+  "check": {
+   "kind": "path",
+   "frm": "RunPipeline",
+   "to": "ComputeHash"
+  }
+ },
+ {
+  "id": "t033",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "research",
+  "q": "Which file owns record normalisation and what is its entry point?",
+  "ground_truth": "core/normalize.go owns it; NormalizeRecord is the entry point.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "NormalizeRecord",
+   "expect_members": [
+    "ProcessSvc00"
+   ],
+   "min_count": 8
+  }
+ },
+ {
+  "id": "t034",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls computeChecksum? List the calling methods.",
+  "ground_truth": "computeChecksum is called by normalizeRecord and by every processSvcNN.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "computeChecksum",
+   "expect_members": [
+    "normalizeRecord",
+    "processSvc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t035",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "What are the direct callees of normalizeRecord?",
+  "ground_truth": "normalizeRecord calls clampValue (Clamp.java) and computeChecksum (Checksum.java).",
+  "check": {
+   "kind": "callees",
+   "symbol": "normalizeRecord",
+   "expect_members": [
+    "clampValue",
+    "computeChecksum"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t036",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls normalizeRecord? Name the calling methods.",
+  "ground_truth": "Every processSvcNN calls normalizeRecord (76 callers).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "normalizeRecord",
+   "expect_members": [
+    "processSvc00",
+    "processSvc01"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t037",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "What does runPipeline call directly?",
+  "ground_truth": "runPipeline calls every processSvcNN.",
+  "check": {
+   "kind": "callees",
+   "symbol": "runPipeline",
+   "expect_members": [
+    "processSvc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t038",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Find the definition of clampValue and return the clamping code.",
+  "ground_truth": "clampValue is defined in src/main/java/corpus/core/Clamp.java.",
+  "check": {
+   "kind": "search_code",
+   "query": "clampValue",
+   "expect_file": "Clamp.java"
+  }
+ },
+ {
+  "id": "t039",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "research",
+  "q": "How does the Normalizer class build a record? Summarise the core helpers it calls.",
+  "ground_truth": "Normalizer.normalizeRecord clamps via Clamp.clampValue and hashes via Checksum.computeChecksum.",
+  "check": {
+   "kind": "callees",
+   "symbol": "normalizeRecord",
+   "expect_members": [
+    "clampValue",
+    "computeChecksum"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t040",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "research",
+  "q": "What would break if computeChecksum changed? List impacted methods.",
+  "ground_truth": "normalizeRecord and every processSvcNN call computeChecksum.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "computeChecksum",
+   "expect_members": [
+    "normalizeRecord"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t041",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "research",
+  "q": "Trace the call path from runPipeline to computeChecksum.",
+  "ground_truth": "runPipeline -> processSvcNN -> normalizeRecord -> computeChecksum.",
+  "check": {
+   "kind": "path",
+   "frm": "runPipeline",
+   "to": "computeChecksum"
+  }
+ },
+ {
+  "id": "t042",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "research",
+  "q": "Trace from runPipeline to clampValue.",
+  "ground_truth": "runPipeline -> processSvcNN -> normalizeRecord -> clampValue.",
+  "check": {
+   "kind": "path",
+   "frm": "runPipeline",
+   "to": "clampValue"
+  }
+ },
+ {
+  "id": "t043",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "research",
+  "q": "Which class owns normalisation and what is its entry point method?",
+  "ground_truth": "corpus.core.Normalizer owns it; normalizeRecord is the entry point called by every service.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "normalizeRecord",
+   "expect_members": [
+    "processSvc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t044",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Who calls processSvc00? Name the caller.",
+  "ground_truth": "runPipeline (src/pipeline.js) calls processSvc00.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc00",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t045",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "What does runPipeline call directly?",
+  "ground_truth": "runPipeline calls collect (same file) and every processSvcNN service.",
+  "check": {
+   "kind": "callees",
+   "symbol": "runPipeline",
+   "expect_members": [
+    "collect",
+    "processSvc00"
+   ],
+   "min_count": 5
+  }
+ },
+ {
+  "id": "t046",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Who calls collect?",
+  "ground_truth": "runPipeline calls collect (src/pipeline.js).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "collect",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t047",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "What does normalizeRecord call in its own file?",
+  "ground_truth": "normalizeRecord calls buildRecord (src/core/normalize.js).",
+  "check": {
+   "kind": "callees",
+   "symbol": "normalizeRecord",
+   "expect_members": [
+    "buildRecord"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t048",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Find where normalizeRecord is referenced in service files. Return code.",
+  "ground_truth": "Service files require and call normalizeRecord; e.g. src/service/svc00.js.",
+  "check": {
+   "kind": "search_code",
+   "query": "normalizeRecord rec",
+   "expect_file": "svc00.js"
+  }
+ },
+ {
+  "id": "t049",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Find the definition of clampScore.",
+  "ground_truth": "clampScore is defined in src/core/clamp.js.",
+  "check": {
+   "kind": "search_symbols",
+   "query": "clampScore",
+   "expect_file": "clamp.js"
+  }
+ },
+ {
+  "id": "t050",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "research",
+  "q": "Which functions does runPipeline drive, and how does it assemble its result? Summarise.",
+  "ground_truth": "runPipeline calls every processSvcNN to build rows, then calls collect to filter them (src/pipeline.js).",
+  "check": {
+   "kind": "callees",
+   "symbol": "runPipeline",
+   "expect_members": [
+    "collect",
+    "processSvc00"
+   ],
+   "min_count": 5
+  }
+ },
+ {
+  "id": "t051",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "research",
+  "q": "What would break inside the pipeline if collect changed? Identify its caller.",
+  "ground_truth": "runPipeline depends on collect; it is the only in-file caller.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "collect",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t052",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "research",
+  "q": "Which file owns the service-dispatch pipeline and what is its entry point?",
+  "ground_truth": "src/pipeline.js owns it; runPipeline is the entry point that drives every processSvcNN.",
+  "check": {
+   "kind": "callees",
+   "symbol": "runPipeline",
+   "expect_members": [
+    "processSvc00"
+   ],
+   "min_count": 5
+  }
+ },
+ {
+  "id": "t053",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "Who calls validateAmount in the validators file?",
+  "ground_truth": "validateRecord (src/core/validate.ts) calls validateAmount.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "validateAmount",
+   "expect_members": [
+    "validateRecord"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t054",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "What does validateRecord call?",
+  "ground_truth": "validateRecord calls validateAmount and validateCode (src/core/validate.ts).",
+  "check": {
+   "kind": "callees",
+   "symbol": "validateRecord",
+   "expect_members": [
+    "validateAmount",
+    "validateCode"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t055",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "What does toMinorUnits call in its own file?",
+  "ground_truth": "toMinorUnits calls roundMinor (src/core/money.ts).",
+  "check": {
+   "kind": "callees",
+   "symbol": "toMinorUnits",
+   "expect_members": [
+    "roundMinor"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t056",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "What does postEntry call in its own file?",
+  "ground_truth": "postEntry calls makeEntry (src/core/ledger.ts).",
+  "check": {
+   "kind": "callees",
+   "symbol": "postEntry",
+   "expect_members": [
+    "makeEntry"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t057",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "Find the definition of processSvc100. Return its code.",
+  "ground_truth": "processSvc100 is defined in src/service/svc100.ts.",
+  "check": {
+   "kind": "search_code",
+   "query": "processSvc100",
+   "expect_file": "svc100.ts"
+  }
+ },
+ {
+  "id": "t058",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "Where is the major-to-minor unit rounding implemented? Return the code.",
+  "ground_truth": "roundMinor in src/core/money.ts (Math.round(amount * 100)).",
+  "check": {
+   "kind": "search_code",
+   "query": "Math.round amount",
+   "expect_file": "money.ts"
+  }
+ },
+ {
+  "id": "t059",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "research",
+  "q": "How does the validation subsystem combine its checks? Summarise the functions involved.",
+  "ground_truth": "validateRecord (src/core/validate.ts) ANDs validateAmount and validateCode.",
+  "check": {
+   "kind": "callees",
+   "symbol": "validateRecord",
+   "expect_members": [
+    "validateAmount",
+    "validateCode"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t060",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "research",
+  "q": "What would break if roundMinor changed? Identify its in-file caller.",
+  "ground_truth": "toMinorUnits depends on roundMinor (src/core/money.ts).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "roundMinor",
+   "expect_members": [
+    "toMinorUnits"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t061",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "research",
+  "q": "Which file owns ledger entry construction and what is its entry point?",
+  "ground_truth": "src/core/ledger.ts owns it; postEntry is the entry point (it calls makeEntry and toMinorUnits).",
+  "check": {
+   "kind": "callees",
+   "symbol": "postEntry",
+   "expect_members": [
+    "makeEntry"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t062",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "research",
+  "q": "Trace, within ledger.ts and money.ts, how postEntry reaches the rounding helper. Give the in-file call chain.",
+  "ground_truth": "postEntry -> toMinorUnits (money.ts) -> roundMinor; postEntry also calls makeEntry.",
+  "check": {
+   "kind": "callees",
+   "symbol": "toMinorUnits",
+   "expect_members": [
+    "roundMinor"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t063",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc03? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc03.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc03",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t064",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc09? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc09.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc09",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t065",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc17? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc17.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc17",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t066",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc23? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc23.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc23",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t067",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc41? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc41.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc41",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t068",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc58? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc58.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc58",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t069",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Who calls process_svc70? Name the caller and its file.",
+  "ground_truth": "run_pipeline (src/app/pipeline.rs) calls process_svc70.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc70",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t070",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls process_svc005? Name the caller.",
+  "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc005.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc005",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t071",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls process_svc042? Name the caller.",
+  "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc042.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc042",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t072",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls process_svc113? Name the caller.",
+  "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc113.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc113",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t073",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls process_svc200? Name the caller.",
+  "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc200.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc200",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t074",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls process_svc314? Name the caller.",
+  "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc314.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc314",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t075",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Who calls process_svc400? Name the caller.",
+  "ground_truth": "run_pipeline (app/pipeline.py) calls process_svc400.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "process_svc400",
+   "expect_members": [
+    "run_pipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t076",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls processSvc02? Name the calling method.",
+  "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc02.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc02",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t077",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls processSvc19? Name the calling method.",
+  "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc19.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc19",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t078",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls processSvc33? Name the calling method.",
+  "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc33.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc33",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t079",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls processSvc47? Name the calling method.",
+  "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc47.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc47",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t080",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls processSvc60? Name the calling method.",
+  "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc60.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc60",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t081",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Who calls processSvc75? Name the calling method.",
+  "ground_truth": "runPipeline (corpus.app.Pipeline) calls processSvc75.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc75",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t082",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Who calls ProcessSvc01?",
+  "ground_truth": "RunPipeline (app/pipeline.go) calls ProcessSvc01.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "ProcessSvc01",
+   "expect_members": [
+    "RunPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t083",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Who calls ProcessSvc04?",
+  "ground_truth": "RunPipeline (app/pipeline.go) calls ProcessSvc04.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "ProcessSvc04",
+   "expect_members": [
+    "RunPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t084",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Who calls ProcessSvc07?",
+  "ground_truth": "RunPipeline (app/pipeline.go) calls ProcessSvc07.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "ProcessSvc07",
+   "expect_members": [
+    "RunPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t085",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Who calls processSvc01?",
+  "ground_truth": "runPipeline (src/pipeline.js) calls processSvc01.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc01",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t086",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Who calls processSvc03?",
+  "ground_truth": "runPipeline (src/pipeline.js) calls processSvc03.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc03",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t087",
+  "repo": "js_small",
+  "lang": "javascript",
+  "type": "locate",
+  "q": "Who calls processSvc06?",
+  "ground_truth": "runPipeline (src/pipeline.js) calls processSvc06.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "processSvc06",
+   "expect_members": [
+    "runPipeline"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t088",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Find every place the Record type is referenced. List the functions.",
+  "ground_truth": "Record (src/core/normalize.rs) is referenced in normalize_record and in every process_svcNN service signature.",
+  "check": {
+   "kind": "find_usages",
+   "symbol": "Record",
+   "expect_members": [
+    "normalize_record",
+    "process_svc00"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t089",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "Which functions depend on the Record type, and what does that imply for changing its fields?",
+  "ground_truth": "normalize_record produces Record and every process_svcNN returns it; changing fields impacts all of them.",
+  "check": {
+   "kind": "find_usages",
+   "symbol": "Record",
+   "expect_members": [
+    "normalize_record"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t090",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "locate",
+  "q": "Show the code that merges two checksums.",
+  "ground_truth": "merge_checksums in src/core/checksum.rs.",
+  "check": {
+   "kind": "search_code",
+   "query": "merge_checksums",
+   "expect_file": "checksum.rs"
+  }
+ },
+ {
+  "id": "t091",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "locate",
+  "q": "Show the code that posts a ledger entry.",
+  "ground_truth": "post_entry in app/core/ledger.py.",
+  "check": {
+   "kind": "search_code",
+   "query": "post_entry",
+   "expect_file": "ledger.py"
+  }
+ },
+ {
+  "id": "t092",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "locate",
+  "q": "Show the FNV checksum fold loop.",
+  "ground_truth": "Checksum.computeChecksum in Checksum.java.",
+  "check": {
+   "kind": "search_code",
+   "query": "Fold byte array checksum",
+   "expect_file": "Checksum.java"
+  }
+ },
+ {
+  "id": "t093",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "locate",
+  "q": "Show the FNV hash fold loop.",
+  "ground_truth": "ComputeHash in core/hash.go.",
+  "check": {
+   "kind": "search_code",
+   "query": "ComputeHash",
+   "expect_file": "hash.go"
+  }
+ },
+ {
+  "id": "t094",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "locate",
+  "q": "Show the ledger entry construction helper.",
+  "ground_truth": "makeEntry in src/core/ledger.ts.",
+  "check": {
+   "kind": "search_code",
+   "query": "makeEntry account minor",
+   "expect_file": "ledger.ts"
+  }
+ },
+ {
+  "id": "t095",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "Summarise the layering of the python app: which layer calls which, from the pipeline down to the validators.",
+  "ground_truth": "pipeline -> service (process_svcNNN) -> ledger (post_entry) -> money (to_minor_units) -> validate (validate_amount/validate_currency).",
+  "check": {
+   "kind": "path",
+   "frm": "run_pipeline",
+   "to": "validate_currency"
+  }
+ },
+ {
+  "id": "t096",
+  "repo": "java_medium",
+  "lang": "java",
+  "type": "research",
+  "q": "Which core class is the single most depended-on leaf (called from the most sites), and what is its method?",
+  "ground_truth": "corpus.core.Checksum.computeChecksum is the most-called leaf (normalizeRecord plus every processSvcNN).",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "computeChecksum",
+   "expect_members": [
+    "normalizeRecord"
+   ],
+   "min_count": 70
+  }
+ },
+ {
+  "id": "t097",
+  "repo": "go_small",
+  "lang": "go",
+  "type": "research",
+  "q": "If the Record struct grew a field, which functions construct or return it?",
+  "ground_truth": "NormalizeRecord constructs Record; every ProcessSvcNN returns it.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "NormalizeRecord",
+   "expect_members": [
+    "ProcessSvc00"
+   ],
+   "min_count": 8
+  }
+ },
+ {
+  "id": "t098",
+  "repo": "ts_large",
+  "lang": "typescript",
+  "type": "research",
+  "q": "How does money.ts guard against invalid input before rounding?",
+  "ground_truth": "toMinorUnits calls validateRecord (which ANDs validateAmount/validateCode) before calling roundMinor.",
+  "check": {
+   "kind": "callees",
+   "symbol": "toMinorUnits",
+   "expect_members": [
+    "roundMinor"
+   ],
+   "min_count": 1
+  }
+ },
+ {
+  "id": "t099",
+  "repo": "rust_medium",
+  "lang": "rust",
+  "type": "research",
+  "q": "Name the single function every service routes through before touching the core leaves, and prove it by its callees.",
+  "ground_truth": "normalize_record is the shared junction; its callees are clamp_value and compute_checksum.",
+  "check": {
+   "kind": "callees",
+   "symbol": "normalize_record",
+   "expect_members": [
+    "clamp_value",
+    "compute_checksum"
+   ],
+   "min_count": 2
+  }
+ },
+ {
+  "id": "t100",
+  "repo": "python_large",
+  "lang": "python",
+  "type": "research",
+  "q": "Which validator is reused both by the money layer and directly by every service, and what does that say about its blast radius?",
+  "ground_truth": "validate_currency is called by to_minor_units and by every process_svcNNN, so its blast radius spans the whole service layer.",
+  "check": {
+   "kind": "who_calls",
+   "symbol": "validate_currency",
+   "expect_members": [
+    "to_minor_units",
+    "process_svc000"
+   ],
+   "min_count": 400
+  }
+ }
+]

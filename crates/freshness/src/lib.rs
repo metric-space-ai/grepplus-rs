@@ -12,7 +12,7 @@
 //!
 //! This deliberately does NOT implement a long-running watcher
 //! (`greppy index --watch`); the on-demand path is sufficient for the
-//! drop-in `grep` use case.
+//! byte-exact `grep` passthrough use case.
 
 #![deny(rust_2018_idioms)]
 

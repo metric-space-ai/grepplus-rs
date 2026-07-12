@@ -1,13 +1,39 @@
 # Third-Party Notices
 
-`greppy` is original Rust source. It depends on third-party Rust crates
-under their own licenses; those licenses are recorded in each crate's
-`Cargo.toml` and resolved by `cargo metadata`. This file documents the one
-non-crate notice obligation: vendored GPU kernels.
+Greppy source is MIT-licensed. Embedded model weights, Rust dependencies, and
+vendored accelerator kernels retain their own licenses and notices. Release
+archives must include this file and the complete `licenses/` directory.
+
+## Embedded model assets
+
+### EmbeddingGemma-300M Q4_K
+
+- Purpose: code-query and source-span embeddings.
+- Upstream model: `google/embeddinggemma-300m`.
+- Bundled files: `embeddinggemma-300M-Q4_K.gguf`, `tokenizer.json`.
+- Terms: Gemma Terms of Use plus the incorporated Gemma Prohibited Use Policy.
+- Notice: `licenses/EMBEDDINGGEMMA-NOTICE.txt`.
+
+The Gemma terms require a copy of the agreement and a specific Notice for
+redistribution. They are not replaced by Greppy's MIT license. Public release
+remains blocked until the bundled quantization's provenance and redistribution
+review are signed off and the current official terms are compared with the
+packaged copies.
+
+### Qwen3.5-0.8B MTP Q4_K_M
+
+- Purpose: short function-purpose navigation hints.
+- Base model/tokenizer: `Qwen/Qwen3.5-0.8B`.
+- Quantized MTP source: `unsloth/Qwen3.5-0.8B-MTP-GGUF`.
+- Bundled files: `Qwen3.5-0.8B-MTP-Q4_K_M.gguf`, `tokenizer.json`.
+- License: Apache License 2.0; see `licenses/QWEN3.5-APACHE-2.0.txt`.
+
+Model outputs are non-authoritative navigation hints. Source spans, signatures,
+and graph evidence remain deterministic even when summary inference fails.
 
 ## ggml (vendored GPU kernels)
 
-The embedding engine (`crates/embed-native`) is a from-scratch Rust
+The embedding engine (`crates/embed-native`) is a native Rust
 EmbeddingGemma implementation. Its CPU path is 100% Rust. For the **opt-in**
 GPU backends (built only with `--features cuda` or `--features metal`) it
 vendors a small slice of quantized-matmul and quantization kernels from
@@ -21,9 +47,9 @@ The ggml project is **MIT-licensed**:
 
 The vendored sources live under `crates/embed-native/vendor/`. The MIT license
 text is preserved there at `crates/embed-native/vendor/LICENSE-ggml`, and
-per-file provenance (which files are upstream ggml vs. greppy-authored
-wrappers) is documented in `crates/embed-native/vendor/README.md`. The default
-build (`default = []`) ships no ggml code.
+per-file provenance (upstream-derived versus Greppy-authored wrappers) is
+documented in `crates/embed-native/vendor/README.md`. Every build embeds both
+models; the `metal` and `cuda` features control only accelerator kernels.
 
 ## Qwen3.5 native summarizer kernels
 
@@ -32,3 +58,10 @@ Its opt-in CUDA and Metal backends reuse the same MIT-compatible vendored ggml
 kernel slice documented above under `crates/embed-native/vendor/`; no separate
 Qwen3.5 runtime dependency on llama.cpp, libggml/libllama, Candle, ONNX,
 Python, or an external server is introduced.
+
+## Rust dependencies and release SBOM
+
+Rust crate licenses are declared by their packages and resolved in
+`Cargo.lock`. The release workflow must generate an SPDX SBOM from the exact
+packaged source and attach it to the release. A tag is not publishable when the
+SBOM, model notices, checksums, signatures, or build provenance are missing.

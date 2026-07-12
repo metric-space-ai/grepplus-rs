@@ -11,7 +11,7 @@
 # 5. Compare the outcome against the expected class.
 #
 # The probe uses the same `greppy_freshness::check` code that
-# `greppy-grep` uses in its freshness gate, so the outcomes here
+# the Greppy passthrough uses in its freshness gate, so the outcomes here
 # are the ones agents would actually see at runtime.
 
 set -uo pipefail

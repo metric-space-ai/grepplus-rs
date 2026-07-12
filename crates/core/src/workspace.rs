@@ -1,4 +1,4 @@
-//! Workspace / store locator shared across the drop-in wrapper and the
+//! Workspace / store locator shared across the passthrough library and the
 //! CLI dispatcher.
 //!
 //! Keeps `.greppy/graph.db` from polluting `grep -R` in the same
@@ -132,7 +132,7 @@ pub fn cleanup_stale_stores(cache_root: &Path, ttl_secs: u64, keep: &Path) -> us
         .unwrap_or(0)
 }
 
-/// Resolve the canonical workspace root shared by every CLI and drop-in path.
+/// Resolve the canonical workspace root shared by every CLI and passthrough path.
 /// `.git` may be either a directory or a file (linked worktree/submodule).
 pub fn resolve_workspace_root(start: &Path) -> PathBuf {
     let canonical = start

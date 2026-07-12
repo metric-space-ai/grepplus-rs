@@ -1,7 +1,7 @@
-//! Integration tests for the drop-in safety fixes from
+//! Integration tests for the passthrough safety fixes from
 //! `reviews/independent-production-readiness-review-2026-06-29.md`.
 //!
-//! Each test exercises one finding with the actual `greppy-grep`
+//! Each test exercises one finding with the shipped `greppy`
 //! binary, not just the unit-tested library surface.
 //!
 //! Coverage:
@@ -30,7 +30,7 @@ use std::sync::Mutex;
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn binary_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_greppy-grep"))
+    PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
 }
 
 fn real_grep_path() -> PathBuf {
@@ -53,7 +53,7 @@ fn unique_tempdir(tag: &str) -> PathBuf {
     p
 }
 
-/// Run `greppy-grep` with `args` and an explicit isolated
+/// Run `greppy` with `args` and an explicit isolated
 /// `GREPPY_STORE_DIR`. The wrapper runs with `cwd` set to `cwd`
 /// (its freshness gate uses cwd-relative paths). Stdin, stdout,
 /// stderr are piped.
@@ -65,14 +65,12 @@ fn run_isolated(args: &[&str], cwd: &Path, store_dir: &Path) -> std::process::Ou
     cmd.stdin(Stdio::piped());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    cmd.output().expect("spawn greppy-grep")
+    cmd.output().expect("spawn greppy")
 }
 
 /// Build a minimal repo at `tmp`, write `src/lib.rs = source`,
 /// open a store at the platform-locator'd path under `store_dir`, and
-/// run the indexer directly (avoids spawning the separate `greppy`
-/// CLI binary, whose `CARGO_BIN_EXE_<name>` env var this crate does
-/// not export).
+/// run the indexer directly so the test can control the initial store state.
 fn build_indexed_repo(tmp: &Path, source: &str, store_dir: &Path) {
     let src = tmp.join("src");
     std::fs::create_dir_all(&src).unwrap();
@@ -117,7 +115,7 @@ fn index_existing_repo(root: &Path, store_dir: &Path) {
         .unwrap_or("default");
     greppy_indexer::index(&mut store, root, project).unwrap();
     drop(store);
-    // The greppy-grep sub-process tests below re-set
+    // The greppy sub-process tests below re-set
     // GREPPY_STORE_DIR explicitly; the env override here is process-
     // global so we reset it to leave the test in a clean state.
     env::remove_var("GREPPY_STORE_DIR");
@@ -423,7 +421,7 @@ fn discover_grep_refuses_shim_under_home_shim_dir() {
     env::set_var("GREPPY_REAL_GREP", &fake_shim);
 
     // discover_grep is not `pub`-callable cross-process; instead, we
-    // exercise it by spawning greppy-grep and asserting it returns
+    // exercise it by spawning greppy and asserting it returns
     // rc=3 (real-grep-missing exit code from main.rs).
     // SAFETY: env::set_var/remove_var are unsafe since Rust 1.85; the
     // integration test build is on a stable Rust so we leave the

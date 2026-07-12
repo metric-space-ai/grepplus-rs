@@ -1,7 +1,7 @@
 # Battle-proof validation harness (Track C)
 
 A **black-box** production-invariant suite. It drives the already-built
-`greppy` / `greppy-grep` binaries and asserts the contracts that
+the shipped `greppy` binary and asserts the contracts that
 matter in production. It does **not** touch any crate source or Cargo
 files — it lives entirely under `bench/battle/`.
 
@@ -63,7 +63,7 @@ BATTLE_SCALE_FILES=2000 BATTLE_SCALE_BUDGET_S=1800 bash bench/battle/scale.sh
    the documented lock contract (losers exit 75).
 4. **grep_fuzz.sh** — 42 patterns/flags/paths (malformed UTF-8, huge
    lines, binary files, missing paths, regex metacharacters) through
-   `greppy-grep`; asserts stdout/stderr/exit are **byte-identical** to
+   `greppy`; asserts stdout/stderr/exit are **byte-identical** to
    `/usr/bin/grep` and greppy never crashes.
 5. **malformed.sh** — index truncated / invalid-UTF8 / deeply-nested Rust
    files; asserts no panic, graceful exit, integrity ok, and that a
@@ -83,8 +83,8 @@ BATTLE_SCALE_FILES=2000 BATTLE_SCALE_BUDGET_S=1800 bash bench/battle/scale.sh
    graph.db exactly; `who-calls`/`callees`/`path` resolve the right
    symbol in every language; `find-usages` lands on a `TYPE_REF`-d Rust
    struct; `search-symbols`/`search-code` find known symbols/content
-   across all six languages; the drop-in grep contract (`greppy -R` and
-   `greppy-grep` vs `/usr/bin/grep`) holds byte-exact in its STRICT
+   across all six languages; the grep passthrough contract (`greppy -R` and
+   `greppy` vs `/usr/bin/grep`) holds byte-exact in its STRICT
    regime while the recursive **semantic augmentation** is asserted
    present-and-additive on a fresh graph; determinism (index twice →
    identical node/edge counts and sets); and an unsupported `.txt` file is
@@ -92,7 +92,7 @@ BATTLE_SCALE_FILES=2000 BATTLE_SCALE_BUDGET_S=1800 bash bench/battle/scale.sh
 8. **soak.sh** *(opt-in, slow)* — drive `BATTLE_SOAK_ITERS` rounds of an
    `index → edit → reindex → search-code → grep` loop against a mutating
    corpus. Asserts, **across all iterations**: no panic / signal crash,
-   `integrity_check` stays `ok`, the drop-in grep stays **byte-exact** vs
+   `integrity_check` stays `ok`, the grep passthrough stays **byte-exact** vs
    `/usr/bin/grep`, sidecar temp files stay bounded under a short TTL and
    are actually reclaimed by the startup cleanup, and resident-set size
    does not grow unbounded (early vs late RSS sample).
@@ -184,7 +184,7 @@ the underlying behaviour is fixed.
   pipeline is deterministic.
 - **Grep-compat** (42/42): every probed pattern/flag/adversarial input is
   byte-identical to system grep across stdout, stderr, and exit code. No
-  panics. The drop-in contract holds.
+  panics. The passthrough contract holds.
 - **Malformed input** (6/6): truncated / invalid-UTF8 / deeply-nested Rust
   files are handled without panic or stack overflow; well-formed siblings
   still index; DB integrity holds.
@@ -193,7 +193,7 @@ the underlying behaviour is fixed.
 - **Concurrency** (8/8): one winner, losers exit the documented 75, DB
   integrity ok after the race (Finding #2 resolved).
 - **Soak** (8/8 at 100 iters, opt-in): no panic, integrity stays ok,
-  drop-in grep stays byte-exact, sidecars bounded (peak ≤ 4) and TTL
+  grep passthrough stays byte-exact, sidecars bounded (peak <= 4) and TTL
   cleanup reclaims expired files, RSS flat (early 1504 KB / late 1536 KB).
 - **Navigation** (14/14): `who-calls` / `find-usages` / `trace` resolve a
   known caller/callee and land on the struct (not the same-named impl).
@@ -222,7 +222,7 @@ green — these are characteristics the suite now pins, not failures):
   resolved cross-file `IMPORTS` edge is produced. Asserted both ways (node
   present, resolved-edge count == 0) so a future change either direction
   is noticed. Owner: `crates/resolver` / `crates/parser`, not this track.
-- **Both `greppy` and `greppy-grep` preserve ordinary grep behavior.** The
+- **`greppy` preserves ordinary grep behavior.** The
   suite compares stdout, stderr, and exit status against system grep for hit,
   miss, recursive, count, and single-file invocations while a fresh index is
   present. Semantic context is available only from explicit greppy commands.

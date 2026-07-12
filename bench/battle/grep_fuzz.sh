@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# GREP-COMPAT FUZZ battle — the drop-in contract must NEVER break.
+# GREP-COMPAT FUZZ battle - the byte-exact passthrough contract must NEVER break.
 #
 # For a battery of patterns / flags / paths (including malformed UTF-8,
 # huge lines, binary files, missing paths, regex metacharacters), assert
-# that `greppy-grep` (the `greppy -R ...` drop-in path) produces
+# that the `greppy -R ...` passthrough path produces
 # stdout, stderr, and exit code BYTE-IDENTICAL to the system grep, and
 # that greppy never panics or crashes with a signal.
 #
@@ -13,7 +13,7 @@
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 NAME="grep_fuzz"
-require_bins "$GREPPY_GREP_BIN" || { emit_summary "$NAME"; exit 1; }
+require_bins "$GREPPY_BIN" || { emit_summary "$NAME"; exit 1; }
 
 if [[ ! -x "$REAL_GREP" ]]; then
     fail "real grep oracle present ($REAL_GREP)"
@@ -56,7 +56,7 @@ run_case() {
     local desc="$1"; shift
     local out_g out_r rc_g rc_r
 
-    out_g="$("$GREPPY_GREP_BIN" "$@" 2>"$WORK/.eg")"; rc_g=$?
+    out_g="$("$GREPPY_BIN" "$@" 2>"$WORK/.eg")"; rc_g=$?
     local err_g; err_g="$(cat "$WORK/.eg")"
     out_r="$("$REAL_GREP" "$@" 2>"$WORK/.er")"; rc_r=$?
     local err_r; err_r="$(cat "$WORK/.er")"

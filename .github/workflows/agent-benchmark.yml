@@ -1,0 +1,97 @@
+name: agent benchmark release gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      parallel:
+        description: Concurrent agent tasks
+        required: true
+        default: "5"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  benchmark:
+    name: pinned Greppy vs explorer
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Verify task-bank shape
+        run: |
+          test "$(jq length bench/agent_efficiency/tasks_v2.json)" -eq 115
+
+      - name: Build candidate binary with Metal
+        run: cargo build --release --bin greppy --features metal
+
+      - name: Materialize benchmark repositories
+        run: |
+          bash bench/agent_efficiency/gen_corpus.sh
+          python3 bench/agent_efficiency/real_corpus.py setup \
+            --repos serde flask gson zod tokio django
+
+      - name: Verify pinned task and repository contract
+        run: python3 bench/agent_efficiency/verify_real_tasks.py
+
+      - name: Run pre-registered acceptance gate
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
+          RUN_DIR: ${{ runner.temp }}/greppy-agent-benchmark
+        run: |
+          test -n "$MINIMAX_API_KEY"
+          python3 bench/agent_efficiency/parallel_acceptance_run.py \
+            --skip-build \
+            --skip-verify \
+            --tasks tasks_v2.json \
+            --agents grep,greppy,explorer \
+            --parallel '${{ inputs.parallel }}' \
+            --output-dir "$RUN_DIR"
+
+      - name: Package publishable evidence without raw traces
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-agent-benchmark
+        run: |
+          mkdir -p publish
+          for file in \
+            RUN_MANIFEST.json \
+            results.json \
+            results.mechanical.json \
+            aggregate.txt \
+            FORENSICS_explorer_VS_greppy.md \
+            release-gate.json \
+            SUMMARY.md
+          do
+            test -s "$RUN_DIR/$file"
+            cp "$RUN_DIR/$file" publish/
+          done
+          test "$(jq -r .passed publish/release-gate.json)" = true
+          test "$(jq -r .greppy.git_commit publish/RUN_MANIFEST.json)" = "$GITHUB_SHA"
+          test "$(jq -r .raw_traces_published publish/RUN_MANIFEST.json)" = false
+          tar -C publish -czf greppy-agent-benchmark.tar.gz .
+          shasum -a 256 greppy-agent-benchmark.tar.gz > greppy-agent-benchmark.tar.gz.sha256
+
+      - name: Attest benchmark evidence
+        uses: actions/attest@v4
+        with:
+          subject-path: greppy-agent-benchmark.tar.gz
+
+      - name: Upload benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: greppy-agent-benchmark-${{ github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            greppy-agent-benchmark.tar.gz
+            greppy-agent-benchmark.tar.gz.sha256

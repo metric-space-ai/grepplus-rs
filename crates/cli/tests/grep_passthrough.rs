@@ -1,6 +1,6 @@
 //! Integration tests for the grep passthrough.
 //!
-//! These tests run `greppy-grep` as a subprocess and compare its
+//! These tests run the shipped `greppy` binary as a subprocess and compare its
 //! stdout/stderr/exit-code byte-for-byte against the same command run
 //! with the real `grep` binary on `PATH` (or `GREPPY_REAL_GREP`).
 
@@ -9,8 +9,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 fn binary_path() -> PathBuf {
-    // CARGO_BIN_EXE_greppy-grep is set by cargo for integration tests.
-    PathBuf::from(env!("CARGO_BIN_EXE_greppy-grep"))
+    PathBuf::from(env!("CARGO_BIN_EXE_greppy"))
 }
 
 fn real_grep_path() -> PathBuf {
@@ -238,7 +237,7 @@ fn passthrough_r2_common_flag_matrix_matches_real_grep() {
 
 // The wrapper previously collected argv via
 // `std::env::args()`, which UNWRAPS and PANICS (rc 101) on a non-UTF-8
-// argument — `greppy-grep $'\xff' f.txt </dev/null` died with rc 101
+// argument — `greppy $'\xff' f.txt </dev/null` died with rc 101
 // while real grep returns 1/2 cleanly. The fix routes argv through
 // `args_os` and forwards the original `OsString`s to real grep verbatim.
 // Here we drive both the wrapper and real grep with a non-UTF-8 PATTERN
@@ -262,7 +261,7 @@ fn passthrough_non_utf8_pattern_and_path_match_real_grep() {
     let mut theirs = Command::new(real_grep_path());
     theirs.arg(&pattern).arg(&path).stdin(Stdio::null());
 
-    let o = ours.output().expect("spawn greppy-grep");
+    let o = ours.output().expect("spawn greppy");
     let t = theirs.output().expect("spawn real grep");
 
     assert_ne!(

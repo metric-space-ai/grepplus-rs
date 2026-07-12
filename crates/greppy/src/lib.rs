@@ -1,11 +1,11 @@
-//! `greppy-grep` — byte-exact real-`grep` passthrough.
+//! Internal byte-exact real-`grep` passthrough used by the `greppy` binary.
 //!
 //! Structured and semantic code navigation lives behind explicit `greppy`
 //! subcommands. Ordinary grep invocations never synthesize output, create
 //! sidecars, inspect the code index, or alter grep's exit status.
 //!
-//! The binary is invoked as `greppy-grep` (or via a `greppy grep`
-//! subcommand in the unified `greppy` CLI in `crates/cli`).
+//! The unified CLI owns the only shipped executable and delegates ordinary
+//! invocations through this library.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -113,7 +113,7 @@ pub fn run_grep(real_grep: &std::path::Path, argv: &[String]) -> Result<i32> {
 /// Run real grep with the given `OsString` argv, forwarding argv
 /// byte-for-byte.
 ///
-/// The drop-in wrapper must NEVER panic on argv it
+/// The passthrough must NEVER panic on argv it
 /// cannot UTF-8-decode. Real `grep` accepts arbitrary bytes for the
 /// pattern and for path arguments (e.g. a filename containing `0xff`),
 /// and returns its own exit code; the wrapper must do the same. We
@@ -233,7 +233,7 @@ mod tests {
         // without ever panicking on the undecodable argv.
         let pattern = OsString::from_vec(vec![0xff]);
         let path = OsString::from_vec(vec![b'f', 0xff, b'.', b't', b'x', b't']);
-        let argv = vec![OsString::from("greppy-grep"), pattern, path];
+        let argv = vec![OsString::from("greppy"), pattern, path];
 
         let rc = run_grep_os(&real, &argv).expect("must not panic on non-UTF-8 argv");
         // grep returns 2 on a file-open error; either way it is grep's own

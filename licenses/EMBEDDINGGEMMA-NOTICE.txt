@@ -1,0 +1,10 @@
+Gemma is provided under and subject to the Gemma Terms of Use found at ai.google.dev/gemma/terms
+
+Greppy embeds a quantized derivative of google/embeddinggemma-300m for local
+code retrieval. The model is subject to:
+
+- GEMMA-TERMS.html
+- GEMMA-PROHIBITED-USE-POLICY.html
+
+Source model: https://huggingface.co/google/embeddinggemma-300m
+Official terms: https://ai.google.dev/gemma/terms

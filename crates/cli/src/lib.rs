@@ -1,7 +1,7 @@
 //! `greppy` CLI — the unified subcommand dispatcher.
 //!
 //! Subcommand surface:
-//! - `grep`         — drop-in wrapper, delegates to real grep.
+//! - grep-compatible passthrough — delegates ordinary invocations to real grep.
 //! - `index`        — index a repo.
 //! - `search-graph` — graph search.
 //! - `who-calls` / `callees` / `find-usages` / `impact` / `brief` — graph navigation.
@@ -190,7 +190,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Drop-in replacement for grep.
+    /// Run an ordinary invocation through the byte-exact real-grep passthrough.
     #[command(external_subcommand)]
     Passthrough(Vec<String>),
     /// Index a repository.
@@ -292,7 +292,8 @@ pub enum Command {
         /// Accepted for agent ergonomics — no-op (brief is one fixed briefing).
         #[arg(long)]
         all: bool,
-        /// Accepted for agent ergonomics — no-op.
+        /// Emit machine-readable output with definitions, signatures, summaries,
+        /// graph evidence, and a valid expand handle.
         #[arg(long)]
         json: bool,
     },
@@ -560,21 +561,6 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
-    /// Agent installer — out of scope.
-    Install {
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-    /// Agent uninstaller — out of scope.
-    Uninstall {
-        #[arg(long, short = 'y')]
-        yes: bool,
-    },
-    /// Self-update is disabled; install a signed release artifact explicitly.
-    #[command(alias = "upgrade")]
-    Update,
-    /// Runtime config — out of scope.
-    Config { subcmd: Option<String> },
     /// Internal: warm embedding daemon (spawned automatically by query
     /// commands; lazy-loads the model, drops it after an idle TTL to free
     /// GPU memory, exits after a longer idle TTL). Not part of the public
@@ -703,7 +689,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         // placeholder and argv[1..] are the user's (possibly non-UTF-8)
         // arguments, forwarded verbatim.
         let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len());
-        full.push(std::ffi::OsString::from("greppy-grep"));
+        full.push(std::ffi::OsString::from("greppy"));
         full.extend(argv.into_iter().skip(1));
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
@@ -771,7 +757,6 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
-        "update" | "upgrade" => "greppy update [--check|--dry-run] [-y] [--tag TAG]",
         _ => return None,
     })
 }
@@ -1256,14 +1241,7 @@ fn dispatch_subcommand(
                         "index --json is only supported for `grep index status --json`".into(),
                     ));
                 }
-                dispatch_index(
-                    path.as_deref(),
-                    root,
-                    EmbeddingCliArgs {
-                        device,
-                        no_gpu,
-                    },
-                )
+                dispatch_index(path.as_deref(), root, EmbeddingCliArgs { device, no_gpu })
             }
         }
         Command::Cache { command } => dispatch_cache(command, root),
@@ -1427,13 +1405,6 @@ fn dispatch_subcommand(
             EmbeddingCliArgs { device, no_gpu },
             root,
         ),
-        Command::Install { .. } => Err(Error::out_of_scope("greppy install")),
-        Command::Uninstall { .. } => Err(Error::out_of_scope("greppy uninstall")),
-        Command::Update => Err(Error::Config(
-            "self-update is disabled; install a signed and attested Greppy release artifact explicitly"
-                .into(),
-        )),
-        Command::Config { .. } => Err(Error::out_of_scope("greppy config")),
     }
 }
 
@@ -1998,7 +1969,7 @@ const EXPAND_NAV_EVIDENCE_LIMIT: usize = 80;
 const EXPAND_CALLSITE_LINES_PER_NODE: usize = 8;
 
 /// Freshness budget for explicit machine-readable navigation queries. The
-/// grep drop-in hotpath uses 200 ms; explicit graph JSON can afford a little
+/// grep passthrough hotpath uses 200 ms; explicit graph JSON can afford a little
 /// more so it can prove freshness on normal debug/test builds instead of
 /// reporting false `budget exceeded` staleness.
 const NAV_FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
@@ -12182,24 +12153,24 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
     };
 
     let mut full = Vec::with_capacity(stripped.len() + 1);
-    full.push("greppy-grep".to_string());
+    full.push("greppy".to_string());
     full.extend_from_slice(stripped);
 
-    let real = greppy_grep::discover_grep()?;
-    greppy_grep::run_grep(&real, &full)
+    let real = greppy_passthrough::discover_grep()?;
+    greppy_passthrough::run_grep(&real, &full)
 }
 
 /// `OsString` argv variant of [`dispatch_grep`].
 ///
 /// forwards the original (possibly non-UTF-8) argv to
-/// real grep byte-for-byte via [`greppy_grep::run_grep_os`]. `full`
+/// real grep byte-for-byte via [`greppy_passthrough::run_grep_os`]. `full`
 /// includes a synthetic argv[0] placeholder; `full[1..]` are the user's
 /// grep arguments. A leading grep-family placeholder (when the user
 /// wrote `greppy grep …`) is handled by the pre-clap router, which
 /// only routes here for the *bare* form — but we still strip a leading
 /// `grep`/`egrep`/… token defensively to match [`dispatch_grep`].
 fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
-    // full[0] is the "greppy-grep" placeholder. Strip a leading
+    // full[0] is the "greppy" placeholder. Strip a leading
     // grep-family placeholder in full[1] if present (mirrors the String
     // dispatch_grep behaviour) so `greppy grep -R foo .` and
     // `greppy -R foo .` agree.
@@ -12210,11 +12181,11 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     };
 
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(stripped.len() + 1);
-    rebuilt.push(std::ffi::OsString::from("greppy-grep"));
+    rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend_from_slice(stripped);
 
-    let real = greppy_grep::discover_grep()?;
-    greppy_grep::run_grep_os(&real, &rebuilt)
+    let real = greppy_passthrough::discover_grep()?;
+    greppy_passthrough::run_grep_os(&real, &rebuilt)
 }
 
 /// Run the indexer against `path` (default: current directory).
@@ -13849,16 +13820,6 @@ mod tests {
     fn parse_implemented_subcommand() {
         let cli = Cli::try_parse_from(["greppy", "index", "."]).unwrap();
         assert!(matches!(cli.command, Some(Command::Index { .. })));
-    }
-
-    #[test]
-    fn parse_update_is_a_non_executing_policy_command() {
-        let cli = Cli::try_parse_from(["greppy", "update"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update)));
-        assert!(Cli::try_parse_from(["greppy", "update", "--check"]).is_err());
-
-        let cli = Cli::try_parse_from(["greppy", "upgrade"]).unwrap();
-        assert!(matches!(cli.command, Some(Command::Update)));
     }
 
     #[test]

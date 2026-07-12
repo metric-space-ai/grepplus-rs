@@ -16,7 +16,7 @@ greppy-core = { path = "../core" }
 greppy-discover = { path = "../discover" }
 greppy-embed-native = { path = "../embed-native" }
 greppy-freshness = { path = "../freshness" }
-greppy-grep = { path = "../greppy" }
+greppy-passthrough = { path = "../greppy" }
 greppy-indexer = { path = "../indexer" }
 greppy-qwen35-native = { path = "../qwen35-native" }
 greppy-search = { path = "../search" }

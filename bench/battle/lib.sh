@@ -23,9 +23,8 @@ BATTLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$BATTLE_DIR/../.." && pwd)}"
 
 GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy}"
-GREPPY_GREP_BIN="${GREPPY_GREP_BIN:-$WORKSPACE_ROOT/target/debug/greppy-grep}"
 
-# Real grep used as the byte-exact oracle for the drop-in contract.
+# Real grep used as the byte-exact oracle for the passthrough contract.
 REAL_GREP="${REAL_GREP:-/usr/bin/grep}"
 if [[ ! -x "$REAL_GREP" ]]; then
     REAL_GREP="$(command -v grep || echo /usr/bin/grep)"

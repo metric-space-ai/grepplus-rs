@@ -2,16 +2,22 @@
 
 # greppy
 
-**Standard `grep`, plus a few commands your coding agent uses to navigate code — `who-calls`, `impact`, `semantic-search`, `brief`. On structural code-navigation questions the agent answers correctly ~87% of the time instead of ~53% with plain grep — using fewer tokens. One native Rust binary.**
+**Local code navigation for coding agents: deterministic symbol-graph evidence, native semantic search, compact function briefings, and byte-exact real-`grep` passthrough. One native Rust binary.**
 
 [![Release](https://img.shields.io/github/v/release/metric-space-ai/greppy?display_name=tag&sort=semver&color=22c55e&label=release)](https://github.com/metric-space-ai/greppy/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`greppy` is a drop-in `grep` — every flag works exactly as before — that *also*
-answers the questions an agent normally burns rounds on: *who calls this
-function, what breaks if I change it, where is the code that does X.* One line in
-your agent's config (below) tells it the extra commands exist, and it stops
-looping through text matches.
+`greppy` is a code-navigation tool that also accepts ordinary `grep`
+invocations. Those invocations execute the real system `grep` and forward its
+stdout, stderr, and exit code byte-for-byte; they do not open an index, load a
+model, or mutate a Greppy cache. Greppy is installed only as `greppy`, never as
+a global `grep` replacement.
+
+Its structured commands answer questions an agent otherwise spends several
+search-and-read rounds on: *who calls this function, what breaks if I change it,
+where is the code that does X.* Deterministic source and graph evidence is the
+authority. Locally generated summaries are short navigation hints attached to
+the exact source signature, not a replacement for reading the returned code.
 
 ```bash
 # Standard grep — every command works, unchanged:
@@ -36,15 +42,21 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 **1. Install the binary.**
 
 ```bash
-cargo build --release --bin greppy --features embedded-model
+# Portable CPU build (both models are always embedded)
+cargo build --release --bin greppy
 sudo install -m 0755 target/release/greppy /usr/local/bin/greppy
 ```
 
-Everything is automatic — the code graph and the semantic model are **built into
-the binary** and build themselves on first use. Nothing to index, nothing to
-download, no flags to configure. (Prebuilt binaries for macOS / Linux / Windows
-are on the [Releases](../../releases) page.) Want it as a transparent `grep`
-drop-in too? Install it a second time as `grep`.
+Every build embeds EmbeddingGemma and Qwen3.5 plus their tokenizers. No model is
+downloaded at runtime and neither model can be disabled. CPU inference is always
+available; build with `--features metal` on Apple Silicon or `--features cuda`
+on Linux/NVIDIA to include the accelerated backend. Runtime selection is
+automatic and can be made explicit with `--device cpu|metal|cuda[:INDEX]` or
+`GREPPY_DEVICE`.
+
+The first structured query builds its local workspace index. Prebuilt binaries
+for macOS, Linux, and Windows are published on the [Releases](../../releases)
+page. Do not rename or install the binary as `grep`.
 
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
@@ -53,9 +65,10 @@ paste the snippet below into the file your agent reads for project instructions
 prompt).
 
 ```text
-This project has `greppy` — standard grep plus a few code-navigation commands
-over a prebuilt symbol graph and an on-device semantic index. Every normal grep
-invocation (and flag) works exactly as usual.
+This project has `greppy`, a local code-navigation tool over a symbol graph and
+an on-device semantic index. Ordinary grep invocations are delegated byte-for-
+byte to the real system grep, but Greppy must not be installed or invoked as a
+global grep alias.
 
 CODE-NAVIGATION COMMANDS. SYMBOL is a function / method / class / type name.
 They return resolved results as `qualified_name file:line`, not text matches:
@@ -92,36 +105,38 @@ FLAGS (append to any command above):
 Prefer these over grepping a symbol name and reading every hit: who-calls /
 callees / impact answer relationship questions directly, and semantic-search
 finds code you cannot name.
+
+Treat returned source paths, exact spans, signatures, and graph relations as
+evidence. The indented English sentence below a function signature is a local
+Qwen navigation hint. Read the source and verify changes with builds and tests.
 ```
 
 ---
 
 ## What it saves
 
-What an agent actually pays for is **billed tokens** and **wall-clock time.**
+Greppy is designed to replace exploratory search-and-open loops with one
+structured query plus directly attached evidence. That benefit is a release
+gate, not a marketing assumption.
 
-<img src="docs/assets/nav-wins.svg" width="100%" alt="On structural code-navigation questions the agent answers correctly 87% with greppy vs 53% with plain grep, using fewer tokens"/>
+The checked-in benchmark contains 115 pinned tasks across six real repositories
+and deterministic synthetic controls. It records per-task correctness, tool
+calls, source opens, input/output tokens, context volume, and wall time for the
+same agent with Greppy and with an uncoached shell-search baseline.
 
-The benchmark: **14 coding-agent models** (Claude Opus/Sonnet/Fable, GPT-5.5, Gemini, Grok, DeepSeek, Qwen, GLM, Kimi, MiniMax-M3, …), each driven by [Pi Code](https://pi.dev), answer **35 code-navigation questions** across **7 real repositories** (Rust `serde` + `tokio`, Python `flask` + `django`, Java `gson`, TypeScript `zod`, Go `hugo`). Every task runs twice — once with plain `grep`, once with `greppy`, **same agent, same prompt.** Answers are **floor-graded**: a pass must name the ground-truth symbol/file (each anchor rg-verified at generation time). The harness is in [`bench/agent_efficiency/`](bench/agent_efficiency/).
+`v0.2.0` may claim an efficiency win only when the published, mechanically
+graded run proves all of the following:
 
-**Correctness is the headline.** On **structural navigation** — *who-calls*, *callees*, *impact/blast-radius*, *find-symbol* — the agent answers correctly **87% of the time with greppy vs 53% with plain grep** (graded by the repo's own [`grade_answers.py`](bench/agent_efficiency/grade_answers.py)). Across all 35 questions: **90% vs 63%.** Plain grep is cheap but frequently confidently wrong; greppy resolves the relationship in one call.
+- no statistically significant correctness regression;
+- at least 20% fewer tool calls and source-open calls on structural tasks;
+- at least 20% fewer variable input tokens on structural tasks;
+- exact repository commits, task-bank hash, prompt hash, model ID, Greppy
+  binary hash, per-task rows, grading, aggregate, and forensics are published;
+- raw agent traces remain private and are not release artifacts.
 
-| On structural navigation questions | grep | greppy |
-|---|---:|---:|
-| **Answered correctly** (floor-graded) | 53% | **87%** |
-| **Input tokens** (median · mean saving) | 1× | **1.2× · 2.3× fewer** |
-| **Search-context tokens** (median · mean) | 1× | **1.7× · 5.1× less** |
-| **Output tokens** (median) | 1× | **1.2× fewer** |
-
-So it is not a cost-for-accuracy trade: on structural questions greppy is **both more correct and cheaper.**
-
-**Where plain grep keeps up:** open-ended *"how does this subsystem work"* questions. Both tools reach the answer there (~98% correct either way), but greppy's precise locator makes the agent read more to explain the *mechanism*, so it costs a little **more**. greppy's edge is **pinpoint / structural** questions — the semantic path is being tuned to also lead the agent to the answer in one step.
-
-**The gain depends on the model.** Priced at each model's real OpenRouter list rate, the **actual dollar cost** of the structural tasks drops with greppy for most models — a **median of ~16%** cheaper — but it swings widely (from **+54%** on MiMo to **−84%** on Grok 4.3, which spirals) and does **not** track a model's general agentic-benchmark score. Benchmark your own model — most come out ahead, and every model gets the correctness lift.
-
-<img src="docs/assets/gain-vs-agentic.svg" width="100%" alt="Real dollar saving per model on structural tasks vs Artificial Analysis Agentic Index — model-dependent, uncorrelated with agentic rank"/>
-
-<sub>Real cost = each model's OpenRouter list price × tokens, summed over the structural tasks. The scatter shows the efficiency gain is real for most models but genuinely model-dependent, not something a model's agentic rank predicts.</sub>
+The reproducible harness and pre-registered contract are in
+[`bench/agent_efficiency/`](bench/agent_efficiency/). Historical charts are not
+treated as `v0.2.0` evidence until a current run passes those gates.
 
 ---
 
@@ -129,21 +144,57 @@ So it is not a cost-for-accuracy trade: on structural questions greppy is **both
 
 - **Standard grep.** Any invocation that isn't one of the extra commands runs real `grep` and returns its output and exit code unchanged.
 - **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USES`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`find-usages`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches — collapsing several grep+read rounds into one call.
-- **Native semantic search.** For a natural-language query that shares no words with the code, `semantic-search` embeds the query with Google's **EmbeddingGemma** on greppy's own native Rust inference (CPU / Apple Metal / NVIDIA CUDA, auto-detected — no llama.cpp, no Python, no HTTP) and returns the nearest code spans by meaning. A small warm daemon keeps the model resident between calls and drops it after idle, so it never holds GPU memory while you're not searching.
-- **One native Rust binary.** The EmbeddingGemma model is baked into the binary; tree-sitter parsers and SQLite are compiled in statically.
+- **Native semantic navigation.** `semantic-search` uses Google's embedded **EmbeddingGemma** to find code by meaning. Embedded **Qwen3.5-0.8B Q4_K_M with MTP** adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
+- **Bounded warm daemons.** The embedding and summary engines use separate local daemons. A used model remains resident for five idle minutes; the process exits after 30 idle minutes. Failed inference never removes deterministic source or graph output.
+- **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
+
+## Local data and cleanup
+
+Greppy stores workspace paths, source spans, graph edges, embeddings, and query
+cache entries in a local SQLite-backed cache outside the repository. Directories
+are private to the current user (`0700` on Unix), and cache objects are managed
+only after ownership, type, and path validation. Set `GREPPY_STORE_DIR` to place
+the data on an encrypted or ephemeral volume.
+
+```bash
+greppy cache status --json       # inspect paths, sizes, locks, TTL and quota
+greppy cache gc --dry-run        # preview TTL/LRU reclamation
+greppy cache gc                  # reclaim eligible entries
+greppy cache clear --root . --yes
+greppy cache clear --all --yes   # explicit destructive operation
+```
+
+The default workspace-cache TTL is 14 days. `GREPPY_STORE_TTL_DAYS=0` disables
+age eviction but not the independent size quota.
 
 ---
 
 ## Status
 
-Early and evolving — the drop-in `grep` core is solid; the intelligence layers around it are beta.
+The current `main` branch is qualifying for the gated `v0.2.0` release. No
+official release is cut until the packaged artifacts, native inference,
+daemon-fault tests, summary-quality corpus, agent benchmark, hardware matrix,
+signing, and notarization gates pass.
 
-- **Solid:** the `grep` drop-in and the code-graph commands (`who-calls` / `callees` / `find-usages` / `impact` / `path` / `brief`) on supported languages.
-- **Supported languages (107):** `python`, `csharp`, `go`, `cpp`, `php`, `rust`, `swift`, `scala`, `c`, `java`, `javascript`, `typescript`, `ruby`, `bash`, `kotlin`, `fsharp`, `julia`, `ocaml`, `d`, `gdscript`, `zig`, `elm`, `erlang`, `crystal`, `gleam`, `objc`, `solidity`, `prisma`, `protobuf`, `css`, `dockerfile`, `json`, `groovy`, `lua`, `sql`, `make`, `nix`, `cmake`, `dart`, `fortran`, `elixir`, `scheme`, `vue`, `astro`, `svelte`, `verilog`, `glsl`, `hcl`, `matlab`, `r`, `purescript`, `racket`, `clojure`, `haskell`, `cuda`, `tcl`, `graphql`, `pascal`, `powershell`, `html`, `yaml`, `hlsl`, `cobol`, `fish`, `ini`, `vhdl`, `json5`, `awk`, `cairo`, `ada`, `hare`, `kdl`, `jsonnet`, `llvm`, `janet`, `jinja2`, `bicep`, `gotemplate`, `just`, `devicetree`, `liquid`, `assembly`, `hyprlang`, `gn`, `blade`, `cfml`, `cfscript`, `csv`, `bibtex`, `beancount`, `gitattributes`, `markdown`, `toml`, `xml`, `scss`, `perl`, `fennel`, `starlark`, `ron`, `dotenv`, `properties`, `po`, `diff`, `rst`, `mermaid`, `regex`, `linkerscript`. More land in each release.
-- **Beta:** `semantic-search` — the on-device EmbeddingGemma inference is solid and the model ships inside the binary. Newer than the graph commands, so still labelled beta.
+- **Production-certified parser set:** Rust, Python, Java, JavaScript,
+  TypeScript, and Go.
+- **Additional parser coverage:** many more languages can be indexed and
+  searched, but are not claimed to have the same graph completeness until they
+  receive language-specific fixtures and real-repository acceptance tests.
+- **Supported release targets:** macOS Apple Silicon with Metal, Linux x86_64
+  with CPU and NVIDIA CUDA, and Windows x86_64 CPU with named-pipe daemons.
+- **Known boundaries:** reflection, runtime dependency injection, generated
+  code, macros, and dynamic dispatch can hide relationships from any static
+  graph. Freshness checks fail closed rather than knowingly returning stale
+  source evidence.
 
-Not yet production-ready — use it as a fast code-navigation aid, not a system of record.
+Published releases are immutable and checksummed. Greppy has no self-updater;
+pin a release or commit and upgrade through verified release artifacts. See
+[SUPPORT.md](SUPPORT.md), [SECURITY.md](SECURITY.md), and
+[CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Third-party notices: [THIRD_PARTY.md](THIRD_PARTY.md).
+Greppy source code is MIT-licensed; embedded model weights have separate terms.
+See [LICENSE](LICENSE), [THIRD_PARTY.md](THIRD_PARTY.md), and the model notices
+under [`licenses/`](licenses/).

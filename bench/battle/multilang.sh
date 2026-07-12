@@ -32,7 +32,7 @@
 #     struct (the node with the incoming edges), not a same-named node.
 #   * `search-symbols` / `search-code` find known symbols / content across
 #     all six languages.
-#   * the drop-in grep contract still holds on this mixed repo (`greppy
+#   * the byte-exact grep passthrough still holds on this mixed repo (`greppy
 #     -R` vs the system grep, byte-exact, on several queries).
 #   * determinism: index twice into independent stores -> identical node
 #     and edge counts (and identical node/edge SETS).
@@ -483,13 +483,6 @@ else
         grep_case "$GREPPY_BIN" greppy "${argv[@]}"
     done
 
-    if [[ -x "$GREPPY_GREP_BIN" ]]; then
-        grep_case "$GREPPY_GREP_BIN" greppy-grep -R -n helper .
-        grep_case "$GREPPY_GREP_BIN" greppy-grep -R -n caller .
-        grep_case "$GREPPY_GREP_BIN" greppy-grep -R function .
-    else
-        echo "[multilang] note: greppy-grep binary absent; skipping standalone passthrough checks"
-    fi
 fi
 
 # ---------------------------------------------------------------------------

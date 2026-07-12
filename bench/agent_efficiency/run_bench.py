@@ -38,6 +38,7 @@ aggregate report is not an acceptance gate: speed wins without machine-readable
 quality evidence remain optimization hints only.
 """
 import json
+import hashlib
 import os
 import pathlib
 import re
@@ -63,6 +64,7 @@ TASKS = HERE / "tasks_v2.json"
 RESULTS = HERE / "results.json"
 RAW_ROOT = HERE / "raw_runs"
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
+BENCHMARK_PROMPT_VERSION = "greppy-agent-nav-v3"
 
 
 def ensure_provider_key(provider: str = "minimax") -> None:
@@ -154,7 +156,7 @@ EXPLORER_SYS = (
 
 
 def gp_sys(root: str) -> str:
-    """greppy-agent system prompt (v2 — precise tool doc, not coaching).
+    """Greppy agent prompt: concise product documentation, not an answer hint.
 
     Owner rule: every failed call costs the agent extra thinking plus a
     tool call. v2 therefore documents the tool the way a man page would —
@@ -167,18 +169,17 @@ def gp_sys(root: str) -> str:
     return (
         f"Answer the question about the code at {root} using the greppy "
         f"code-intelligence CLI ({g}), always with `--root {root}`. It returns "
-        f"real source, not just pointers - trust its output; do not re-open "
-        f"files to confirm.\n"
+        f"exact source locations and can return source evidence. Deterministic "
+        f"source spans and graph relations are authoritative; short English "
+        f"summaries are navigation hints only.\n"
         f"Pick the command by QUESTION TYPE:\n"
         f"- 'where/how does the code do X' (behavior, no symbol name): "
-        f"context \"X\" - semantic search, returns the relevant definitions "
-        f"with source. THE first move for any vocabulary-gap question.\n"
+        f"semantic-search \"X\" - returns ranked definitions with exact spans, "
+        f"source signatures, short purpose hints, and an expand handle.\n"
         f"- 'who calls S / is S used / can I change or delete S': who-calls S "
         f"(callers), find-usages S (all references), callees S (what S calls). "
-        f"Each result ALREADY prints the call site as `file:line: code`, so "
-        f"you have the evidence to answer directly — do NOT add --code (it "
-        f"dumps full bodies and is rarely needed) and do NOT pass --all (the "
-        f"'N more ... of T total' footer already gives the full count).\n"
+        f"Use --code only when the returned relationship needs source context; "
+        f"use an Expand handle when Greppy provides one.\n"
         f"- 'what breaks if S changes / how far does S reach': impact S "
         f"[--direction incoming|outgoing] - the whole transitive set in ONE "
         f"call.\n"
@@ -187,15 +188,32 @@ def gp_sys(root: str) -> str:
         f"- know part of a name: search-symbols NAME [--kind function|method|"
         f"struct|class]. Literal text: search-code TEXT. Call chain: "
         f"path --from A --to B.\n"
-        f"These are ALL the flags - do not invent others.\n"
+        f"The generated purpose sentence can help choose what to inspect, but "
+        f"never use it as evidence without the associated source.\n"
         f"ERROR RULE: if a command errors or returns nothing useful, do not "
         f"retry variants of the same call. Follow the suggestion in its "
         f"output if present; otherwise switch: symbol not found -> "
         f"search-symbols NAME; context weak -> search-code with a distinctive "
         f"literal. Maximum ONE fallback, then answer from what you have.\n"
-        f"Be efficient: ONE well-chosen call usually answers the question. "
-        f"Stop as soon as you can answer. End with the final answer."
+        f"Be efficient, inspect enough returned evidence to answer correctly, "
+        f"and end with the final answer."
     )
+
+
+def prompt_contract() -> dict:
+    """Stable hashes recorded in every result row and acceptance manifest."""
+    prompts = {
+        "grep": GREP_SYS,
+        "greppy": gp_sys("{ROOT}"),
+        "explorer": EXPLORER_SYS,
+    }
+    return {
+        "version": BENCHMARK_PROMPT_VERSION,
+        "sha256": {
+            name: hashlib.sha256(text.encode("utf-8")).hexdigest()
+            for name, text in prompts.items()
+        },
+    }
 
 
 def plus_sys(root: str) -> str:
@@ -311,6 +329,7 @@ def run_pi(
 
 def parse_pi_jsonl(out: str) -> dict:
     inp = outp = tools = 0
+    source_open_calls = 0
     cache_read = cache_write = cache_write_1h = 0
     ctx_chars = 0  # total chars of tool-result content the agent had to ingest
     turn_prompt_inputs: list[int] = []
@@ -337,6 +356,19 @@ def parse_pi_jsonl(out: str) -> dict:
                     if isinstance(c, dict) and c.get("type") == "text":
                         ctx_chars += len(c.get("text", ""))
             m = o.get("message", {})
+            for item in m.get("content", []) or []:
+                if not isinstance(item, dict) or item.get("type") != "toolCall":
+                    continue
+                name = item.get("name")
+                if name == "read":
+                    source_open_calls += 1
+                    continue
+                if name != "bash":
+                    continue
+                arguments = item.get("arguments") or {}
+                command = str(arguments.get("command", ""))
+                if re.search(r"(^|[;&|]\s*)(cat|head|tail|sed\s+-n)\s", command):
+                    source_open_calls += 1
             u = m.get("usage", {}) or {}
             turn_input = int(u.get("input", 0) or 0)
             turn_output = int(u.get("output", 0) or 0)
@@ -378,7 +410,7 @@ def parse_pi_jsonl(out: str) -> dict:
         "loop_input": loop_reported_input,
         "turns": len(turn_prompt_inputs),
         "ctx_chars": ctx_chars, "ctx_tok": round(ctx_chars / 4),
-        "tool_calls": tools,
+        "tool_calls": tools, "source_open_calls": source_open_calls,
         "answer": answer.strip(), "error": err,
     }
 
@@ -819,6 +851,9 @@ def main() -> None:
         row.update({
             "id": t["id"], "repo": repo, "lang": lang, "size": size,
             "type": t["type"], "q": t["q"], "ground_truth": t["ground_truth"],
+            "prompt_contract": prompt_contract(),
+            "provider": PROVIDER,
+            "model": PROVIDERS[PROVIDER]["model"],
         })
         raw_paths = row.get("raw_paths", {})
 

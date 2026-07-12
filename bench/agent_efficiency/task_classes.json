@@ -1,0 +1,169 @@
+{
+  "schema_version": 1,
+  "purpose": "Machine-readable R7 regression/router classes for the synthetic 100-task agent benchmark.",
+  "source_evidence": [
+    "bench/agent_efficiency/tasks.json",
+    "bench/agent_efficiency/BENCHMARK_CONTRACT.md"
+  ],
+  "classes": {
+    "direct_similarity": {
+      "role": "embedding_candidate",
+      "description": "Concept-to-symbol/file or natural-language-to-implementation discovery where EmbeddingGemma may replace repeated grep/read probing.",
+      "ids": [
+        "t006",
+        "t007",
+        "t011",
+        "t019",
+        "t023",
+        "t030",
+        "t033",
+        "t039",
+        "t043",
+        "t050",
+        "t052",
+        "t058",
+        "t059",
+        "t061",
+        "t092",
+        "t093",
+        "t094",
+        "t095",
+        "t098"
+      ],
+      "hard_negative_ids": [
+        "t006",
+        "t007",
+        "t030",
+        "t033",
+        "t039",
+        "t043",
+        "t052",
+        "t058",
+        "t059",
+        "t092",
+        "t093",
+        "t095",
+        "t098"
+      ],
+      "acceptance": {
+        "median_tool_calls_max": 2.5,
+        "context_median_must_not_regress_vs_current_greppy": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "hybrid_seed_graph": {
+      "role": "embedding_candidate",
+      "description": "Similarity should identify the target symbol, then exact graph commands must answer counts, callers, references, paths or blast radius.",
+      "ids": [
+        "t012",
+        "t024",
+        "t089",
+        "t097",
+        "t100"
+      ],
+      "acceptance": {
+        "tool_calls_target_range": [2, 3],
+        "exact_graph_counts_must_be_preserved": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "literal_control": {
+      "role": "avoid_embedding",
+      "description": "Literal/local/exact tasks where grep, exact symbol search or minimal source read should win; vector search must not be invoked.",
+      "ids": [
+        "t005",
+        "t017",
+        "t018",
+        "t029",
+        "t038",
+        "t057",
+        "t060",
+        "t090",
+        "t091"
+      ],
+      "acceptance": {
+        "embedding_must_not_be_invoked": true,
+        "candidate_must_not_expand_transitively_unless_asked": true,
+        "quality_must_not_regress": true
+      }
+    },
+    "graph_control": {
+      "role": "avoid_embedding",
+      "description": "Exact graph, caller/callee/path/impact/reference tasks where graph or literal search should answer without vector retrieval.",
+      "ids": [
+        "t001",
+        "t002",
+        "t003",
+        "t004",
+        "t008",
+        "t009",
+        "t010",
+        "t013",
+        "t014",
+        "t015",
+        "t016",
+        "t020",
+        "t021",
+        "t022",
+        "t025",
+        "t026",
+        "t027",
+        "t028",
+        "t031",
+        "t032",
+        "t034",
+        "t035",
+        "t036",
+        "t037",
+        "t040",
+        "t041",
+        "t042",
+        "t044",
+        "t045",
+        "t046",
+        "t047",
+        "t048",
+        "t049",
+        "t051",
+        "t053",
+        "t054",
+        "t055",
+        "t056",
+        "t062",
+        "t063",
+        "t064",
+        "t065",
+        "t066",
+        "t067",
+        "t068",
+        "t069",
+        "t070",
+        "t071",
+        "t072",
+        "t073",
+        "t074",
+        "t075",
+        "t076",
+        "t077",
+        "t078",
+        "t079",
+        "t080",
+        "t081",
+        "t082",
+        "t083",
+        "t084",
+        "t085",
+        "t086",
+        "t087",
+        "t088",
+        "t096",
+        "t099"
+      ],
+      "acceptance": {
+        "embedding_must_not_be_invoked": true,
+        "direct_scope_must_not_be_reported_as_transitive": true,
+        "quality_must_not_regress": true
+      }
+    }
+  }
+}

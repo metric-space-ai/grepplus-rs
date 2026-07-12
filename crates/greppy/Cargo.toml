@@ -1,15 +1,11 @@
 [package]
-name = "greppy-grep"
+name = "greppy-passthrough"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "greppy byte-exact real-grep passthrough"
-
-[[bin]]
-name = "greppy-grep"
-path = "src/main.rs"
+description = "Internal byte-exact real-grep passthrough library for greppy"
 
 [[example]]
 name = "freshness-probe"

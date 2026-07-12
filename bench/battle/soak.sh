@@ -10,7 +10,7 @@
 #   1. NO PANIC / no signal crash on any iteration (we scan combined
 #      stderr for panic / SIG* markers and check exit codes).
 #   2. integrity_check stays "ok" on the live graph.db every iteration.
-#   3. Both grep-compatible entry points stay BYTE-EXACT vs system grep
+#   3. The grep-compatible product path stays BYTE-EXACT vs system grep
 #      (stdout + stderr + exit code) on every iteration, even as the
 #      corpus is mutated underneath it, even with a fresh index in scope.
 #   4. RSS does NOT grow unbounded: we sample resident set size of an
@@ -35,7 +35,7 @@ ITERS="${BATTLE_SOAK_ITERS:-200}"
 N_FILES="${BATTLE_SOAK_FILES:-40}"
 RSS_FACTOR="${BATTLE_SOAK_RSS_FACTOR:-3}"
 
-require_bins "$GREPPY_BIN" "$GREPPY_GREP_BIN" || { emit_summary "$NAME"; exit 1; }
+require_bins "$GREPPY_BIN" || { emit_summary "$NAME"; exit 1; }
 
 if [[ ! -x "$REAL_GREP" ]]; then
     fail "real grep oracle present ($REAL_GREP)"
@@ -164,9 +164,9 @@ while [[ "$i" -lt "$ITERS" ]]; do
     # Structured search must not crash (exercises the read path).
     ( cd "$CORPUS" && "$GREPPY_BIN" search-code "soak_touch_$i" ) >>"$LOG" 2>&1 || true
 
-    # Byte-exact drop-in grep on the moving needle's current home file.
+    # Byte-exact grep passthrough on the moving needle's current home file.
     needle_rel="src/$(printf 'mod%04d' "$(( i % N_FILES ))").rs"
-    for bin_label in "$GREPPY_BIN:greppy" "$GREPPY_GREP_BIN:greppy-grep"; do
+    for bin_label in "$GREPPY_BIN:greppy"; do
         bin="${bin_label%%:*}"
         label="${bin_label##*:}"
         if ! grep_byte_exact "$bin" "$label" -n SOAK_NEEDLE "$needle_rel"; then
@@ -206,7 +206,7 @@ fi
 # ---------------------------------------------------------------------------
 assert_eq 0 "$loop_panics"      "no panic / signal crash across $ITERS iterations"
 assert_eq 0 "$integ_bad"        "integrity_check stayed ok at every checkpoint"
-assert_eq 0 "$grep_breaks"      "drop-in grep stayed byte-exact vs $REAL_GREP across iterations"
+assert_eq 0 "$grep_breaks"      "grep passthrough stayed byte-exact vs $REAL_GREP across iterations"
 
 # RSS growth bound. Guard against a zero early sample (sampling can miss a
 # very fast child); only assert the ratio when we have a real baseline.

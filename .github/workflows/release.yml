@@ -1,7 +1,7 @@
 name: release
 
 # Build ready-to-run binaries for macOS (arm64 + x86_64), Linux (x86_64) and
-# Windows (x86_64) and attach them to a GitHub Release.
+# Windows (x86_64), sign them, and attach them to a GitHub Release.
 #
 # Triggers:
 #   * push a tag `v*`   -> builds and publishes a Release with the assets
@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  actions: read
   id-token: write
   attestations: write
 
@@ -48,10 +49,8 @@ jobs:
             features: cuda
             cuda_sub_packages: '["nvcc", "cudart"]'
             cuda_non_cuda_sub_packages: '["libcublas", "libcublas-dev"]'
-          # v0.1.0: Windows ships a CPU binary (embedding on AVX2). Windows GPU
-          # (CUDA) is deferred to v0.1.1 — nvcc's cudafe++ crashes on
-          # windows-latest's newest MSVC. macOS Intel (macos-13) is also deferred
-          # for now (scarce GitHub runners); Apple Silicon covers modern Macs.
+          # v0.2.0 certifies Windows CPU inference and named-pipe daemons.
+          # Windows CUDA and macOS Intel remain outside this release gate.
           - name: windows-x86_64
             os: windows-latest
             asset: greppy-windows-x86_64.zip
@@ -67,6 +66,15 @@ jobs:
           git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-mtp-q4km/*'
           ls -lh crates/cli/assets/embeddinggemma-300m-q4k
           ls -lh crates/cli/assets/qwen35-0.8b-mtp-q4km
+          test "$(shasum -a 256 crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf | awk '{print $1}')" = "53f7d1c0d5c84a81e46f3bea8e0f17c94f459ffbaa8b06f7f52f1f09e58996f2"
+          test "$(shasum -a 256 crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json | awk '{print $1}')" = "6852f8d561078cc0cebe70ca03c5bfdd0d60a45f9d2e0e1e4cc05b68e9ec329e"
+          qwen_dir=crates/cli/assets/qwen35-0.8b-mtp-q4km
+          test "$(shasum -a 256 "$qwen_dir/Qwen3.5-0.8B-MTP-Q4_K_M.gguf" | awk '{print $1}')" = "$(tr -d '\r\n' < "$qwen_dir/Qwen3.5-0.8B-MTP-Q4_K_M.gguf.sha256")"
+          test "$(shasum -a 256 "$qwen_dir/tokenizer.json" | awk '{print $1}')" = "$(tr -d '\r\n' < "$qwen_dir/tokenizer.json.sha256")"
+          test -s licenses/EMBEDDINGGEMMA-NOTICE.txt
+          test -s licenses/GEMMA-TERMS.html
+          test -s licenses/GEMMA-PROHIBITED-USE-POLICY.html
+          test -s licenses/QWEN3.5-APACHE-2.0.txt
 
       - name: Install Rust (pinned by rust-toolchain.toml)
         uses: dtolnay/rust-toolchain@stable
@@ -89,6 +97,44 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
+
+      - name: Sign macOS binary with Developer ID
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        shell: bash
+        env:
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+        run: |
+          test -n "$CERTIFICATE_P12" && test -n "$CERTIFICATE_PASSWORD" && test -n "$SIGNING_IDENTITY"
+          keychain="$RUNNER_TEMP/greppy-signing.keychain-db"
+          cert="$RUNNER_TEMP/greppy-signing.p12"
+          printf '%s' "$CERTIFICATE_P12" | base64 -D > "$cert"
+          security create-keychain -p "$CERTIFICATE_PASSWORD" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$CERTIFICATE_PASSWORD" "$keychain"
+          security import "$cert" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$CERTIFICATE_PASSWORD" "$keychain"
+          codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" target/release/greppy
+          codesign --verify --strict --verbose=2 target/release/greppy
+
+      - name: Sign Windows binary with Authenticode
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
+        shell: pwsh
+        env:
+          CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if (-not $env:CERTIFICATE_PFX -or -not $env:CERTIFICATE_PASSWORD) {
+            throw 'Windows signing credentials are required for tag builds'
+          }
+          $cert = Join-Path $env:RUNNER_TEMP 'greppy-signing.pfx'
+          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:CERTIFICATE_PFX))
+          & signtool sign /fd SHA256 /tr 'http://timestamp.digicert.com' /td SHA256 /f $cert /p $env:CERTIFICATE_PASSWORD target/release/greppy.exe
+          if ($LASTEXITCODE -ne 0) { throw 'signtool sign failed' }
+          & signtool verify /pa /all /v target/release/greppy.exe
+          if ($LASTEXITCODE -ne 0) { throw 'signtool verify failed' }
 
       - name: Verify CUDA backend runtime dependencies
         if: matrix.features == 'cuda'
@@ -129,7 +175,8 @@ jobs:
           mkdir -p dist
           cp target/release/greppy dist/greppy
           cp bench/release_package_smoke.sh dist/
-          cp README.md LICENSE THIRD_PARTY.md dist/ 2>/dev/null || true
+          cp README.md LICENSE THIRD_PARTY.md SECURITY.md SUPPORT.md CHANGELOG.md dist/
+          cp -R licenses dist/licenses
           tar -C dist -czf "${{ matrix.asset }}" .
 
       - name: Package (Windows)
@@ -139,8 +186,22 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
           Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
-          Copy-Item README.md,LICENSE,THIRD_PARTY.md dist/ -ErrorAction SilentlyContinue
+          Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md dist/
+          Copy-Item licenses dist/licenses -Recurse
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
+
+      - name: Notarize macOS signed binary
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID" && test -n "$APPLE_TEAM_ID" && test -n "$APPLE_APP_PASSWORD"
+          notary_zip="$RUNNER_TEMP/greppy-notary.zip"
+          ditto -c -k --keepParent target/release/greppy "$notary_zip"
+          xcrun notarytool submit "$notary_zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
 
       - name: Smoke-test packaged artifact (Unix)
         if: runner.os != 'Windows'
@@ -150,6 +211,9 @@ jobs:
           mkdir -p "$clean/bin" "$clean/store" "$clean/repo"
           tar -C "$clean/bin" -xzf "${{ matrix.asset }}"
           test ! -e "$clean/bin/grep"
+          test -s "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt"
+          test -s "$clean/bin/licenses/GEMMA-TERMS.html"
+          test -s "$clean/bin/licenses/QWEN3.5-APACHE-2.0.txt"
           bash "$clean/bin/release_package_smoke.sh" "$clean/bin/greppy" "$clean/work"
 
       - name: Smoke-test packaged artifact (Windows)
@@ -159,7 +223,18 @@ jobs:
           $clean = Join-Path $env:RUNNER_TEMP 'greppy-package-smoke'
           New-Item -ItemType Directory -Force "$clean/bin","$clean/store","$clean/repo" | Out-Null
           Expand-Archive -Path "${{ matrix.asset }}" -DestinationPath "$clean/bin" -Force
+          if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt")) { throw 'missing EmbeddingGemma notice' }
+          if (-not (Test-Path "$clean/bin/licenses/GEMMA-TERMS.html")) { throw 'missing Gemma terms' }
+          if (-not (Test-Path "$clean/bin/licenses/QWEN3.5-APACHE-2.0.txt")) { throw 'missing Qwen license' }
           & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
+
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: dist
+          format: spdx-json
+          output-file: ${{ matrix.asset }}.spdx.json
+          upload-artifact: false
 
       - name: Generate SHA256 checksum (Unix)
         if: runner.os != 'Windows'
@@ -178,6 +253,11 @@ jobs:
         with:
           subject-path: ${{ matrix.asset }}
 
+      - name: Attest SBOM provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ matrix.asset }}.spdx.json
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
@@ -185,6 +265,7 @@ jobs:
           path: |
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
+            ${{ matrix.asset }}.spdx.json
 
   verify-packages:
     name: clean package (${{ matrix.name }})
@@ -217,10 +298,14 @@ jobs:
           (cd package && shasum -a 256 -c "${{ matrix.asset }}.sha256")
           tar -C unpack -xzf "package/${{ matrix.asset }}"
           test ! -e unpack/grep
+          if [[ "$GITHUB_REF" == refs/tags/* && "${{ runner.os }}" = macOS ]]; then
+            codesign --verify --strict --verbose=2 unpack/greppy
+          fi
           bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
           if [ "${{ runner.os }}" = Linux ]; then
             ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
           fi
+          test -s "package/${{ matrix.asset }}.spdx.json"
 
       - name: Verify clean Windows host
         if: runner.os == 'Windows'
@@ -232,6 +317,11 @@ jobs:
           $got = (Get-FileHash -Algorithm SHA256 "package/${{ matrix.asset }}").Hash.ToLowerInvariant()
           if ($want -ne $got) { throw "package checksum mismatch: $got != $want" }
           Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
+          if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+            $signature = Get-AuthenticodeSignature "$PWD/unpack/greppy.exe"
+            if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
+          }
           & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
 
   publish:
@@ -243,6 +333,45 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: release-assets
+      - name: Download passing benchmark for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_id="$(gh run list \
+            --workflow agent-benchmark.yml \
+            --commit "$GITHUB_SHA" \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId // empty')"
+          test -n "$run_id" || {
+            echo '::error::no successful agent benchmark exists for this release commit'
+            exit 1
+          }
+          mkdir -p release-assets/agent-benchmark
+          gh run download "$run_id" \
+            --name "greppy-agent-benchmark-$GITHUB_SHA" \
+            --dir release-assets/agent-benchmark
+          (cd release-assets/agent-benchmark && shasum -a 256 -c greppy-agent-benchmark.tar.gz.sha256)
+          mkdir -p release-assets/agent-benchmark/verified
+          tar -C release-assets/agent-benchmark/verified \
+            -xzf release-assets/agent-benchmark/greppy-agent-benchmark.tar.gz
+          test "$(jq -r .passed release-assets/agent-benchmark/verified/release-gate.json)" = true
+          test "$(jq -r .greppy.git_commit release-assets/agent-benchmark/verified/RUN_MANIFEST.json)" = "$GITHUB_SHA"
+          test "$(jq -r .raw_traces_published release-assets/agent-benchmark/verified/RUN_MANIFEST.json)" = false
+      - name: Generate aggregate release checksums
+        shell: bash
+        run: |
+          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' \) -print0 \
+            | sort -z \
+            | xargs -0 shasum -a 256 \
+            | sed 's#  release-assets/[^/]*/#  #' > release-assets/SHA256SUMS
+          test "$(wc -l < release-assets/SHA256SUMS)" -eq 7
+          cat release-assets/SHA256SUMS
+      - name: Attest aggregate checksums
+        uses: actions/attest@v4
+        with:
+          subject-path: release-assets/SHA256SUMS
       - name: Attach verified packages to release
         uses: softprops/action-gh-release@v2
         with:
@@ -250,4 +379,8 @@ jobs:
             release-assets/**/*.tar.gz
             release-assets/**/*.zip
             release-assets/**/*.sha256
+            release-assets/**/*.spdx.json
+            release-assets/agent-benchmark/greppy-agent-benchmark.tar.gz
+            release-assets/agent-benchmark/greppy-agent-benchmark.tar.gz.sha256
+            release-assets/SHA256SUMS
           fail_on_unmatched_files: true
