@@ -16,13 +16,18 @@ impl PerformanceCorePool {
             let pool = rayon::ThreadPoolBuilder::new()
                 .num_threads(worker_cpus.len())
                 .thread_name(move |idx| format!("{thread_prefix}-pcore-{idx}"))
-                .start_handler(move |_| {
-                    let _ = linux_set_current_affinity(&startup_cpus);
+                .start_handler(move |idx| {
+                    if let Some(cpu) = linux_cpu_for_worker(&startup_cpus, idx) {
+                        let _ = linux_set_current_affinity(cpu);
+                    }
                 })
                 .build()
                 .map_err(|e| Error::Cpu(format!("cannot create performance-core pool: {e}")))?;
             if !pool
-                .broadcast(|_| linux_set_current_affinity(&worker_cpus))
+                .broadcast(|context| {
+                    linux_cpu_for_worker(&worker_cpus, context.index())
+                        .is_some_and(linux_set_current_affinity)
+                })
                 .into_iter()
                 .all(|configured| configured)
             {
@@ -209,6 +214,17 @@ fn windows_set_current_cpu_sets(cpu_sets: &[u32]) -> bool {
     unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), cpu_sets.as_ptr(), count) != 0 }
 }
 
+#[cfg(any(target_os = "linux", test))]
+#[derive(Clone, Copy, Debug)]
+struct LinuxCpuInfo {
+    cpu: usize,
+    core_type: Option<u64>,
+    capacity: Option<u64>,
+    max_frequency: Option<u64>,
+    physical_package_id: Option<i64>,
+    core_id: Option<i64>,
+}
+
 #[cfg(target_os = "linux")]
 fn linux_performance_cpus() -> Result<Vec<usize>> {
     let mut allowed = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
@@ -229,71 +245,141 @@ fn linux_performance_cpus() -> Result<Vec<usize>> {
         ));
     }
 
-    let online = parse_linux_cpu_list(
-        &std::fs::read_to_string("/sys/devices/system/cpu/online")
-            .map_err(|e| Error::Cpu(format!("cannot read Linux online CPU list: {e}")))?,
-    )?;
-    let scores = linux_performance_scores(&online)?;
-    let max_score = scores
-        .iter()
-        .map(|(_, score)| *score)
-        .max()
-        .ok_or_else(|| Error::Cpu("Linux online CPU list is empty".into()))?;
-    let allowed = allowed
-        .into_iter()
-        .collect::<std::collections::HashSet<_>>();
-    let performance = scores
-        .into_iter()
-        .filter_map(|(cpu, score)| (allowed.contains(&cpu) && score == max_score).then_some(cpu))
-        .collect::<Vec<_>>();
-    if performance.is_empty() {
-        return Err(Error::Cpu(
-            "Linux CPU affinity excludes every detected performance core".into(),
-        ));
+    let mut discovered = std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .ok()
+        .and_then(|online| parse_linux_cpu_list(&online).ok())
+        .unwrap_or_else(|| allowed.clone());
+    for &cpu in &allowed {
+        if !discovered.contains(&cpu) {
+            discovered.push(cpu);
+        }
     }
-    Ok(performance)
+    discovered.sort_unstable();
+    discovered.dedup();
+
+    let cpus = discovered
+        .into_iter()
+        .map(linux_cpu_info)
+        .collect::<Vec<_>>();
+    select_linux_performance_cpus(&cpus, &allowed)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_performance_scores(cpus: &[usize]) -> Result<Vec<(usize, u64)>> {
-    const SCORE_PATHS: &[&str] = &[
-        "topology/core_type",
-        "cpu_capacity",
-        "cpufreq/cpuinfo_max_freq",
-    ];
-    for relative_path in SCORE_PATHS {
-        let scores = cpus
-            .iter()
-            .filter_map(|&cpu| {
-                let path = format!("/sys/devices/system/cpu/cpu{cpu}/{relative_path}");
-                std::fs::read_to_string(path)
-                    .ok()?
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .map(|score| (cpu, score))
-            })
-            .collect::<Vec<_>>();
-        if scores.len() == cpus.len() {
-            return Ok(scores);
-        }
+fn linux_cpu_info(cpu: usize) -> LinuxCpuInfo {
+    LinuxCpuInfo {
+        cpu,
+        core_type: linux_sysfs_cpu_value(cpu, "topology/core_type"),
+        capacity: linux_sysfs_cpu_value(cpu, "cpu_capacity"),
+        max_frequency: linux_sysfs_cpu_value(cpu, "cpufreq/cpuinfo_max_freq"),
+        physical_package_id: linux_sysfs_cpu_value(cpu, "topology/physical_package_id"),
+        core_id: linux_sysfs_cpu_value(cpu, "topology/core_id"),
     }
-    // Homogeneous x86 hosts commonly expose none of the heterogeneous-core
-    // sysfs attributes. Treat all allowed processors equally in that case;
-    // partial metadata is rejected because it cannot safely identify P-cores.
-    let any_classification_metadata = cpus.iter().any(|cpu| {
-        SCORE_PATHS.iter().any(|relative_path| {
-            std::path::Path::new(&format!("/sys/devices/system/cpu/cpu{cpu}/{relative_path}"))
-                .exists()
+}
+
+#[cfg(target_os = "linux")]
+fn linux_sysfs_cpu_value<T>(cpu: usize, relative_path: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    let path = format!("/sys/devices/system/cpu/cpu{cpu}/{relative_path}");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn select_linux_performance_cpus(cpus: &[LinuxCpuInfo], allowed: &[usize]) -> Result<Vec<usize>> {
+    let performance = linux_performance_candidates(cpus)?;
+    let allowed = allowed
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let mut performance = performance
+        .into_iter()
+        .filter(|cpu| allowed.contains(&cpu.cpu))
+        .collect::<Vec<_>>();
+    performance.sort_unstable_by_key(|cpu| cpu.cpu);
+
+    let mut seen_cores = std::collections::HashSet::new();
+    let mut selected = performance
+        .into_iter()
+        .filter(|cpu| match (cpu.physical_package_id, cpu.core_id) {
+            (Some(package), Some(core)) if package >= 0 && core >= 0 => {
+                seen_cores.insert((package, core))
+            }
+            _ => true,
         })
+        .map(|cpu| cpu.cpu)
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    if selected.is_empty() {
+        Err(Error::Cpu(
+            "Linux CPU affinity excludes every detected performance core".into(),
+        ))
+    } else {
+        Ok(selected)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_performance_candidates(cpus: &[LinuxCpuInfo]) -> Result<Vec<&LinuxCpuInfo>> {
+    if cpus.is_empty() {
+        return Err(Error::Cpu("Linux online CPU list is empty".into()));
+    }
+
+    let core_types = cpus
+        .iter()
+        .filter_map(|cpu| cpu.core_type)
+        .collect::<std::collections::HashSet<_>>();
+    if core_types.len() > 1 {
+        let performance_type = core_types
+            .into_iter()
+            .max()
+            .expect("multiple Linux core types cannot be empty");
+        return Ok(cpus
+            .iter()
+            .filter(|cpu| cpu.core_type == Some(performance_type))
+            .collect());
+    }
+
+    let complete_core_type = cpus.iter().all(|cpu| cpu.core_type.is_some());
+    if complete_core_type {
+        return Ok(cpus.iter().collect());
+    }
+
+    if let Some(performance) = linux_highest_scored_cpus(cpus, |cpu| cpu.capacity)
+        .or_else(|| linux_highest_scored_cpus(cpus, |cpu| cpu.max_frequency))
+    {
+        return Ok(performance);
+    }
+
+    let any_classification_metadata = cpus.iter().any(|cpu| {
+        cpu.core_type.is_some() || cpu.capacity.is_some() || cpu.max_frequency.is_some()
     });
-    if !any_classification_metadata {
-        return Ok(cpus.iter().copied().map(|cpu| (cpu, 1)).collect());
+    // Homogeneous hosts commonly expose no heterogeneous-core metadata. A
+    // single complete core type is also homogeneous from the kernel's view.
+    if complete_core_type || !any_classification_metadata {
+        return Ok(cpus.iter().collect());
     }
     Err(Error::Cpu(
         "incomplete Linux performance-core metadata; refusing to schedule inference on unclassified processors"
             .into(),
     ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_highest_scored_cpus(
+    cpus: &[LinuxCpuInfo],
+    score: fn(&LinuxCpuInfo) -> Option<u64>,
+) -> Option<Vec<&LinuxCpuInfo>> {
+    let scores = cpus.iter().filter_map(score).collect::<Vec<_>>();
+    if scores.len() != cpus.len() {
+        return None;
+    }
+    let max_score = scores.into_iter().max()?;
+    Some(
+        cpus.iter()
+            .filter(|cpu| score(cpu) == Some(max_score))
+            .collect(),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -324,13 +410,16 @@ fn parse_linux_cpu_list(value: &str) -> Result<Vec<usize>> {
     Ok(cpus)
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn linux_cpu_for_worker(cpus: &[usize], worker_index: usize) -> Option<usize> {
+    cpus.get(worker_index).copied()
+}
+
 #[cfg(target_os = "linux")]
-fn linux_set_current_affinity(cpus: &[usize]) -> bool {
+fn linux_set_current_affinity(cpu: usize) -> bool {
     let mut affinity = unsafe { std::mem::zeroed::<libc::cpu_set_t>() };
     unsafe { libc::CPU_ZERO(&mut affinity) };
-    for &cpu in cpus {
-        unsafe { libc::CPU_SET(cpu, &mut affinity) };
-    }
+    unsafe { libc::CPU_SET(cpu, &mut affinity) };
     unsafe { libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &affinity) == 0 }
 }
 
@@ -374,6 +463,113 @@ mod tests {
         assert!(parse_linux_cpu_list("").is_err());
     }
 
+    fn linux_cpu(
+        cpu: usize,
+        core_type: Option<u64>,
+        package: Option<i64>,
+        core: Option<i64>,
+    ) -> LinuxCpuInfo {
+        LinuxCpuInfo {
+            cpu,
+            core_type,
+            capacity: None,
+            max_frequency: None,
+            physical_package_id: package,
+            core_id: core,
+        }
+    }
+
+    #[test]
+    fn selects_one_logical_cpu_per_physical_performance_core() {
+        let cpus = [
+            linux_cpu(1, Some(2), Some(0), Some(0)),
+            linux_cpu(0, Some(2), Some(0), Some(0)),
+            linux_cpu(3, Some(2), Some(0), Some(1)),
+            linux_cpu(2, Some(2), Some(0), Some(1)),
+            linux_cpu(4, Some(1), Some(0), Some(2)),
+            linux_cpu(6, Some(2), Some(1), Some(0)),
+        ];
+
+        assert_eq!(
+            select_linux_performance_cpus(&cpus, &[0, 1, 2, 3, 4, 6])
+                .expect("select performance CPUs"),
+            vec![0, 2, 6]
+        );
+    }
+
+    #[test]
+    fn selection_respects_restricted_affinity_without_using_efficiency_cores() {
+        let cpus = [
+            linux_cpu(0, Some(2), Some(0), Some(0)),
+            linux_cpu(1, Some(2), Some(0), Some(0)),
+            linux_cpu(2, Some(2), Some(0), Some(1)),
+            linux_cpu(4, Some(1), Some(0), Some(2)),
+        ];
+
+        assert_eq!(
+            select_linux_performance_cpus(&cpus, &[1, 2, 4])
+                .expect("select allowed performance CPUs"),
+            vec![1, 2]
+        );
+        assert!(select_linux_performance_cpus(&cpus, &[4]).is_err());
+    }
+
+    #[test]
+    fn selection_falls_back_when_classification_and_topology_are_absent() {
+        let cpus = [
+            linux_cpu(7, None, None, None),
+            linux_cpu(2, None, None, None),
+            linux_cpu(4, None, None, None),
+        ];
+
+        assert_eq!(
+            select_linux_performance_cpus(&cpus, &[7, 2]).expect("select allowed CPUs"),
+            vec![2, 7]
+        );
+    }
+
+    #[test]
+    fn selection_uses_capacity_when_core_type_is_absent() {
+        let mut cpus = [
+            linux_cpu(0, None, Some(0), Some(0)),
+            linux_cpu(1, None, Some(0), Some(0)),
+            linux_cpu(2, None, Some(0), Some(1)),
+        ];
+        cpus[0].capacity = Some(1024);
+        cpus[1].capacity = Some(1024);
+        cpus[2].capacity = Some(512);
+
+        assert_eq!(
+            select_linux_performance_cpus(&cpus, &[0, 1, 2]).expect("select capacity-ranked CPUs"),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn homogeneous_complete_core_type_ignores_frequency_variation() {
+        let mut cpus = [
+            linux_cpu(0, Some(2), Some(0), Some(0)),
+            linux_cpu(1, Some(2), Some(0), Some(1)),
+        ];
+        cpus[0].max_frequency = Some(4_800_000);
+        cpus[1].max_frequency = Some(4_700_000);
+
+        assert_eq!(
+            select_linux_performance_cpus(&cpus, &[0, 1]).expect("select homogeneous CPUs"),
+            vec![0, 1]
+        );
+    }
+
+    #[test]
+    fn maps_each_worker_to_one_distinct_cpu() {
+        let cpus = [3, 7, 11];
+
+        assert_eq!(linux_cpu_for_worker(&cpus, 0), Some(3));
+        assert_eq!(linux_cpu_for_worker(&cpus, 1), Some(7));
+        assert_eq!(linux_cpu_for_worker(&cpus, 2), Some(11));
+        assert_eq!(linux_cpu_for_worker(&cpus, 3), None);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn pool_workers_are_restricted_to_performance_cpus() {
@@ -400,7 +596,12 @@ mod tests {
                 .filter(|&cpu| unsafe { libc::CPU_ISSET(cpu, &affinity) })
                 .collect::<std::collections::HashSet<_>>()
         });
-        assert!(affinities.iter().all(|affinity| affinity == &expected));
+        assert!(affinities.iter().all(|affinity| affinity.len() == 1));
+        let assigned = affinities
+            .into_iter()
+            .flat_map(|affinity| affinity.into_iter())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(assigned, expected);
     }
 
     #[cfg(target_os = "macos")]
