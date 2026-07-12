@@ -220,6 +220,8 @@ struct LayerWorkspace {
 }
 
 struct ShapeCacheEntry {
+    capacity_batch: usize,
+    capacity_seq_len: usize,
     batch: usize,
     input_seq_len: usize,
     seq_len: usize,
@@ -407,16 +409,21 @@ impl MetalEmbeddingModel {
             .shape_cache
             .lock()
             .map_err(|_| Error::InvalidGguf("Metal shape cache mutex poisoned".into()))?;
-        let entry_idx = match cache.iter().position(|entry| {
-            entry.batch == batch && entry.input_seq_len == input_seq_len && entry.seq_len == seq_len
-        }) {
-            Some(idx) => idx,
-            None => {
-                cache.push(ShapeCacheEntry::new(self, batch, input_seq_len, seq_len)?);
-                cache.len() - 1
-            }
-        };
-        let shape = &mut cache[entry_idx];
+        if cache.is_empty() {
+            cache.push(ShapeCacheEntry::new(self, batch, input_seq_len, seq_len)?);
+        } else if cache[0].capacity_batch < batch || cache[0].capacity_seq_len < seq_len {
+            let capacity_batch = cache[0].capacity_batch.max(batch);
+            let capacity_seq_len = cache[0].capacity_seq_len.max(seq_len);
+            cache.clear();
+            cache.push(ShapeCacheEntry::new(
+                self,
+                capacity_batch,
+                capacity_seq_len,
+                capacity_seq_len,
+            )?);
+        }
+        let shape = &mut cache[0];
+        shape.set_active_shape(batch, input_seq_len, seq_len)?;
         shape.upload_inputs(
             token_ids,
             attention_mask,
@@ -1937,6 +1944,34 @@ impl MetalEmbeddingModel {
         };
         (pad_bytes, blk_bytes, tmp_bytes)
     }
+
+    fn flash_scratch_capacity_sizes(
+        &self,
+        capacity_batch: usize,
+        capacity_seq_len: usize,
+        mask_present: bool,
+        elem_size: usize,
+        allow_vec: bool,
+    ) -> (usize, usize, usize) {
+        // Flash scratch is not monotonic in sequence length: an exactly aligned
+        // sequence needs no padding while the preceding length can need MiBs.
+        // Keep one bounded workspace, but size its scratch for every shape that
+        // may reuse that workspace.
+        (1..=capacity_seq_len).fold((0, 0, 0), |maxima, seq_len| {
+            let current = self.flash_scratch_sizes(
+                capacity_batch,
+                seq_len,
+                mask_present,
+                elem_size,
+                allow_vec,
+            );
+            (
+                maxima.0.max(current.0),
+                maxima.1.max(current.1),
+                maxima.2.max(current.2),
+            )
+        })
+    }
 }
 
 impl ForwardWorkspace {
@@ -1963,7 +1998,7 @@ impl LayerWorkspace {
         let kv = rows * model.cfg.head_dim * model.cfg.num_key_value_heads;
         let intermediate = rows * model.cfg.intermediate_size;
         let (flash_pad, flash_blk, flash_tmp) =
-            model.flash_scratch_sizes(batch, seq_len, true, 4, false);
+            model.flash_scratch_capacity_sizes(batch, seq_len, true, 4, false);
         Ok(Self {
             xs_norm: model.new_f32_private(hidden)?,
             q: model.new_f32_private(hidden)?,
@@ -2005,6 +2040,8 @@ impl ShapeCacheEntry {
             pos_buf.write(0, &pos);
         }
         Ok(Self {
+            capacity_batch: batch,
+            capacity_seq_len: seq_len,
             batch,
             input_seq_len,
             seq_len,
@@ -2025,12 +2062,36 @@ impl ShapeCacheEntry {
         })
     }
 
+    fn set_active_shape(
+        &mut self,
+        batch: usize,
+        input_seq_len: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        if batch > self.capacity_batch || seq_len > self.capacity_seq_len || input_seq_len > seq_len
+        {
+            return Err(Error::InvalidGguf(format!(
+                "Metal active embedding shape {batch}x{input_seq_len}/{seq_len} exceeds cached capacity {}x{}",
+                self.capacity_batch, self.capacity_seq_len
+            )));
+        }
+        if self.batch != batch || self.input_seq_len != input_seq_len || self.seq_len != seq_len {
+            self.mask_cache_valid = false;
+        }
+        self.batch = batch;
+        self.input_seq_len = input_seq_len;
+        self.seq_len = seq_len;
+        Ok(())
+    }
+
     fn upload_inputs(
         &mut self,
         token_ids: &[Vec<u32>],
         attention_mask: &[Vec<u32>],
         sliding_window: usize,
     ) {
+        let active_rows = self.batch * self.seq_len;
+        let active_mask_elems = active_rows * self.seq_len;
         for batch_idx in 0..self.batch {
             let ids_row = &token_ids[batch_idx];
             let mask_row = &attention_mask[batch_idx];
@@ -2048,30 +2109,34 @@ impl ShapeCacheEntry {
         }
 
         unsafe {
-            self.ids_buf.write(0, &self.flat_ids);
-            self.mask_u32_buf.write(0, &self.flat_mask);
-            if !self.mask_cache_valid || self.flat_mask != self.last_mask {
+            self.ids_buf.write(0, &self.flat_ids[..active_rows]);
+            self.mask_u32_buf.write(0, &self.flat_mask[..active_rows]);
+            if !self.mask_cache_valid
+                || self.flat_mask[..active_rows] != self.last_mask[..active_rows]
+            {
                 self.full_mask_present = fill_attention_mask_bits(
-                    &self.flat_mask,
+                    &self.flat_mask[..active_rows],
                     self.batch,
                     self.seq_len,
                     None,
-                    &mut self.full_mask_bits,
+                    &mut self.full_mask_bits[..active_mask_elems],
                 );
                 self.sliding_mask_present = fill_attention_mask_bits(
-                    &self.flat_mask,
+                    &self.flat_mask[..active_rows],
                     self.batch,
                     self.seq_len,
                     Some(sliding_window),
-                    &mut self.sliding_mask_bits,
+                    &mut self.sliding_mask_bits[..active_mask_elems],
                 );
                 if self.full_mask_present {
-                    self.full_mask_buf.write(0, &self.full_mask_bits);
+                    self.full_mask_buf
+                        .write(0, &self.full_mask_bits[..active_mask_elems]);
                 }
                 if self.sliding_mask_present {
-                    self.sliding_mask_buf.write(0, &self.sliding_mask_bits);
+                    self.sliding_mask_buf
+                        .write(0, &self.sliding_mask_bits[..active_mask_elems]);
                 }
-                self.last_mask.copy_from_slice(&self.flat_mask);
+                self.last_mask[..active_rows].copy_from_slice(&self.flat_mask[..active_rows]);
                 self.mask_cache_valid = true;
             }
         }

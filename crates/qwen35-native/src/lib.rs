@@ -25,8 +25,8 @@ pub mod metal;
 pub use inventory::{Qwen35Inventory, QWEN35_08B_EXPECTED};
 pub use model::{DevicePreference, LoadOptions, Qwen35Summarizer};
 pub use postprocess::{
-    postprocess_brief_output, postprocess_triage_output, TriageVerdict, MAX_BRIEF_BULLET_CHARS,
-    MAX_TRIAGE_REASON_CHARS,
+    postprocess_brief_output, postprocess_triage_output, TriageVerdict, BRIEF_FILTER_VERSION,
+    MAX_BRIEF_BULLET_CHARS, MAX_TRIAGE_REASON_CHARS,
 };
 pub use prompt::{brief_prompt, triage_prompt, PROMPT_VERSION, TRIAGE_PROMPT_VERSION};
 pub use sampler::{

@@ -859,6 +859,7 @@ impl MetalQwen35Model {
         self.read_f32(&workspace.hidden, tokens.len() * self.inventory.hidden_size)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn forward_tokens_logits_hidden(
         &self,
         tokens: &[u32],

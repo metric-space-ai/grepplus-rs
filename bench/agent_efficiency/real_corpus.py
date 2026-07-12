@@ -153,7 +153,7 @@ HERE = Path(__file__).resolve().parent
 _SEED_DIR = os.environ.get("GREPPY_BENCH_SEED_DIR")
 ROOT = HERE / "realcorpus"
 REPO_ROOT = HERE.parents[1]
-CBM = pathlib.Path(os.environ.get("GREPPY_REFERENCE_ORACLE", "reference-oracle"))
+CBM = Path(os.environ.get("GREPPY_REFERENCE_ORACLE", "reference-oracle"))
 MANIFEST = ROOT / "MANIFEST.json"
 CANDIDATES = ROOT / "candidates.json"
 

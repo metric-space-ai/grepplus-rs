@@ -1078,8 +1078,8 @@ fn peek_root_arg(argv: &[std::ffi::OsString]) -> Option<String> {
 /// Decide whether `argv` (including argv[0]) is a bare `grep`
 /// passthrough rather than a recognised structured subcommand.
 ///
-/// We skip a leading global `--root <val>` / `--root=<val>` and any
-/// `--help`/`-h`/`--version`/`-V` (which clap handles), then look at the
+/// We skip a leading global `--root <val>` / `--root=<val>` and top-level
+/// help/version requests (which clap handles), then look at the
 /// first remaining token:
 /// * If it equals a recognised subcommand name → NOT a passthrough.
 /// * Otherwise (a flag like `-R`, a pattern, or nothing) → passthrough.
@@ -1087,8 +1087,10 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
     let mut i = 1; // skip argv[0]
     while i < argv.len() {
         let tok = &argv[i];
-        // Help/version requests must reach clap so it prints them.
-        if tok == "--help" || tok == "-h" || tok == "--version" || tok == "-V" {
+        // Long help/version requests are Greppy commands. Short `-h` is also
+        // grep's no-filename flag, so it is Greppy help only when used alone.
+        if tok == "--help" || tok == "--version" || tok == "-V" || (tok == "-h" && argv.len() == 2)
+        {
             return false;
         }
         // Global `--root` may precede the subcommand; skip it (and its
@@ -1968,11 +1970,10 @@ const CODE_NAV_LIMIT: usize = 6;
 const EXPAND_NAV_EVIDENCE_LIMIT: usize = 80;
 const EXPAND_CALLSITE_LINES_PER_NODE: usize = 8;
 
-/// Freshness budget for explicit machine-readable navigation queries. The
-/// grep passthrough hotpath uses 200 ms; explicit graph JSON can afford a little
-/// more so it can prove freshness on normal debug/test builds instead of
-/// reporting false `budget exceeded` staleness.
-const NAV_FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_000);
+/// Freshness budget for explicit navigation queries. Ordinary grep passthrough
+/// never reaches this path. Large repositories under I/O pressure need enough
+/// time to prove freshness without turning a transient timeout into EX_TEMPFAIL.
+const NAV_FRESHNESS_BUDGET: std::time::Duration = std::time::Duration::from_millis(5_000);
 
 /// Default result row cap for code-search surfaces. Text output should stay
 /// grep-like and compact; JSON reports exact totals plus omitted rows.
@@ -3661,6 +3662,13 @@ fn serving_stale() -> bool {
     false
 }
 
+fn freshness_state_can_trigger_reindex(state: &str) -> bool {
+    !matches!(
+        state,
+        "cold" | "config_error" | "failed" | "unknown" | "refreshing"
+    )
+}
+
 fn freshness_serve_decision(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -3720,7 +3728,10 @@ fn freshness_serve_decision_with_policy(
         .get("state")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    if matches!(state, "cold" | "config_error" | "failed") {
+    // Unknown is not evidence of drift. In particular, a budget-exhausted
+    // inventory walk must not launch a full reindex that can replace the DB
+    // containing expand packs created by the preceding query.
+    if !freshness_state_can_trigger_reindex(state) {
         return FreshnessServe::Refuse(freshness);
     }
     let scope_or_version_drift = freshness
@@ -4211,17 +4222,11 @@ fn ensure_nav_json_mode(code: bool, json: bool) -> Result<()> {
 /// span exceeds `cap` lines it is truncated and a
 /// `… (truncated, N more lines)` marker is appended.
 ///
-/// IMPORTANT (the token-saving design): the store records a node's
-/// `start_line`/`end_line` as the **declaration line** of the symbol — in
-/// the current indexer `end_line == start_line` for every definition,
-/// because the captured tree-sitter node is the name identifier, not the
-/// full item. Reading only that single line would defeat the whole point
-/// of `context`/`--code` (the agent would still have to open the file to
-/// see the body). So we extend the span from `start_line` to the end of
-/// the definition by balancing `{}`/`()`/`[]` delimiters across the
-/// source (see [`definition_end_idx`]). When a future indexer stores a
-/// real multi-line `end_line`, we honour the larger of the stored end and
-/// the computed end, so this stays correct either way.
+/// Current indexes store the full tree-sitter definition range. Older indexes
+/// may contain only the declaration line (`end_line == start_line`); only for
+/// those legacy rows do we recover a body end with [`definition_end_idx`]. A
+/// multi-line parser span is authoritative. Extending it heuristically can
+/// cross into the next Python method or another adjacent definition.
 fn read_span(
     root: &std::path::Path,
     file_path: &str,
@@ -4264,15 +4269,13 @@ fn read_span_with_meta(
         // skip gracefully rather than emit nothing useful.
         return None;
     }
-    // Stored (declaration) end, clamped to the file. For the current
-    // indexer this equals start_idx.
+    // Stored parser end, clamped to the file.
     let stored_end_idx = std::cmp::min(end_line as usize, all.len()) - 1;
-    // Computed body end: balance delimiters forward from the declaration
-    // line so we capture the whole `{ … }` (or `;`-terminated) item.
-    let computed_end_idx = definition_end_idx(&all, start_idx);
-    // Honour whichever end is further (forward-compatible with a future
-    // indexer that records true multi-line spans).
-    let end_idx_inclusive = std::cmp::max(stored_end_idx, computed_end_idx);
+    let end_idx_inclusive = if stored_end_idx == start_idx {
+        definition_end_idx(&all, start_idx)
+    } else {
+        stored_end_idx
+    };
     let total_lines = end_idx_inclusive - start_idx + 1;
     let actual_end_line = start_line + total_lines as i64 - 1;
     let shown = std::cmp::min(total_lines, cap);
@@ -9789,11 +9792,14 @@ fn semantic_signature_from_span(code: &str) -> Option<String> {
     let start = code[leading_offset..]
         .char_indices()
         .find_map(|(idx, ch)| (!ch.is_whitespace()).then_some(leading_offset + idx))?;
+    let declaration = &code[start..];
+    let python_declaration =
+        declaration.starts_with("def ") || declaration.starts_with("async def ");
     let bytes = code.as_bytes();
     let mut round_depth = 0usize;
     let mut square_depth = 0usize;
     let mut angle_depth = 0usize;
-    let mut in_string = false;
+    let mut string_delimiter = None;
     let mut escaped = false;
     let mut line_comment = false;
     let mut block_comment_depth = 0usize;
@@ -9821,13 +9827,13 @@ fn semantic_signature_from_span(code: &str) -> Option<String> {
             }
             continue;
         }
-        if in_string {
+        if let Some(delimiter) = string_delimiter {
             if escaped {
                 escaped = false;
             } else if byte == b'\\' {
                 escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
+            } else if byte == delimiter {
+                string_delimiter = None;
             }
             idx += 1;
             continue;
@@ -9843,7 +9849,8 @@ fn semantic_signature_from_span(code: &str) -> Option<String> {
             continue;
         }
         match byte {
-            b'"' => in_string = true,
+            b'"' => string_delimiter = Some(byte),
+            b'\'' if python_declaration => string_delimiter = Some(byte),
             b'(' => round_depth += 1,
             b')' => round_depth = round_depth.saturating_sub(1),
             b'[' => square_depth += 1,
@@ -9851,6 +9858,14 @@ fn semantic_signature_from_span(code: &str) -> Option<String> {
             b'<' => angle_depth += 1,
             b'>' if angle_depth > 0 => angle_depth -= 1,
             b'{' if round_depth == 0 && square_depth == 0 && angle_depth == 0 => {
+                end = idx;
+                break;
+            }
+            b':' if python_declaration
+                && round_depth == 0
+                && square_depth == 0
+                && angle_depth == 0 =>
+            {
                 end = idx;
                 break;
             }
@@ -11626,10 +11641,11 @@ fn load_qwen35_summarizer(cfg: &QwenSummaryConfig) -> Result<LoadedQwen35Summari
 
 fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
     format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}:{}",
         cfg.model_id,
         greppy_qwen35_native::PROMPT_VERSION,
         greppy_qwen35_native::TRIAGE_PROMPT_VERSION,
+        greppy_qwen35_native::BRIEF_FILTER_VERSION,
         inference_device_identity(&cfg.device),
         model_file_digest(&cfg.gguf).unwrap_or_else(|_| "unknown".into()),
         model_file_digest(&cfg.tokenizer).unwrap_or_else(|_| "unknown".into())
@@ -13442,6 +13458,14 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn transient_freshness_states_never_trigger_reindex() {
+        for state in ["cold", "config_error", "failed", "unknown", "refreshing"] {
+            assert!(!freshness_state_can_trigger_reindex(state), "state={state}");
+        }
+        assert!(freshness_state_can_trigger_reindex("drift"));
+    }
+
     struct EnvRestore {
         vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
     }
@@ -14216,6 +14240,39 @@ mod tests {
     }
 
     #[test]
+    fn read_span_trusts_multiline_parser_end_for_python() {
+        let root = test_tempdir("python-parser-span");
+        std::fs::write(
+            root.join("module.py"),
+            "def first() -> int:\n    return 1\n\ndef second() -> dict[str, int]:\n    return {\"value\": 2}\n",
+        )
+        .unwrap();
+
+        let span = read_span_with_meta(&root, "module.py", 1, 2, 60, false).unwrap();
+
+        assert_eq!(span.end_line, 2);
+        assert_eq!(span.text, "def first() -> int:\n    return 1\n");
+        assert!(!span.text.contains("second"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_span_recovers_legacy_single_line_rust_definition() {
+        let root = test_tempdir("legacy-rust-span");
+        std::fs::write(
+            root.join("lib.rs"),
+            "fn value() -> i32 {\n    1\n}\n\nfn next() {}\n",
+        )
+        .unwrap();
+
+        let span = read_span_with_meta(&root, "lib.rs", 1, 1, 60, false).unwrap();
+
+        assert_eq!(span.end_line, 3);
+        assert_eq!(span.text, "fn value() -> i32 {\n    1\n}\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn semantic_signature_from_span_preserves_multiline_source_signature() {
         let code = r#"pub unsafe extern "C" fn transform<'a, T: Clone>(
     value: &'a T,
@@ -14232,6 +14289,26 @@ where
         assert_eq!(
             signature,
             "pub unsafe extern \"C\" fn transform<'a, T: Clone>( value: &'a T, ) -> Option<&'a T> where T: Send,"
+        );
+    }
+
+    #[test]
+    fn semantic_signature_from_span_stops_at_python_body_colon() {
+        let source = "async def load_value(\n    key: str,\n    *,\n    default: dict[str, int] | None = None,\n) -> dict[str, int]:\n    value = await fetch(key)\n    return value or default or {}\n";
+        assert_eq!(
+            semantic_signature_from_span(source).as_deref(),
+            Some(
+                "async def load_value( key: str, *, default: dict[str, int] | None = None, ) -> dict[str, int]"
+            )
+        );
+    }
+
+    #[test]
+    fn semantic_signature_from_span_keeps_python_forward_annotation_colon() {
+        let source = "def load_value(key: str) -> 'dict[str: int]':\n    return {}\n";
+        assert_eq!(
+            semantic_signature_from_span(source).as_deref(),
+            Some("def load_value(key: str) -> 'dict[str: int]'")
         );
     }
 
@@ -14783,6 +14860,14 @@ where
         // Help/version must reach clap.
         assert!(!is_grep_passthrough(&mk(&["greppy", "--help"])));
         assert!(!is_grep_passthrough(&mk(&["greppy", "--version"])));
+        assert!(!is_grep_passthrough(&mk(&["greppy", "-h"])));
+        assert!(is_grep_passthrough(&mk(&[
+            "greppy",
+            "-h",
+            "needle",
+            "first.rs",
+            "second.rs"
+        ])));
         // Global --root before a structured subcommand is skipped.
         assert!(!is_grep_passthrough(&mk(&[
             "greppy",

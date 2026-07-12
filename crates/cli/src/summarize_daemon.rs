@@ -143,6 +143,7 @@ fn request_brief(
 ) -> RequestOutcome<Vec<String>> {
     let request = serde_json::json!({
         "pv": greppy_qwen35_native::PROMPT_VERSION,
+        "fv": greppy_qwen35_native::BRIEF_FILTER_VERSION,
         "mk": model_key,
         "mode": "brief",
         "source": source,
@@ -186,6 +187,7 @@ fn request_triage(
         .collect::<Vec<_>>();
     let request = serde_json::json!({
         "pv": greppy_qwen35_native::TRIAGE_PROMPT_VERSION,
+        "fv": greppy_qwen35_native::BRIEF_FILTER_VERSION,
         "mk": model_key,
         "mode": "triage",
         "query": query,
@@ -306,6 +308,11 @@ fn validate(raw: &str, model_key: &str) -> Result<(), serde_json::Value> {
     };
     if request.get("pv").and_then(serde_json::Value::as_str) != Some(expected_prompt) {
         return Err(serde_json::json!({"error": "prompt-version mismatch"}));
+    }
+    if request.get("fv").and_then(serde_json::Value::as_str)
+        != Some(greppy_qwen35_native::BRIEF_FILTER_VERSION)
+    {
+        return Err(serde_json::json!({"error": "filter-version mismatch"}));
     }
     if request.get("mk").and_then(serde_json::Value::as_str) != Some(model_key) {
         return Err(serde_json::json!({"error": "model-key mismatch"}));
@@ -452,6 +459,18 @@ mod tests {
         assert_eq!(
             validate(&wrong.to_string(), "model-key").unwrap_err()["error"],
             "prompt-version mismatch"
+        );
+
+        let stale_filter = serde_json::json!({
+            "pv": greppy_qwen35_native::PROMPT_VERSION,
+            "fv": "old-filter",
+            "mk": "model-key",
+            "mode": "brief",
+            "source": "fn f() {}",
+        });
+        assert_eq!(
+            validate(&stale_filter.to_string(), "model-key").unwrap_err()["error"],
+            "filter-version mismatch"
         );
     }
 

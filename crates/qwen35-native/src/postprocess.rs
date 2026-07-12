@@ -1,5 +1,6 @@
 pub const MAX_BRIEF_BULLET_CHARS: usize = 140;
 pub const MAX_TRIAGE_REASON_CHARS: usize = 48;
+pub const BRIEF_FILTER_VERSION: &str = "qwen35-brief-filter-v2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TriageVerdict {

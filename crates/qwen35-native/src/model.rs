@@ -305,6 +305,19 @@ fn brief_bullet_passes_quality(
     {
         return false;
     }
+    if bullet_symbol_identifiers(bullet)
+        .into_iter()
+        .any(|ident| !source_supports_term(&ident, source_terms, source_identifiers))
+    {
+        return false;
+    }
+    if bullet
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter_map(risky_claim_root)
+        .any(|term| !source_supports_term(term, source_terms, source_identifiers))
+    {
+        return false;
+    }
     // Relatedness check, relaxed for the finetuned model: it paraphrases, so
     // exact >=4-char term overlap rejects good briefs on short functions.
     // Accept when any >=3-char bullet term matches a source term or occurs as
@@ -326,6 +339,77 @@ fn brief_bullet_passes_quality(
                 || source_terms.iter().any(|s| s.contains(&t))
                 || idents_lower.iter().any(|i| i.contains(&t))
         })
+}
+
+fn bullet_symbol_identifiers(text: &str) -> Vec<String> {
+    text.split(|c: char| !(c == '_' || c == '$' || c.is_ascii_alphanumeric()))
+        .enumerate()
+        .filter_map(|(index, raw)| {
+            let token = raw.trim_matches(['_', '$']);
+            if token.len() < 2 {
+                return None;
+            }
+            let mut chars = token.chars();
+            let first = chars.next()?;
+            let rest = chars.collect::<String>();
+            let internal_upper = rest.chars().any(|c| c.is_ascii_uppercase());
+            let all_upper = token.len() >= 2 && token.chars().all(|c| c.is_ascii_uppercase());
+            let code_shaped = raw.contains('_')
+                || raw.contains('$')
+                || internal_upper
+                || (index > 0
+                    && first.is_ascii_uppercase()
+                    && !rest.is_empty()
+                    && rest.chars().all(|c| c.is_ascii_lowercase()))
+                || all_upper;
+            code_shaped.then(|| token.to_ascii_lowercase())
+        })
+        .collect()
+}
+
+fn risky_claim_root(term: &str) -> Option<&'static str> {
+    match term.to_ascii_lowercase().as_str() {
+        "atomic" => Some("atomic"),
+        "database" | "databases" => Some("database"),
+        "decode" | "decodes" | "decoded" | "decoding" => Some("decode"),
+        "empty" => Some("empty"),
+        "file" | "files" => Some("file"),
+        "flag" | "flags" => Some("flag"),
+        "log" | "logs" | "logged" | "logging" => Some("log"),
+        "parse" | "parses" | "parsed" | "parsing" => Some("parse"),
+        "persist" | "persists" | "persisted" | "persisting" => Some("persist"),
+        "positive" => Some("positive"),
+        "property" | "properties" => Some("property"),
+        "reject" | "rejects" | "rejected" | "rejecting" => Some("reject"),
+        "send" | "sends" | "sent" | "sending" => Some("send"),
+        "serialize" | "serializes" | "serialized" | "serializing" => Some("serialize"),
+        "signal" | "signals" => Some("signal"),
+        "store" | "stores" | "stored" | "storing" => Some("store"),
+        "string" | "strings" => Some("string"),
+        "throw" | "throws" | "thrown" | "throwing" => Some("throw"),
+        "traceback" | "tracebacks" => Some("traceback"),
+        "unbox" | "unboxed" | "unboxing" => Some("unbox"),
+        "validate" | "validates" | "validated" | "validating" => Some("validate"),
+        "wasi" => Some("wasi"),
+        "windows" => Some("windows"),
+        "wrapper" | "wrappers" => Some("wrapper"),
+        _ => None,
+    }
+}
+
+fn source_supports_term(
+    term: &str,
+    source_terms: &std::collections::BTreeSet<String>,
+    source_identifiers: &std::collections::BTreeSet<String>,
+) -> bool {
+    let term = term.to_ascii_lowercase();
+    let prefix_len = term.len().min(4);
+    let prefix = &term[..prefix_len];
+    source_terms.contains(&term)
+        || source_terms.iter().any(|source| source.contains(prefix))
+        || source_identifiers
+            .iter()
+            .any(|source| source.contains(prefix))
 }
 
 fn query_overlaps_span(query: &str, span_loc: &str, span_code: &str) -> bool {
@@ -382,6 +466,42 @@ mod triage_guard_tests {
             &bullets,
             "fn add_user(users: &mut Vec<String>, name: String) { users.push(name); }"
         ));
+    }
+
+    #[test]
+    fn brief_quality_rejects_invented_camelcase_and_acronym_symbols() {
+        for bullet in [
+            "Creates a ZoodMiniISODateTime for the given params.",
+            "Creates a template literal from $ZodParts.",
+            "Evaluates a cubic BCP spline.",
+        ] {
+            assert!(!brief_bullets_pass_quality(
+                &[bullet.to_string()],
+                "fn bcspline(x: f32) -> f32 { ZodMiniISODateTime::new(x) }"
+            ));
+        }
+    }
+
+    #[test]
+    fn brief_quality_keeps_symbols_that_exist_in_source() {
+        assert!(brief_bullets_pass_quality(
+            &["Creates a ZodMiniISODateTime from ISO params.".to_string()],
+            "fn datetime(params: ISOParams) -> ZodMiniISODateTime { ZodMiniISODateTime::new(params) }"
+        ));
+    }
+
+    #[test]
+    fn brief_quality_rejects_unsupported_risky_claims() {
+        for bullet in [
+            "Computes a file size hint from the iterator.",
+            "Stores the decoded JSON value.",
+            "Sends a drop signal to the caller.",
+        ] {
+            assert!(!brief_bullets_pass_quality(
+                &[bullet.to_string()],
+                "fn value() -> usize { iterator.size_hint().0 }"
+            ));
+        }
     }
 
     #[test]
