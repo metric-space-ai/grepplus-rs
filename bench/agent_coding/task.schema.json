@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://grepplus.dev/schemas/agent-coding-tasks-v1.json",
+  "title": "Greppy paired agent coding benchmark tasks",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "tasks"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "greppy.agent-coding-tasks.v1"
+    },
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/task"
+      }
+    }
+  },
+  "$defs": {
+    "task": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "repository",
+        "mutation_patch",
+        "user_task",
+        "test_command",
+        "timeout_seconds"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$"
+        },
+        "repository": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "url",
+            "commit"
+          ],
+          "properties": {
+            "url": {
+              "type": "string",
+              "minLength": 1,
+              "description": "Credential-free HTTPS/SSH URL or local path."
+            },
+            "commit": {
+              "type": "string",
+              "pattern": "^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$",
+              "description": "Full pinned Git commit object id; symbolic refs are forbidden."
+            }
+          }
+        },
+        "mutation_patch": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A git-apply-compatible patch that makes the independent test fail."
+        },
+        "user_task": {
+          "type": "string",
+          "minLength": 1
+        },
+        "test_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "description": "Exact argv; no shell interpolation is performed."
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 7200,
+          "description": "Per clone, agent, warmup, test, and Git operation timeout."
+        }
+      }
+    }
+  }
+}

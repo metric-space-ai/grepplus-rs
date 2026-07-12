@@ -33,7 +33,7 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 <img src="docs/assets/greppy-demo.gif" width="100%" alt="Split screen: the same coding agent answers one who-calls question, left with plain grep, right with greppy."/>
 
-<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. greppy resolves the callers in a single `greppy who-calls` call instead of a grep-and-read spiral: **2.3× faster, 14 → 5 tool calls, ~9× fewer input tokens**. Counters are live from the recorded run.</sub>
+<sub>The **same** coding agent (MiniMax-M3, driven by [Pi Code](https://pi.dev)) answers one *who-calls* question on a real repo — **left with plain `grep`, right with `greppy`**. This recording illustrates the workflow only; the pre-registered, publishable release evidence is described below.</sub>
 
 ---
 
@@ -56,9 +56,10 @@ automatic and can be made explicit with `--device cpu|metal|cuda[:INDEX]` or
 
 The first structured query builds its local workspace index. There is no
 current prebuilt production package while `v0.2.0` is completing the release
-gates listed below; the older model-bearing preview packages were withdrawn.
-Build the current `main` revision from source for evaluation. Do not rename or
-install the binary as `grep`.
+gates listed below. Older archives remain available only as explicitly marked
+legacy previews and are not the current production distribution. Build the
+current `main` revision from source for evaluation. Do not rename or install the
+binary as `grep`.
 
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
