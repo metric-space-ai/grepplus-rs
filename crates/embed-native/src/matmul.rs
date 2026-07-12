@@ -1753,14 +1753,83 @@ fn matmul_q4kx8_batched_avxvnni_prepared(
     input: &PreparedQ8KRows,
     matrix_rows: usize,
 ) -> Vec<f32> {
-    matmul_x8_batched_avxvnni_prepared(
-        rhs,
-        input,
-        matrix_rows,
-        dot8x4_q4k_q8k_avxvnni,
-        dot8x8_q4k_q8k_avxvnni,
-        dot8x16_q4k_q8k_avxvnni,
-    )
+    debug_assert_eq!(matrix_rows % 8, 0);
+    let row_blocks = input.cols / QK_K;
+    let mut out = vec![0.0f32; input.rows * matrix_rows];
+    // A task owns complete input rows, so kernel results can land in final layout.
+    out.par_chunks_mut(16 * matrix_rows)
+        .enumerate()
+        .for_each(|(input_chunk, chunk)| {
+            let first_input_tile = input_chunk * 4;
+            let input_rows = chunk.len() / matrix_rows;
+            for group in 0..matrix_rows / 8 {
+                let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
+                let mut local_row = 0;
+                let mut input_tile = first_input_tile;
+
+                if input_rows >= 16 {
+                    let values = unsafe {
+                        dot8x16_q4k_q8k_avxvnni(
+                            weights,
+                            [
+                                &input.tiles_x4[input_tile],
+                                &input.tiles_x4[input_tile + 1],
+                                &input.tiles_x4[input_tile + 2],
+                                &input.tiles_x4[input_tile + 3],
+                            ],
+                        )
+                    };
+                    for tile in 0..4 {
+                        for input_lane in 0..4 {
+                            let dst = (tile * 4 + input_lane) * matrix_rows + group * 8;
+                            chunk[dst..dst + 8].copy_from_slice(&values[tile][input_lane]);
+                        }
+                    }
+                    continue;
+                }
+
+                if input_rows - local_row >= 8 {
+                    let values = unsafe {
+                        dot8x8_q4k_q8k_avxvnni(
+                            weights,
+                            [&input.tiles_x4[input_tile], &input.tiles_x4[input_tile + 1]],
+                        )
+                    };
+                    for tile in 0..2 {
+                        for input_lane in 0..4 {
+                            let dst = (local_row + tile * 4 + input_lane) * matrix_rows + group * 8;
+                            chunk[dst..dst + 8].copy_from_slice(&values[tile][input_lane]);
+                        }
+                    }
+                    local_row += 8;
+                    input_tile += 2;
+                }
+
+                if input_rows - local_row >= 4 {
+                    let values =
+                        unsafe { dot8x4_q4k_q8k_avxvnni(weights, &input.tiles_x4[input_tile]) };
+                    for input_lane in 0..4 {
+                        let dst = (local_row + input_lane) * matrix_rows + group * 8;
+                        chunk[dst..dst + 8].copy_from_slice(&values[input_lane]);
+                    }
+                    local_row += 4;
+                }
+
+                if local_row < input_rows {
+                    let (tail, tail_rows) = input
+                        .tail_x4
+                        .as_ref()
+                        .expect("ragged prepared Q8_K rows must have a tail tile");
+                    debug_assert_eq!(*tail_rows, input_rows - local_row);
+                    let values = unsafe { dot8x4_q4k_q8k_avxvnni(weights, tail) };
+                    for input_lane in 0..*tail_rows {
+                        let dst = (local_row + input_lane) * matrix_rows + group * 8;
+                        chunk[dst..dst + 8].copy_from_slice(&values[input_lane]);
+                    }
+                }
+            }
+        });
+    out
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3860,6 +3929,10 @@ fn dot_q4k_q8k(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
         }
     }
 
+    dot_q4k_q8k_scalar(xs, ys)
+}
+
+fn dot_q4k_q8k_scalar(xs: &[BlockQ4K], ys: &[BlockQ8K]) -> f32 {
     const KMASK1: u32 = 0x3f3f3f3f;
     const KMASK2: u32 = 0x0f0f0f0f;
     const KMASK3: u32 = 0x03030303;
@@ -6658,6 +6731,64 @@ mod arm_tests {
 mod x86_tests {
     use super::*;
 
+    fn deterministic_q4k_weights(matrix_rows: usize, row_blocks: usize) -> Vec<BlockQ4K> {
+        (0..matrix_rows)
+            .flat_map(|row| {
+                (0..row_blocks).map(move |block| {
+                    let mut scales = [0u8; 12];
+                    let mut qs = [0u8; QK_K / 2];
+                    for (idx, value) in scales.iter_mut().enumerate() {
+                        *value = ((row * 37 + block * 19 + idx * 13 + 7) & 0xff) as u8;
+                    }
+                    for (idx, value) in qs.iter_mut().enumerate() {
+                        *value = ((row * 29 + block * 41 + idx * 17 + 11) & 0xff) as u8;
+                    }
+                    BlockQ4K {
+                        d: f16::from_f32(0.006 + row as f32 * 0.00003),
+                        dmin: f16::from_f32(0.002 + block as f32 * 0.0002),
+                        scales,
+                        qs,
+                    }
+                })
+            })
+            .collect()
+    }
+
+    fn deterministic_prepared_q8k_rows(rows: usize, row_blocks: usize) -> PreparedQ8KRows {
+        let cols = row_blocks * QK_K;
+        let values = (0..rows * cols)
+            .map(|idx| {
+                let row = idx / cols;
+                let col = idx % cols;
+                ((row * 43 + col * 37 + (row ^ col) * 3) % 509) as f32 / 83.0 - 3.0
+            })
+            .collect::<Vec<_>>();
+        let activations = values
+            .chunks_exact(cols)
+            .map(quantize_q8k)
+            .collect::<Vec<_>>();
+        let tiles_x4 = activations[..rows & !3]
+            .chunks_exact(4)
+            .map(|tile| pack_q8kx4_rows([&tile[0], &tile[1], &tile[2], &tile[3]]))
+            .collect::<Vec<_>>();
+        let tail = &activations[rows & !3..];
+        let tail_x4 = tail.last().map(|last| {
+            (
+                pack_q8kx4_rows(std::array::from_fn(|lane| {
+                    tail.get(lane).unwrap_or(last).as_slice()
+                })),
+                tail.len(),
+            )
+        });
+        PreparedQ8KRows {
+            rows,
+            cols,
+            activations,
+            tiles_x4,
+            tail_x4,
+        }
+    }
+
     #[test]
     fn cpu_simd_override_selects_requested_supported_kernel() {
         let requested = std::env::var("EMBED_NATIVE_CPU_SIMD").unwrap_or_default();
@@ -6669,6 +6800,69 @@ mod x86_tests {
         };
         if let Some(expected) = expected {
             assert_eq!(cpu_simd_backend(), expected);
+        }
+    }
+
+    #[test]
+    fn q4kx8_prepared_input_major_matches_transposed_schedule_and_scalar() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("avxvnni") {
+            return;
+        }
+
+        let cases = [
+            (1, 1, 8),
+            (3, 2, 16),
+            (4, 3, 24),
+            (5, 1, 40),
+            (7, 2, 8),
+            (8, 3, 24),
+            (9, 1, 16),
+            (12, 2, 40),
+            (15, 3, 8),
+            (16, 1, 24),
+            (17, 2, 40),
+            (20, 3, 8),
+            (24, 1, 24),
+            (28, 2, 40),
+            (31, 3, 8),
+            (32, 1, 24),
+            (33, 2, 40),
+        ];
+        for (input_rows, row_blocks, matrix_rows) in cases {
+            let weights = deterministic_q4k_weights(matrix_rows, row_blocks);
+            let packed_weights = pack_to_q4kx8_vnni(&weights, matrix_rows);
+            let input = deterministic_prepared_q8k_rows(input_rows, row_blocks);
+            let actual =
+                matmul_q4kx8_batched_avxvnni_prepared(&packed_weights, &input, matrix_rows);
+            let transposed_schedule = matmul_x8_batched_avxvnni_prepared(
+                &packed_weights,
+                &input,
+                matrix_rows,
+                dot8x4_q4k_q8k_avxvnni,
+                dot8x8_q4k_q8k_avxvnni,
+                dot8x16_q4k_q8k_avxvnni,
+            );
+
+            for input_row in 0..input_rows {
+                for output_row in 0..matrix_rows {
+                    let idx = input_row * matrix_rows + output_row;
+                    assert_eq!(
+                        actual[idx].to_bits(),
+                        transposed_schedule[idx].to_bits(),
+                        "schedule mismatch input_rows={input_rows} row_blocks={row_blocks} matrix_rows={matrix_rows} input={input_row} output={output_row}",
+                    );
+                    let expected = dot_q4k_q8k_scalar(
+                        &weights[output_row * row_blocks..(output_row + 1) * row_blocks],
+                        &input.activations[input_row],
+                    );
+                    let tolerance = 2.0e-4 * expected.abs().max(1.0);
+                    assert!(
+                        (actual[idx] - expected).abs() <= tolerance,
+                        "scalar mismatch input_rows={input_rows} row_blocks={row_blocks} matrix_rows={matrix_rows} input={input_row} output={output_row}: actual={} expected={expected} tolerance={tolerance}",
+                        actual[idx],
+                    );
+                }
+            }
         }
     }
 
