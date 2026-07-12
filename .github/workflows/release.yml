@@ -164,6 +164,26 @@ jobs:
           Write-Host "tag=$want binary=$got"
           if ($want -ne $got) { Write-Error "version mismatch"; exit 1 }
 
+      - name: Notarize and staple macOS signed binary
+        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        shell: bash
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          test -n "$APPLE_ID" && test -n "$APPLE_TEAM_ID" && test -n "$APPLE_APP_PASSWORD"
+          notary_zip="$RUNNER_TEMP/greppy-notary.zip"
+          ditto -c -k --keepParent target/release/greppy "$notary_zip"
+          xcrun notarytool submit "$notary_zip" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --wait
+          xcrun stapler staple target/release/greppy
+          xcrun stapler validate target/release/greppy
+          spctl --assess --type execute --verbose=4 target/release/greppy
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -184,19 +204,6 @@ jobs:
           Copy-Item README.md,LICENSE,THIRD_PARTY.md,SECURITY.md,SUPPORT.md,CHANGELOG.md dist/
           Copy-Item licenses dist/licenses -Recurse
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
-
-      - name: Notarize macOS signed binary
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
-        shell: bash
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: |
-          test -n "$APPLE_ID" && test -n "$APPLE_TEAM_ID" && test -n "$APPLE_APP_PASSWORD"
-          notary_zip="$RUNNER_TEMP/greppy-notary.zip"
-          ditto -c -k --keepParent target/release/greppy "$notary_zip"
-          xcrun notarytool submit "$notary_zip" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
 
       - name: Smoke-test packaged artifact (Unix)
         if: runner.os != 'Windows'
@@ -307,6 +314,8 @@ jobs:
           test ! -e unpack/grep
           if [[ "$GITHUB_REF" == refs/tags/* && "${{ runner.os }}" = macOS ]]; then
             codesign --verify --strict --verbose=2 unpack/greppy
+            xcrun stapler validate unpack/greppy
+            spctl --assess --type execute --verbose=4 unpack/greppy
           fi
           bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
           if [ "${{ runner.os }}" = Linux ]; then
