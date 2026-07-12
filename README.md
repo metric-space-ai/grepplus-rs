@@ -156,6 +156,11 @@ are private to the current user (`0700` on Unix), and cache objects are managed
 only after ownership, type, and path validation. Set `GREPPY_STORE_DIR` to place
 the data on an encrypted or ephemeral volume.
 
+Full source bodies are not duplicated into SQLite. Exact code search reads the
+current worktree through real `grep` where available, with an in-binary literal
+fallback on clean Windows hosts. Freshness checks guard indexed graph spans and
+embeddings.
+
 ```bash
 greppy cache status --json       # inspect paths, sizes, locks, TTL and quota
 greppy cache gc --dry-run        # preview TTL/LRU reclamation

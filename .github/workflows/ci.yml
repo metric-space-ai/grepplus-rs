@@ -3,9 +3,8 @@ name: CI
 # Track C — CI + release-build battle/soak validation.
 #
 # Gates every push and pull request on:
-#   * cargo build  --workspace
-#   * cargo test   --workspace
-#   * cargo clippy --workspace --all-targets -- -D warnings
+#   * fast non-inference build/test/clippy with SHA-verified sentinel assets
+#   * default product links with both real models on ELF, Mach-O, and PE/COFF
 #   * cargo fmt    --check
 #   * a --release build + the black-box battle suite
 #     (bash bench/battle/run_battle.sh)
@@ -36,6 +35,8 @@ jobs:
   check:
     name: build / test / lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -44,8 +45,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          lfs: true
+
+      # This job intentionally does not fetch Git LFS. Its debug-only,
+      # compile-guarded sentinel assets keep black-box CLI process startup
+      # small; `real-assets-link` verifies the actual product payloads.
 
       # rust-toolchain.toml pins the channel + components; this action
       # reads it and installs exactly that toolchain. No `toolchain:`
@@ -63,9 +66,9 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          key: ${{ runner.os }}-cargo-fast-assets-v1-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-
+            ${{ runner.os }}-cargo-fast-assets-v1-
 
       # The battle scripts shell out to sqlite3 (PRAGMA integrity_check,
       # node/edge dumps). macOS runners ship it; Ubuntu needs the CLI.
@@ -79,8 +82,8 @@ jobs:
           cargo --version
           cargo clippy --version
 
-      - name: cargo build --workspace
-        run: cargo build --workspace
+      - name: cargo build --workspace (fast test assets)
+        run: cargo build --workspace --features greppy/ci-test-assets
 
       # Several crates' unit tests mutate process-global env via set_var
       # (GREPPY_* config knobs). set_var is process-wide across the test
@@ -89,16 +92,7 @@ jobs:
       # failures. Run unit tests single-threaded for deterministic results;
       # real concurrency is covered separately by bench/battle/concurrency.sh.
       - name: cargo test --workspace (single-threaded — env-var test isolation)
-        run: cargo test --workspace -- --test-threads=1
-
-      - name: Apple Silicon Metal inference gates
-        if: runner.os == 'macOS'
-        env:
-          EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
-        run: |
-          cargo test -p greppy-embed-native --features metal --lib -- --test-threads=1
-          cargo test -p greppy-embed-native --features metal --test metal_kernel_parity
-          cargo test -p greppy-embed-native --features metal --test metal_forward_parity
+        run: cargo test --workspace --features greppy/ci-test-assets -- --test-threads=1
 
       - name: x86 portable CPU dispatch gate
         if: runner.os == 'Linux'
@@ -113,7 +107,7 @@ jobs:
       # this specific batch as advisory. Tracked for a follow-up cleanup pass.
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: >
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --workspace --all-targets --features greppy/ci-test-assets -- -D warnings
           -A clippy::unnecessary_lazy_evaluations
           -A clippy::too_many_arguments
           -A clippy::needless_range_loop
@@ -135,22 +129,54 @@ jobs:
         run: python3 -m unittest bench/agent_efficiency/test_grade_answers.py
 
       # Black-box battle suite against the freshly built debug binaries. The
-      # release workflow separately builds and tests the exact packages that
-      # ship, avoiding a second multi-hundred-MiB model link on every push.
+      # real-assets-link and the release workflow separately build the actual
+      # embedded payload, avoiding repeated 827 MB process images here.
       - name: battle suite (bench/battle/run_battle.sh)
         env:
           # Point the harness at the debug binaries we just built.
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
         run: bash bench/battle/run_battle.sh
 
-  windows-cpu:
-    name: Windows CPU + named-pipe daemons
-    runs-on: windows-latest
+  # Link the actual 827 MB embedded payload on every Tier-1 object format.
+  # This is deliberately separate from fast tests: release/default builds
+  # never use sentinels, and a real link catches missing LFS assets plus
+  # PE/COFF, Mach-O, or ELF size/link regressions.
+  real-assets-link:
+    name: real embedded assets (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - name: Checkout
+      - name: Checkout with Git LFS models
         uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build default product binary with real assets
+        run: cargo build -p greppy --bin greppy
+
+      - name: Apple Silicon Metal inference gates
+        if: runner.os == 'macOS'
+        env:
+          EMBED_NATIVE_GGUF: ${{ github.workspace }}/crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf
+        run: |
+          cargo test -p greppy-embed-native --features metal --lib -- --test-threads=1
+          cargo test -p greppy-embed-native --features metal --test metal_kernel_parity
+          cargo test -p greppy-embed-native --features metal --test metal_forward_parity
+
+  windows-cpu:
+    name: Windows CPU + named-pipe daemons
+    runs-on: windows-latest
+    env:
+      GIT_LFS_SKIP_SMUDGE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -165,14 +191,14 @@ jobs:
             ~/.cargo/registry/cache/
             ~/.cargo/git/db/
             target/
-          key: windows-cpu-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: windows-cpu-
+          key: windows-cpu-fast-assets-v1-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: windows-cpu-fast-assets-v1-
 
-      - name: Build Windows CPU binary
-        run: cargo build --workspace
+      - name: Build Windows CPU test binary
+        run: cargo build --workspace --features greppy/ci-test-assets
 
       - name: Test Windows locks and daemon transport
-        run: cargo test -p greppy-core -p greppy-embed-native -p greppy --lib -- --test-threads=1
+        run: cargo test -p greppy-core -p greppy-embed-native -p greppy --lib --features greppy/ci-test-assets -- --test-threads=1
 
       - name: Verify doctor registry
         shell: pwsh

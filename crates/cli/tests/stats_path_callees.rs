@@ -89,7 +89,8 @@ fn run_with_env(
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .current_dir(cwd)
-        .env("GREPPY_STORE_DIR", store_dir);
+        .env("GREPPY_STORE_DIR", store_dir)
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1");
     for (key, value) in envs {
         cmd.env(key, value);
     }

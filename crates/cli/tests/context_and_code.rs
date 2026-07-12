@@ -95,6 +95,7 @@ fn run_with_env(
     run_command(args, cwd, store_dir, envs, true)
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
 fn run_with_inference(args: &[&str], cwd: &Path, store_dir: &Path) -> (i32, String, String) {
     run_command(
         args,
@@ -147,6 +148,7 @@ fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
     (repo, store)
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
 fn index_fixture_with_inference(tag: &str) -> (PathBuf, PathBuf) {
     let (repo, store) = make_repo(tag);
     let (code, out, err) = run_with_inference(&["index", "."], &repo, &store);
@@ -257,6 +259,7 @@ fn context_exact_module_header_uses_display_name() {
 // must bypass the exact-name fast path. With vectors available, that now
 // returns lean semantic locators/digest output rather than the old full-body
 // lexical union.
+#[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn context_multiword_query_returns_semantic_locators() {
     let (repo, store) = index_fixture_with_inference("ctx-rich-research");

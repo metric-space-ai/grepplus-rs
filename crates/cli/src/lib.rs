@@ -6,7 +6,7 @@
 //! - `search-graph` — graph search.
 //! - `who-calls` / `callees` / `find-usages` / `impact` / `brief` — graph navigation.
 //! - `semantic-search` (`semantic`) — meaning-based code search.
-//! - `search-code` / `search-symbols` — indexed code and symbol search.
+//! - `search-code` / `search-symbols` — current-source and indexed symbol search.
 //! - `install`      — agent installer      (out of scope)
 //! - `uninstall`    — agent uninstaller    (out of scope)
 //! - `update`       — explains the signed-release installation policy
@@ -14,6 +14,9 @@
 //!
 //! Out-of-scope lifecycle subcommands print a structured error and exit
 //! with a documented non-zero code (EX_UNAVAILABLE = 69).
+
+#[cfg(all(feature = "ci-test-assets", not(debug_assertions)))]
+compile_error!("ci-test-assets is forbidden outside debug/test builds");
 
 use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
@@ -59,15 +62,20 @@ const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 const ENV_TEST_INDEX_FAILPOINT_READY: &str = "GREPPY_TEST_INDEX_FAILPOINT_READY";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT_HOLD_MS: &str = "GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS";
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, not(feature = "ci-test-assets")))]
 const ENV_TEST_SKIP_INFERENCE: &str = "GREPPY_TEST_SKIP_INFERENCE";
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "ci-test-assets")]
+fn test_inference_skipped() -> bool {
+    true
+}
+
+#[cfg(all(debug_assertions, not(feature = "ci-test-assets")))]
 fn test_inference_skipped() -> bool {
     std::env::var_os(ENV_TEST_SKIP_INFERENCE).is_some()
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(all(not(debug_assertions), not(feature = "ci-test-assets")))]
 fn test_inference_skipped() -> bool {
     false
 }
@@ -2660,14 +2668,14 @@ fn incomplete_provider_json(
         .list_provider_states(project)?
         .into_iter()
         .filter(greppy_store::ProviderState::is_incomplete)
+        .filter(|p| !is_noncode_provider(&p.status, &p.language))
         .map(|p| {
+            // Agent responses only need to know which language is partial.
+            // Per-edge-class and per-file diagnostics belong to doctor and
+            // diagnostics JSON; repeating them on every query wastes tokens.
             serde_json::json!({
                 "language": p.language,
                 "status": p.status,
-                "unsupported_edge_classes": p.unsupported_edge_classes,
-                "files_seen": p.files_seen,
-                "files_indexed": p.files_indexed,
-                "files_failed": p.files_failed,
             })
         })
         .collect())
@@ -2680,15 +2688,15 @@ fn incomplete_provider_json(
 /// and whose `language` reads `"file extension .<ext>"` / `"no file
 /// extension"`. Such a provider has NO call/usage edges to miss, so counting it
 /// as an "incomplete provider" wrongly told agents the code call-graph was
-/// partial — the r061 28-round reconciliation blowup. `impact` therefore
-/// filters these out and reports only real code providers.
+/// partial — the r061 28-round reconciliation blowup. Agent-facing provider
+/// metadata therefore reports only real code providers.
 fn is_noncode_provider(status: &str, language: &str) -> bool {
     status == "unsupported"
         || language.starts_with("file extension .")
         || language == "no file extension"
 }
 
-/// Incomplete providers for `impact`, excluding non-code snapshot/fixture
+/// Compact incomplete-provider metadata, excluding non-code snapshot/fixture
 /// providers (see [`is_noncode_provider`]) so the reported
 /// `incomplete_provider_count` / `provider_complete` reflects only real code
 /// callers, not `.stderr` / `.snap` files.
@@ -2696,22 +2704,7 @@ fn code_incomplete_provider_json(
     store: &greppy_store::Store,
     project: &str,
 ) -> Result<Vec<serde_json::Value>> {
-    Ok(store
-        .list_provider_states(project)?
-        .into_iter()
-        .filter(greppy_store::ProviderState::is_incomplete)
-        .filter(|p| !is_noncode_provider(&p.status, &p.language))
-        .map(|p| {
-            serde_json::json!({
-                "language": p.language,
-                "status": p.status,
-                "unsupported_edge_classes": p.unsupported_edge_classes,
-                "files_seen": p.files_seen,
-                "files_indexed": p.files_indexed,
-                "files_failed": p.files_failed,
-            })
-        })
-        .collect())
+    incomplete_provider_json(store, project)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6161,11 +6154,11 @@ fn cache_path_bytes(path: &std::path::Path) -> u64 {
 /// Content-search fallback for who-calls / find-usages when the call/usage
 /// GRAPH has no edges for `symbol` (e.g. a weakly-connected single-file symbol,
 /// a macro, or a name that is not a graph node at all). Runs the indexed
-/// content search on the name so the agent still gets `file:line` hits from ONE
+/// live source search on the name so the agent still gets `file:line` hits from ONE
 /// greppy call — instead of finding nothing and falling back to a grep loop.
 /// This was the token-efficiency benchmark's only case where greppy lost to
 /// grep (`find-usages GraphIndex`): now greppy is never worse than grep for a
-/// name query, since it always returns indexed matches.
+/// name query, since it always returns source matches.
 fn content_fallback(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -6173,7 +6166,13 @@ fn content_fallback(
     kind: &str,
 ) -> Result<i32> {
     let project = project_for(root)?;
-    let hits = greppy_search::search_code(store, &project, symbol, 50)?;
+    let mut hits = greppy_search::search_code(store, &project, symbol, 50)?;
+    if hits.is_empty() {
+        hits = live_grep_code_hits(symbol, &resolve_root(root)?)?
+            .into_iter()
+            .take(50)
+            .collect();
+    }
     if hits.is_empty() {
         // Truly nothing — not a graph symbol and no indexed text either.
         // Offer the closest indexed names so the dead end carries a next
@@ -6183,7 +6182,7 @@ fn content_fallback(
             .similar_node_names(&project, needle, 5)
             .unwrap_or_default();
         if similar.is_empty() {
-            println!("(symbol not found: `{symbol}`; no {kind} and no indexed content matches)");
+            println!("(symbol not found: `{symbol}`; no {kind} and no source matches)");
         } else {
             println!(
                 "(symbol not found: `{symbol}`; no {kind}. Similar indexed names: {} — retry with one of these)",
@@ -6193,7 +6192,7 @@ fn content_fallback(
         return Ok(1);
     }
     println!(
-        "(`{symbol}` is not a graph symbol; {} indexed content match(es) (would-be {kind}):)",
+        "(`{symbol}` is not a graph symbol; {} source match(es) (would-be {kind}):)",
         hits.len()
     );
     for h in &hits {
@@ -6405,7 +6404,7 @@ fn dispatch_who_calls(
 /// resolver deliberately does not link dynamic `obj.method()` dispatch, so
 /// on dynamic code `who-calls` under-reports and the agent re-derives the
 /// rest with its own grep rounds. This prints ONE honestly-labelled section
-/// of TEXTUAL call-site candidates from the indexed content FTS — the graph
+/// of TEXTUAL call-site candidates from the authoritative worktree — the graph
 /// section above stays the authority; this section only saves the agent its
 /// own text search.
 ///
@@ -6440,10 +6439,25 @@ fn print_textual_call_candidates(
             def_locs.insert(format!("{}:{}", n.file_path, n.start_line));
         }
     }
-    let hits = match greppy_search::search_code(store, project, name, 80) {
+    let mut hits = match greppy_search::search_code(store, project, name, 80) {
         Ok(h) => h,
         Err(_) => return Ok(()), // candidates are best-effort, never an error
     };
+    if hits.is_empty() {
+        let Some(root_path) = store
+            .get_project(project)
+            .ok()
+            .flatten()
+            .map(|project| std::path::PathBuf::from(project.root_path))
+        else {
+            return Ok(());
+        };
+        hits = live_grep_code_hits(name, &root_path)
+            .unwrap_or_default()
+            .into_iter()
+            .take(80)
+            .collect();
+    }
     let mut out: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     for h in hits {
@@ -7710,7 +7724,36 @@ fn dispatch_search_code(
     }
     let freshness = decision.freshness().clone();
 
-    let hits = greppy_search::search_code(&store, &project, q, SEARCH_CODE_LIMIT)?;
+    let indexed_hits = greppy_search::search_code(&store, &project, q, SEARCH_CODE_LIMIT)?;
+    if indexed_hits.is_empty() {
+        // The product index intentionally does not duplicate full source text
+        // into SQLite. Use the authoritative live worktree for both text and
+        // JSON, preserving exact totals and avoiding an empty JSON-only path.
+        let live_hits = live_grep_code_hits(q, &resolve_root(root)?)?;
+        let shown_hits = live_hits
+            .iter()
+            .take(SEARCH_CODE_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+        if json {
+            search_code_json(
+                &store,
+                q,
+                &project,
+                "ok",
+                Some(&freshness),
+                live_hits.len(),
+                &shown_hits,
+            )?;
+        } else if shown_hits.is_empty() {
+            println!("(no matches)");
+        } else {
+            for hit in &shown_hits {
+                println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
+            }
+        }
+        return Ok(if live_hits.is_empty() { 1 } else { 0 });
+    }
     if json {
         let total_exact = store.count_file_content_matches(&project, q)?;
         search_code_json(
@@ -7720,20 +7763,11 @@ fn dispatch_search_code(
             "ok",
             Some(&freshness),
             total_exact,
-            &hits,
+            &indexed_hits,
         )?;
         return Ok(if total_exact == 0 { 1 } else { 0 });
     }
-    if hits.is_empty() {
-        // Content-FTS empty → either no match, or the index was built with
-        // content indexing off (GREPPY_NO_CONTENT / a fast index). Either
-        // way, fall back to a LIVE grep over the repo — `search_code` finds
-        // text patterns via grep, then enriches with the graph. greppy is a
-        // grep wrapper, so this is free and keeps `search-code` working
-        // without eager content-FTS.
-        return live_grep_search_code(q, root, false, None);
-    }
-    for h in &hits {
+    for h in &indexed_hits {
         println!("{}  {}", h.location, clamp_snippet(&h.snippet));
     }
     Ok(0)
@@ -8760,9 +8794,10 @@ fn dispatch_plus(
     let mut vector_candidate_limit = None;
     let mut vector_hits_added = None;
 
-    // Literal/full-text signal: exact indexed code lines remain first-class
-    // grep-like results.
-    let code_hits = greppy_search::search_code_ranked(&store, &project, q, fetch)?;
+    // Literal/full-text signal: exact current-worktree lines remain
+    // first-class grep-like results even though source bodies are not copied
+    // into SQLite by default.
+    let code_hits = source_code_hits_ranked(&store, &project, q, &root_path, fetch)?;
     let exact_literal_text = !code && !code_hits.is_empty() && plus_is_literal_intent(q, &q_tokens);
     let vector_control_intent = if vectors {
         plus_vector_control_intent(q, &q_tokens, exact_literal_text)
@@ -8804,7 +8839,7 @@ fn dispatch_plus(
             if !seen_tokens.insert(tok.clone()) {
                 continue;
             }
-            for h in greppy_search::search_code_ranked(&store, &project, &tok, fetch / 2)? {
+            for h in source_code_hits_ranked(&store, &project, &tok, &root_path, fetch / 2)? {
                 let Some((file, line_str)) = h.location.rsplit_once(':') else {
                     continue;
                 };
@@ -9087,27 +9122,7 @@ fn live_grep_search_code(
     index_freshness: Option<&serde_json::Value>,
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
-    let out = std::process::Command::new("grep")
-        .args(["-rnI", "--", query])
-        .arg(".")
-        .current_dir(&root_path)
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) => {
-            return Err(Error::io(
-                "spawn grep for search-code fallback".to_string(),
-                e,
-            ))
-        }
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut hits = Vec::new();
-    for line in text.lines() {
-        if let Some(hit) = parse_grep_code_hit(line) {
-            hits.push(hit);
-        }
-    }
+    let hits = live_grep_code_hits(query, &root_path)?;
     let shown = hits.len().min(SEARCH_CODE_LIMIT);
     if json {
         let rows = hits[..shown]
@@ -9145,6 +9160,46 @@ fn live_grep_search_code(
         }
     }
     Ok(if hits.is_empty() { 1 } else { 0 })
+}
+
+fn live_grep_code_hits(
+    query: &str,
+    root_path: &std::path::Path,
+) -> Result<Vec<greppy_search::CodeHit>> {
+    let overrides = discover_overrides_from_env()?;
+    let entries = greppy_discover::walk_with_policy_and_overrides(
+        root_path,
+        &greppy_discover::SkipPolicy::walk_default(),
+        &overrides,
+    )?;
+    let paths = entries
+        .into_iter()
+        .map(|entry| entry.rel_path)
+        .collect::<Vec<_>>();
+    live_grep_search_code_paths(query, root_path, &paths)
+}
+
+fn source_code_hits_ranked(
+    store: &greppy_store::Store,
+    project: &str,
+    query: &str,
+    root_path: &std::path::Path,
+    limit: usize,
+) -> Result<Vec<greppy_search::RankedCodeHit>> {
+    let indexed = greppy_search::search_code_ranked(store, project, query, limit)?;
+    if !indexed.is_empty() {
+        return Ok(indexed);
+    }
+    Ok(live_grep_code_hits(query, root_path)?
+        .into_iter()
+        .take(limit)
+        .map(|hit| greppy_search::RankedCodeHit {
+            location: hit.location,
+            snippet: hit.snippet,
+            rank: 0.0,
+            relevance: 1.0,
+        })
+        .collect())
 }
 
 fn git_changed_files(root_path: &std::path::Path) -> Result<Vec<String>> {
@@ -9396,13 +9451,63 @@ fn live_grep_search_code_paths(
     let mut hits = Vec::new();
     for chunk in paths.chunks(128) {
         let out = std::process::Command::new("grep")
-            .args(["-HnI", "--", query])
+            .args(["-HnIF", "--", query])
             .args(chunk)
             .current_dir(root_path)
-            .output()
-            .map_err(|e| Error::io("spawn grep for search-code --changed", e))?;
+            .output();
+        let out = match out {
+            Ok(out) => out,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return internal_literal_search_code_paths(query, root_path, paths);
+            }
+            Err(error) => {
+                return Err(Error::io("spawn grep for search-code source scan", error));
+            }
+        };
+        if !out.status.success() && out.status.code() != Some(1) {
+            return Err(Error::Invalid(format!(
+                "grep source scan failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         hits.extend(text.lines().filter_map(parse_grep_code_hit));
+    }
+    Ok(hits)
+}
+
+/// Portable fallback for clean Windows hosts where the product extensions
+/// must work even though no system grep is installed. Ordinary grep-compatible
+/// invocations still require and byte-forward the real grep process; only the
+/// `search-code` extension uses this conservative literal fallback.
+fn internal_literal_search_code_paths(
+    query: &str,
+    root_path: &std::path::Path,
+    paths: &[String],
+) -> Result<Vec<greppy_search::CodeHit>> {
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut hits = Vec::new();
+    for path in paths {
+        let absolute = root_path.join(path);
+        let bytes = match std::fs::read(&absolute) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(Error::io(format!("read source file {path}"), error)),
+        };
+        if greppy_discover::is_binary_bytes(&bytes) {
+            continue;
+        }
+        for (index, line) in String::from_utf8_lossy(&bytes).lines().enumerate() {
+            if line.contains(query) {
+                hits.push(greppy_search::CodeHit {
+                    location: format!("{path}:{}", index + 1),
+                    snippet: line.to_string(),
+                    rank: 0.0,
+                });
+            }
+        }
     }
     Ok(hits)
 }
@@ -9426,12 +9531,32 @@ fn grep_staged_git_blobs(
             continue;
         }
 
-        let mut child = std::process::Command::new("grep")
-            .args(["-nI", "--", query])
+        let mut child = match std::process::Command::new("grep")
+            .args(["-nIF", "--", query])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| Error::io("spawn grep for search-code --staged", e))?;
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if greppy_discover::is_binary_bytes(&blob.stdout) {
+                    continue;
+                }
+                for (index, line) in String::from_utf8_lossy(&blob.stdout).lines().enumerate() {
+                    if line.contains(query) {
+                        hits.push(greppy_search::CodeHit {
+                            location: format!("{path}:{}", index + 1),
+                            snippet: line.to_string(),
+                            rank: 0.0,
+                        });
+                    }
+                }
+                continue;
+            }
+            Err(error) => {
+                return Err(Error::io("spawn grep for search-code --staged", error));
+            }
+        };
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
                 .write_all(&blob.stdout)
@@ -9440,6 +9565,12 @@ fn grep_staged_git_blobs(
         let out = child
             .wait_with_output()
             .map_err(|e| Error::io("wait for grep in search-code --staged", e))?;
+        if !out.status.success() && out.status.code() != Some(1) {
+            return Err(Error::Invalid(format!(
+                "grep staged-source scan failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
         let text = String::from_utf8_lossy(&out.stdout);
         for line in text.lines() {
             if let Some((line_no, content)) = line.split_once(':') {
@@ -10388,7 +10519,14 @@ fn dispatch_context(
     //    catches symbols a query only matches inside a body (where neither
     //    the symbol-name FTS nor the semantic signals fired).
     if defs.len() < k {
-        for h in greppy_search::search_code(&store, &project, q, fetch)? {
+        let mut code_hits = greppy_search::search_code(&store, &project, q, fetch)?;
+        if code_hits.is_empty() {
+            code_hits = live_grep_code_hits(q, &span_root)?
+                .into_iter()
+                .take(fetch)
+                .collect();
+        }
+        for h in code_hits {
             if defs.len() >= k {
                 break;
             }
@@ -13434,12 +13572,12 @@ mod tests {
     fn version_bump_same_scope_is_scope_stable() {
         // Pure version bump, default scope on both sides → self-heal.
         assert!(version_drift_is_scope_stable(&drift_json(
-            "indexer version/scope changed (was greppy-indexer-v1, expected greppy-indexer-v3)"
+            "indexer version/scope changed (was greppy-indexer-v1, expected greppy-indexer-v4)"
         )));
         // Same non-default scope, version bumped → self-heal.
         assert!(version_drift_is_scope_stable(&drift_json(
             "indexer version/scope changed (was greppy-indexer-v1;discover_scope=I8:src/*.rs, \
-             expected greppy-indexer-v3;discover_scope=I8:src/*.rs)"
+             expected greppy-indexer-v4;discover_scope=I8:src/*.rs)"
         )));
     }
 
@@ -13448,12 +13586,12 @@ mod tests {
         // Different discover scope → NOT stable → refuse (fail-closed).
         assert!(!version_drift_is_scope_stable(&drift_json(
             "indexer version/scope changed (was greppy-indexer-v2;discover_scope=I8:src/*.rs, \
-             expected greppy-indexer-v3)"
+             expected greppy-indexer-v4)"
         )));
         // Version bump AND scope change → scope change dominates → refuse.
         assert!(!version_drift_is_scope_stable(&drift_json(
             "indexer version/scope changed (was greppy-indexer-v1, \
-             expected greppy-indexer-v3;discover_scope=I8:src/*.rs)"
+             expected greppy-indexer-v4;discover_scope=I8:src/*.rs)"
         )));
     }
 
@@ -14835,6 +14973,60 @@ where
     }
 
     #[test]
+    fn internal_source_search_is_literal_line_numbered_and_binary_safe() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "greppy-internal-source-search-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("source.rs"), "first\nneedle.*literal\nneedle\n").unwrap();
+        std::fs::write(root.join("binary.bin"), b"needle\0hidden\n").unwrap();
+
+        let hits = internal_literal_search_code_paths(
+            "needle.*literal",
+            &root,
+            &["source.rs".into(), "binary.bin".into()],
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].location, "source.rs:2");
+        assert_eq!(hits[0].snippet, "needle.*literal");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn live_source_search_respects_gitignore_inventory() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "greppy-live-source-ignore-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("ignored")).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "const MARKER: &str = \"scope_marker\";\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("ignored/generated.rs"), "scope_marker\n").unwrap();
+
+        let hits = live_grep_code_hits("scope_marker", &root).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].location, "src/lib.rs:1");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn is_grep_passthrough_distinguishes_subcommands_from_grep_args() {
         use std::ffi::OsString;
         let mk = |xs: &[&str]| -> Vec<OsString> { xs.iter().map(|s| OsString::from(*s)).collect() };
@@ -15289,9 +15481,9 @@ where
         assert_eq!(shown_all, total);
     }
 
-    /// LEVER 2b: `impact`'s incomplete-provider count/`provider_complete`
-    /// exclude non-code snapshot/fixture providers (.stderr/.snap/.xml/no-ext),
-    /// so the number matches real code callers — the r061 reconciliation fix.
+    /// Agent-facing incomplete-provider metadata excludes non-code
+    /// snapshot/fixture rows (.stderr/.snap/.xml/no-ext), so counts describe
+    /// real code providers instead of repository artifacts.
     #[test]
     fn impact_total_excludes_noncode_files() {
         let mut store = store_with_defs(&[("Method", "src/A.java", "A", "m")]);
@@ -15314,8 +15506,9 @@ where
         seed_provider(&mut store, "file extension .xml", "unsupported", &["calls"]);
         seed_provider(&mut store, "no file extension", "unsupported", &["calls"]);
 
-        // The unfiltered set counts ALL six (what the OTHER commands see).
-        assert_eq!(incomplete_provider_json(&store, "p").unwrap().len(), 6);
+        // Every agent-facing command now drops non-code noise; full details
+        // remain available through doctor/diagnostics.
+        assert_eq!(incomplete_provider_json(&store, "p").unwrap().len(), 2);
 
         // impact's code-only set drops the four non-code providers.
         let code = code_incomplete_provider_json(&store, "p").unwrap();

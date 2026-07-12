@@ -331,9 +331,10 @@ fn enclosing_function_qname(source: &[u8], node: Node<'_>, file_path: &str) -> O
 
 /// Resolve the owner type of an unambiguous Rust receiver call when the AST
 /// carries enough local type evidence. `self.method()` inherits the enclosing
-/// impl owner; `value.method()` is accepted only when `value` is an explicitly
-/// typed function parameter. Inferred locals deliberately return `None` so the
-/// graph resolver cannot attach the call to an unrelated same-named method.
+/// impl owner; named receivers are accepted for explicitly typed parameters or
+/// locals and for locals initialized directly from a struct literal. Other
+/// inferred values deliberately return `None` so the graph resolver cannot
+/// attach the call to an unrelated same-named method.
 fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str> {
     let field = callee.parent()?;
     if field.kind() != "field_expression" {
@@ -351,6 +352,11 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
     let mut ancestor = field.parent();
     while let Some(node) = ancestor {
         if node.kind() == "function_item" {
+            let (local_found, local_owner) =
+                rust_local_binding_owner(source, callee, receiver_text);
+            if local_found {
+                return local_owner;
+            }
             let parameters = node.child_by_field_name("parameters")?;
             for index in 0..parameters.named_child_count() {
                 let Some(parameter) = parameters.named_child(index) else {
@@ -375,6 +381,64 @@ fn rust_receiver_owner<'a>(source: &'a [u8], callee: Node<'_>) -> Option<&'a str
         ancestor = node.parent();
     }
     None
+}
+
+/// Return the nearest preceding local binding whose owner is explicit in the
+/// syntax. A type annotation is authoritative; a struct literal also names its
+/// constructed type directly. Calls and arbitrary expressions are excluded
+/// because their return type would require semantic type inference.
+fn rust_local_binding_owner<'a>(
+    source: &'a [u8],
+    callee: Node<'_>,
+    receiver_name: &str,
+) -> (bool, Option<&'a str>) {
+    let mut ancestor = callee.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "function_item" {
+            break;
+        }
+        if node.kind() == "block" {
+            // Only direct statements in this lexical block are visible here.
+            // Searching descendants would incorrectly pick bindings from an
+            // already-closed sibling block.
+            for index in (0..node.named_child_count()).rev() {
+                let Some(binding) = node.named_child(index) else {
+                    continue;
+                };
+                if binding.end_byte() > callee.start_byte() || binding.kind() != "let_declaration" {
+                    continue;
+                }
+                let matches_receiver = binding
+                    .child_by_field_name("pattern")
+                    .is_some_and(|pattern| node_text(source, pattern).trim() == receiver_name);
+                if !matches_receiver {
+                    continue;
+                }
+                if let Some(ty) = binding.child_by_field_name("type") {
+                    let mut names = Vec::new();
+                    type_identifiers_in(source, ty, &mut names);
+                    return (true, names.into_iter().next());
+                }
+                if let Some(value) = binding.child_by_field_name("value") {
+                    if value.kind() == "struct_expression" {
+                        let type_node = value
+                            .child_by_field_name("name")
+                            .or_else(|| value.named_child(0));
+                        if let Some(type_node) = type_node {
+                            let mut names = Vec::new();
+                            type_identifiers_in(source, type_node, &mut names);
+                            return (true, names.into_iter().next());
+                        }
+                    }
+                }
+                // A local binding shadows any parameter of the same name, but
+                // its arbitrary initializer does not reveal a safe owner.
+                return (true, None);
+            }
+        }
+        ancestor = node.parent();
+    }
+    (false, None)
 }
 
 /// Walk `node`'s ancestors and return the qname of the nearest enclosing
@@ -14231,6 +14295,45 @@ mod tests {
             .and_then(|edge| edge.properties.get("receiver_owner"))
             .and_then(|value| value.as_str());
         assert_eq!(receiver_owner, Some("Buffer"));
+    }
+
+    #[test]
+    fn rust_receiver_owner_uses_struct_literal_local_without_guessing_calls() {
+        const SOURCE: &str = r#"
+            fn caller(shadowed: ParameterType) {
+                let report = types::IndexReport { files: 0 };
+                report.total();
+                let unknown = make_report();
+                unknown.total();
+                let sibling = make_report();
+                {
+                    let sibling = SiblingType {};
+                    sibling.total();
+                }
+                sibling.total();
+                let shadowed = make_report();
+                shadowed.total();
+            }
+        "#;
+        let result = extract(Language::Rust, SOURCE.as_bytes(), "src/lib.rs").unwrap();
+        let owners: Vec<_> = result
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("total")
+            })
+            .map(|edge| {
+                edge.properties
+                    .get("receiver_owner")
+                    .and_then(|value| value.as_str())
+            })
+            .collect();
+
+        assert_eq!(
+            owners,
+            vec![Some("IndexReport"), None, Some("SiblingType"), None, None]
+        );
     }
 
     #[test]

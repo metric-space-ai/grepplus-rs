@@ -103,6 +103,10 @@ fn run(args: &[&str], cwd: &Path, store_dir: &Path) -> (i32, String, String) {
         .args(args)
         .current_dir(cwd)
         .env("GREPPY_STORE_DIR", store_dir)
+        // These graph-collision tests exercise parser/indexer/navigation
+        // contracts, not model inference. Avoid loading the embedded models
+        // for every fixture; dedicated inference tests cover those paths.
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
         .output()
         .expect("spawn greppy");
     (

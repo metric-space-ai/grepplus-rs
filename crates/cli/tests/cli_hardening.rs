@@ -62,6 +62,7 @@ fn run_with_env(
     run_with_env_and_inference(args, cwd, store_dir, envs, false)
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
 fn run_with_inference(args: &[&str], cwd: &Path, store_dir: &Path) -> (i32, String, String) {
     run_with_env_and_inference(args, cwd, store_dir, &[], true)
 }
@@ -246,12 +247,12 @@ fn index_dot_then_search_from_root_and_subdir() {
         "index should key project on the repo-root basename; got: {out}"
     );
 
-    // RV-011: search-code from the repo root finds the indexed content.
+    // RV-011: search-code from the repo root finds current source content.
     let (code, out, err) = run(&["search-code", "alpha_unique_marker"], &repo, &store);
     assert_eq!(code, 0, "search-code from root should exit 0; stderr={err}");
     assert!(
         out.contains("alpha_unique_marker"),
-        "search-code from root must find indexed content (RV-011); got: {out:?}"
+        "search-code from root must find source content (RV-011); got: {out:?}"
     );
 
     // RV-006: search-code from a SUBDIRECTORY must resolve the same store
@@ -985,6 +986,7 @@ fn search_code_base_text_and_json_live_grep_merge_base_diff_without_index() {
     assert_eq!(v["merge_base"].as_str().unwrap_or("").len(), 40);
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
 fn insert_default_model_vectors(store_dir: &Path, count: usize) {
     let db = find_graph_db(store_dir).expect("graph.db exists after index");
     let mut store = greppy_store::Store::open(&db).expect("open graph store");
@@ -1023,6 +1025,7 @@ fn insert_default_model_vectors(store_dir: &Path, count: usize) {
     }
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     let (repo, store_dir) = make_repo("semantic-vector-guard", "vector_guard_marker");
@@ -1072,6 +1075,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
 }
 
+#[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn semantic_vectors_stale_index_skips_before_model_load() {
     let (repo, store_dir) = make_repo("semantic-vector-stale", "vector_stale_marker");

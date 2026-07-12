@@ -484,6 +484,8 @@ mod tests {
     #[test]
     fn legacy_cleanup_api_never_removes_unverified_directories() {
         let cache = tempdir_root("greppy-cleanup-stores");
+        let previous_store_dir = std::env::var_os("GREPPY_STORE_DIR");
+        std::env::set_var("GREPPY_STORE_DIR", cache.join("managed-data"));
         // An OLD store: marker aged well past the TTL → evicted. Use a
         // large back-date (10 days) so a timezone skew in the `touch -t`
         // helper cannot flip its side of the 1-day cutoff.
@@ -520,6 +522,10 @@ mod tests {
         assert_eq!(removed0, 0, "ttl 0 disables eviction");
         assert!(fresh.exists(), "nothing removed when eviction disabled");
 
+        match previous_store_dir {
+            Some(path) => std::env::set_var("GREPPY_STORE_DIR", path),
+            None => std::env::remove_var("GREPPY_STORE_DIR"),
+        }
         let _ = std::fs::remove_dir_all(&cache);
     }
 

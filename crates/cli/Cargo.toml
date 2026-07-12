@@ -10,6 +10,7 @@ description = "greppy unified CLI for grep-compatible search, code navigation, a
 [[bin]]
 name = "greppy"
 path = "src/main.rs"
+test = false
 
 [dependencies]
 greppy-core = { path = "../core" }
@@ -45,6 +46,11 @@ windows-sys = { workspace = true, features = [
 # build choices are the accelerated backends; CPU is always available.
 [features]
 default = []
+# Internal debug/CI fixture mode. It replaces the 827 MB payloads with four
+# SHA-verified sentinels so non-inference integration tests can start quickly.
+# Release builds reject this feature at compile time; product builds always use
+# both real embedded models.
+ci-test-assets = []
 # GPU inference for EmbeddingGemma. Selected per platform at BUILD time (the
 # per-platform release binaries enable it; the runtime auto-detects and uses
 # the GPU with no `--device` flag). On macOS per-invocation Metal init can cost

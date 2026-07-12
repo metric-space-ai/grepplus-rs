@@ -240,6 +240,12 @@ pub fn index_with_options(
         indexed_at: ws::now_iso8601(),
         root_path: abs_root.to_string_lossy().into_owned(),
     })?;
+    if !content_indexing_enabled() {
+        // v4 no longer persists full source bodies. Purge rows left by an
+        // older store before deciding between full and incremental indexing,
+        // otherwise unchanged files could keep stale searchable source.
+        store.delete_project_file_content(project_name)?;
+    }
 
     // Workspace state (fresh insert on first run). Capture the git
     // fingerprint so the freshness check has something to compare
@@ -360,7 +366,7 @@ pub fn index_with_options(
         )?;
         if profile {
             eprintln!(
-                "[profile] run_full (parse+extract+write nodes/content) {:?}",
+                "[profile] run_full (parse+extract+write graph) {:?}",
                 t.elapsed()
             );
         }
@@ -521,9 +527,11 @@ fn run_full(
                         store.delete_index_skip(project_name, &rel_path)?;
                         report.files_indexed += 1;
                         report.nodes_extracted += nodes.len();
-                        // GREPPY_NO_CONTENT: skip eager full-content FTS
-                        // indexing (the ~64% cold-index cost). search-code then
-                        // falls back to a live grep for content matches.
+                        // Full source text is not duplicated into SQLite by
+                        // default. Exact code search reads the authoritative
+                        // worktree through real grep; graph spans and vectors
+                        // remain indexed. A private opt-in exists only for
+                        // store/FTS regression and comparison runs.
                         if content_indexing_enabled() {
                             let rows = content_rows_from_bytes(&bytes);
                             if !rows.is_empty() {
@@ -562,7 +570,7 @@ fn run_full(
     }
     if profile {
         eprintln!(
-            "[profile]   A2 serial store writes (nodes+content+FTS+raw_edges) {:?}",
+            "[profile]   A2 serial store writes (nodes+optional-content+raw_edges) {:?}",
             t_a2.elapsed()
         );
     }
@@ -879,9 +887,18 @@ fn parallel_extract(
     let mut slots: Vec<Option<FileOutcome>> = (0..n).map(|_| None).collect();
     let mut throttled = false;
 
-    // Process in chunks of `worker_count` so we can re-check the memory
-    // budget between waves and bound peak buffered bytes.
-    let chunk = worker_count.max(1);
+    // Use a wider work-stealing window than the worker count. A four-file
+    // barrier on a four-P-core Mac serialized repositories containing one
+    // very large source file beside three tiny files: three workers went idle
+    // until the large parse completed before the next wave could start. Rayon
+    // still executes at most `worker_count` parses simultaneously; the wider
+    // window only gives idle workers enough queued files to steal. We retain
+    // periodic memory-budget checks between bounded windows.
+    const WORK_STEALING_WINDOW_MULTIPLIER: usize = 16;
+    let chunk = worker_count
+        .saturating_mul(WORK_STEALING_WINDOW_MULTIPLIER)
+        .max(worker_count)
+        .max(1);
     let mut pos = 0usize;
     while pos < n {
         // Memory throttle: once over budget, finish the remaining
@@ -927,10 +944,14 @@ fn parallel_extract(
 /// so the resulting rows are byte-for-byte what a fully sequential
 /// indexer would write. See the top-of-file doc comment for context.
 /// Whether to eagerly index full file content into the content-FTS table.
-/// Off when `GREPPY_NO_CONTENT` is set — then `search-code` falls back to a
-/// live grep, and a cold index skips its dominant (~64%) cost.
+/// Eager content FTS is a private comparison mode, not the product default.
+/// Duplicating every source line made cold indexing and the SQLite store grow
+/// dramatically while exact search can read the fresher worktree through the
+/// byte-compatible real-grep backend.
 fn content_indexing_enabled() -> bool {
-    std::env::var("GREPPY_NO_CONTENT").is_err()
+    std::env::var("GREPPY_CONTENT_FTS")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2857,6 +2878,34 @@ mod tests {
             mnames.contains(&"greet"),
             "Method greet must exist; got fn={names:?} methods={mnames:?}"
         );
+    }
+
+    #[test]
+    fn default_index_keeps_source_in_worktree_instead_of_sqlite() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("GREPPY_CONTENT_FTS").ok();
+        // SAFETY: this test serializes the only mutation of this private
+        // comparison variable and restores it before returning.
+        unsafe {
+            std::env::remove_var("GREPPY_CONTENT_FTS");
+        }
+
+        let repo = setup_repo("no-content-duplication", RUST_SAMPLE);
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").expect("indexer run");
+        let rows: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM file_content", [], |row| row.get(0))
+            .unwrap();
+
+        // SAFETY: serialized by ENV_LOCK and restored before return.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("GREPPY_CONTENT_FTS", value),
+                None => std::env::remove_var("GREPPY_CONTENT_FTS"),
+            }
+        }
+        assert_eq!(rows, 0);
     }
 
     #[test]

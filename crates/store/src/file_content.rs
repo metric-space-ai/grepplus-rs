@@ -12,12 +12,37 @@
 //! Re-indexing a file MUST be paired with `delete_for_file` first so
 //! that previously-indexed lines do not persist after rename/remove
 //! removed. Because deletes fire the FTS prune trigger, the
-//! mirror can never accumulate orphan rows.
+//! mirror can never accumulate orphan rows. Bulk replacement temporarily
+//! disables these triggers inside one transaction and uses the documented FTS5
+//! `rebuild` control command before restoring them.
 
 use rusqlite::params;
 
 use crate::store::Store;
 use crate::store_error::{Error, Result};
+
+const DROP_FILE_CONTENT_FTS_TRIGGERS: &str = r#"
+DROP TRIGGER IF EXISTS file_content_fts_ai;
+DROP TRIGGER IF EXISTS file_content_fts_ad;
+DROP TRIGGER IF EXISTS file_content_fts_au;
+"#;
+
+const CREATE_FILE_CONTENT_FTS_TRIGGERS: &str = r#"
+CREATE TRIGGER file_content_fts_ai AFTER INSERT ON file_content BEGIN
+    INSERT INTO file_content_fts(rowid, snippet, file_path)
+    VALUES (new.id, new.snippet, new.file_path);
+END;
+CREATE TRIGGER file_content_fts_ad AFTER DELETE ON file_content BEGIN
+    INSERT INTO file_content_fts(file_content_fts, rowid, snippet, file_path)
+    VALUES ('delete', old.id, old.snippet, old.file_path);
+END;
+CREATE TRIGGER file_content_fts_au AFTER UPDATE ON file_content BEGIN
+    INSERT INTO file_content_fts(file_content_fts, rowid, snippet, file_path)
+    VALUES ('delete', old.id, old.snippet, old.file_path);
+    INSERT INTO file_content_fts(rowid, snippet, file_path)
+    VALUES (new.id, new.snippet, new.file_path);
+END;
+"#;
 
 /// A single line of indexed file content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +52,45 @@ pub struct ContentRow {
 }
 
 impl Store {
+    /// Remove every cached source line for one project. This is used when a
+    /// newer index format switches back to authoritative worktree reads. The
+    /// FTS mirror is rebuilt once instead of firing a delete trigger per line.
+    pub fn delete_project_file_content(&mut self, project: &str) -> Result<usize> {
+        let count: i64 = self
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM file_content WHERE project = ?1",
+                params![project],
+                |row| row.get(0),
+            )
+            .map_err(Error::Sqlite)?;
+        if count == 0 {
+            return Ok(0);
+        }
+
+        let tx = self.transaction()?;
+        tx.raw()
+            .execute_batch(DROP_FILE_CONTENT_FTS_TRIGGERS)
+            .map_err(Error::Sqlite)?;
+        tx.raw()
+            .execute(
+                "DELETE FROM file_content WHERE project = ?1",
+                params![project],
+            )
+            .map_err(Error::Sqlite)?;
+        tx.raw()
+            .execute(
+                "INSERT INTO file_content_fts(file_content_fts) VALUES ('rebuild')",
+                [],
+            )
+            .map_err(Error::Sqlite)?;
+        tx.raw()
+            .execute_batch(CREATE_FILE_CONTENT_FTS_TRIGGERS)
+            .map_err(Error::Sqlite)?;
+        tx.commit()?;
+        usize::try_from(count).map_err(|_| Error::Invalid("file content count overflow".into()))
+    }
+
     /// Delete every `file_content` row for `(project, rel_path)`.
     /// The matching FTS index entries are pruned automatically by the
     /// `file_content_fts_ad` AFTER DELETE trigger (migration 0004), so
@@ -107,6 +171,15 @@ impl Store {
         files: &[(String, Vec<ContentRow>)],
     ) -> Result<usize> {
         let tx = self.transaction()?;
+        // A cold full index previously fired the FTS trigger once per source
+        // line. On real repositories that dominated the entire index (many
+        // minutes despite a single SQL transaction). The base table is the
+        // external-content authority, so bulk-load it without triggers and
+        // build the FTS segment once. DDL is transactional in SQLite: any
+        // insert/rebuild/create failure rolls the trigger removal back too.
+        tx.raw()
+            .execute_batch(DROP_FILE_CONTENT_FTS_TRIGGERS)
+            .map_err(Error::Sqlite)?;
         let mut inserted = 0usize;
         {
             let mut stmt = tx
@@ -128,6 +201,15 @@ impl Store {
                 }
             }
         }
+        tx.raw()
+            .execute(
+                "INSERT INTO file_content_fts(file_content_fts) VALUES ('rebuild')",
+                [],
+            )
+            .map_err(Error::Sqlite)?;
+        tx.raw()
+            .execute_batch(CREATE_FILE_CONTENT_FTS_TRIGGERS)
+            .map_err(Error::Sqlite)?;
         tx.commit()?;
         Ok(inserted)
     }
@@ -456,6 +538,117 @@ mod tests {
             fts_row_count(&s),
             0,
             "delete must leave zero orphan FTS rows"
+        );
+    }
+
+    #[test]
+    fn batch_load_rebuilds_fts_once_and_restores_incremental_triggers() {
+        let mut s = store_with_project("p");
+        let files = vec![
+            (
+                "src/a.rs".to_string(),
+                vec![ContentRow {
+                    line: 1,
+                    snippet: "alpha batch marker".into(),
+                }],
+            ),
+            (
+                "src/b.rs".to_string(),
+                vec![ContentRow {
+                    line: 7,
+                    snippet: "beta batch marker".into(),
+                }],
+            ),
+        ];
+
+        assert_eq!(s.insert_file_content_batch("p", &files).unwrap(), 2);
+        assert_eq!(content_row_count(&s), 2);
+        assert_eq!(fts_row_count(&s), 2);
+        assert_eq!(s.search_file_content("p", "alpha", 10).unwrap().len(), 1);
+        assert_eq!(s.search_file_content("p", "beta", 10).unwrap().len(), 1);
+
+        let trigger_count: i64 = s
+            .conn()
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'trigger'
+                   AND name IN ('file_content_fts_ai', 'file_content_fts_ad', 'file_content_fts_au')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(trigger_count, 3, "all FTS maintenance triggers restored");
+
+        s.insert_file_content_rows(
+            "p",
+            "src/c.rs",
+            &[ContentRow {
+                line: 3,
+                snippet: "gamma incremental marker".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(s.search_file_content("p", "gamma", 10).unwrap().len(), 1);
+        assert_eq!(fts_row_count(&s), content_row_count(&s));
+    }
+
+    #[test]
+    fn project_content_clear_preserves_other_projects_and_fts_triggers() {
+        let mut s = Store::open_memory().unwrap();
+        s.upsert_project(&Project {
+            name: "p1".into(),
+            indexed_at: "2024-01-01T00:00:00Z".into(),
+            root_path: "/tmp/p1".into(),
+        })
+        .unwrap();
+        s.upsert_project(&Project {
+            name: "p2".into(),
+            indexed_at: "2024-01-01T00:00:00Z".into(),
+            root_path: "/tmp/p2".into(),
+        })
+        .unwrap();
+        s.insert_file_content_rows(
+            "p1",
+            "a.rs",
+            &[ContentRow {
+                line: 1,
+                snippet: "remove marker".into(),
+            }],
+        )
+        .unwrap();
+        s.insert_file_content_rows(
+            "p2",
+            "b.rs",
+            &[ContentRow {
+                line: 2,
+                snippet: "preserve marker".into(),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(s.delete_project_file_content("p1").unwrap(), 1);
+        assert!(s
+            .search_file_content("p1", "remove", 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            s.search_file_content("p2", "preserve", 10).unwrap().len(),
+            1
+        );
+        assert_eq!(s.delete_project_file_content("p1").unwrap(), 0);
+
+        s.insert_file_content_rows(
+            "p1",
+            "c.rs",
+            &[ContentRow {
+                line: 3,
+                snippet: "trigger restored".into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            s.search_file_content("p1", "restored", 10).unwrap().len(),
+            1
         );
     }
 

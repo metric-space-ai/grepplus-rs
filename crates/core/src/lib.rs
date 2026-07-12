@@ -26,7 +26,10 @@
 ///   O3 closure attribution, P4 edge call-site line now persisted.
 ///   v2 -> v3 (2026-07-12): preserve Rust receiver-call shape and resolve
 ///   receiver dispatch only to Method nodes, never same-named free functions.
-pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v3";
+///   v3 -> v4 (2026-07-12): resolve type-evident local receiver calls, use a
+///   wider P-core work queue, and keep source bodies authoritative in the
+///   worktree instead of duplicating them into SQLite by default.
+pub const INDEXER_VERSION_BASE: &str = "greppy-indexer-v4";
 
 pub mod cache;
 pub mod diag;
