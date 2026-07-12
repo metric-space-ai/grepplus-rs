@@ -13390,12 +13390,16 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
                 eprintln!("  caused by: {cause}");
                 source = cause.source();
             }
-            match e {
-                Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
-                Error::Invalid(_) => EXIT_USAGE,
-                _ => EXIT_IO,
-            }
+            error_exit_code(&e)
         }
+    }
+}
+
+fn error_exit_code(error: &Error) -> u8 {
+    match error {
+        Error::NotImplemented { .. } | Error::OutOfScope { .. } => EXIT_NOT_IMPLEMENTED,
+        Error::Invalid(_) => EXIT_USAGE,
+        _ => EXIT_IO,
     }
 }
 
@@ -14353,25 +14357,32 @@ where
     }
 
     #[test]
-    fn dispatch_returns_out_of_scope_for_install() {
-        let cli = Cli::try_parse_from(["greppy", "install"]).unwrap();
-        let r = dispatch(cli);
-        assert!(matches!(
-            r,
-            Err(Error::OutOfScope { ref feature }) if feature == "greppy install"
-        ));
+    fn removed_stub_names_are_not_public_subcommands() {
+        for name in ["install", "uninstall", "update", "config"] {
+            let cli = Cli::try_parse_from(["greppy", name]).unwrap();
+            assert!(cli.command.is_none(), "{name} must not be a subcommand");
+            assert_eq!(cli.passthrough, vec![name]);
+        }
     }
 
     #[test]
     fn dispatch_to_code_maps_errors() {
-        // `search-graph` is implemented and no longer returns
-        // NotImplemented. Verify the not-implemented and usage paths still map
-        // to the documented exit codes.
-        let cli = Cli::try_parse_from(["greppy", "install"]).unwrap();
-        assert_eq!(dispatch_to_code(cli), EXIT_NOT_IMPLEMENTED);
-
-        let cli = Cli::try_parse_from(["greppy", "config"]).unwrap();
-        assert_eq!(dispatch_to_code(cli), EXIT_NOT_IMPLEMENTED);
+        assert_eq!(
+            error_exit_code(&Error::out_of_scope("test feature")),
+            EXIT_NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            error_exit_code(&Error::not_implemented("test feature", "not available")),
+            EXIT_NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            error_exit_code(&Error::Invalid("bad input".into())),
+            EXIT_USAGE
+        );
+        assert_eq!(
+            error_exit_code(&Error::Config("configuration failure".into())),
+            EXIT_IO
+        );
 
         let cli = Cli::try_parse_from(["greppy"]).unwrap();
         assert_eq!(dispatch_to_code(cli), EXIT_USAGE);
