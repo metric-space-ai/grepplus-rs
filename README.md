@@ -5,6 +5,7 @@
 **Local code navigation for coding agents: deterministic symbol-graph evidence, native semantic search, compact function briefings, and byte-exact real-`grep` passthrough. One native Rust binary.**
 
 [![Release](https://img.shields.io/github/v/release/metric-space-ai/greppy?display_name=tag&sort=semver&color=22c55e&label=release)](https://github.com/metric-space-ai/greppy/releases/latest)
+[![CI](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml?query=branch%3Amain)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `greppy` is a code-navigation tool that also accepts ordinary `grep`
@@ -55,8 +56,9 @@ automatic and can be made explicit with `--device cpu|metal|cuda[:INDEX]` or
 `GREPPY_DEVICE`.
 
 The first structured query builds its local workspace index. Prebuilt binaries
-for macOS, Linux, and Windows are published on the [Releases](../../releases)
-page. Do not rename or install the binary as `grep`.
+for macOS, Linux, and Windows are published on the
+[Releases](https://github.com/metric-space-ai/greppy/releases) page. Do not
+rename or install the binary as `grep`.
 
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
