@@ -14397,7 +14397,7 @@ where
         let r = dispatch(cli);
         assert!(matches!(
             r,
-            Err(Error::OutOfScope { ref feature }) if feature == "grep install"
+            Err(Error::OutOfScope { ref feature }) if feature == "greppy install"
         ));
     }
 

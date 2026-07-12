@@ -149,7 +149,7 @@ pub(super) fn request(
         .entry("request_id")
         .or_insert_with(|| request_id().into());
 
-    let mut stream = match TransportStream::connect(endpoint) {
+    let mut stream = match TransportStream::connect(endpoint, timeout) {
         Ok(stream) => stream,
         Err(error) if no_daemon_error(&error) => return RequestOutcome::NoDaemon,
         Err(_) => return RequestOutcome::Failed,
@@ -843,7 +843,7 @@ struct TransportStream(std::os::unix::net::UnixStream);
 
 #[cfg(unix)]
 impl TransportStream {
-    fn connect(endpoint: &Endpoint) -> std::io::Result<Self> {
+    fn connect(endpoint: &Endpoint, _timeout: Duration) -> std::io::Result<Self> {
         std::os::unix::net::UnixStream::connect(&endpoint.address).map(Self)
     }
 
@@ -911,9 +911,11 @@ struct TransportStream(std::fs::File);
 
 #[cfg(windows)]
 impl TransportStream {
-    fn connect(endpoint: &Endpoint) -> std::io::Result<Self> {
+    fn connect(endpoint: &Endpoint, timeout: Duration) -> std::io::Result<Self> {
         use std::os::windows::io::FromRawHandle;
-        use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Foundation::{
+            ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING,
         };
@@ -921,36 +923,58 @@ impl TransportStream {
             SetNamedPipeHandleState, WaitNamedPipeW, PIPE_NOWAIT, PIPE_READMODE_BYTE,
         };
 
+        let deadline = Instant::now() + timeout;
         let name = wide_string(&endpoint.address);
-        unsafe {
-            if WaitNamedPipeW(name.as_ptr(), 250) == 0 {
-                return Err(std::io::Error::last_os_error());
+        loop {
+            unsafe {
+                if WaitNamedPipeW(name.as_ptr(), 50) == 0 {
+                    let error = std::io::Error::last_os_error();
+                    if !windows_pipe_busy(&error, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT)
+                        || Instant::now() >= deadline
+                    {
+                        return Err(error);
+                    }
+                    continue;
+                }
+                let handle = CreateFileW(
+                    name.as_ptr(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    0,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                );
+                if handle == INVALID_HANDLE_VALUE {
+                    let error = std::io::Error::last_os_error();
+                    if windows_pipe_busy(&error, ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT)
+                        && Instant::now() < deadline
+                    {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
+                if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
+                    let error = std::io::Error::last_os_error();
+                    drop(std::fs::File::from_raw_handle(handle));
+                    return Err(error);
+                }
+                return Ok(Self(std::fs::File::from_raw_handle(handle)));
             }
-            let handle = CreateFileW(
-                name.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
-                0,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            );
-            if handle == INVALID_HANDLE_VALUE {
-                return Err(std::io::Error::last_os_error());
-            }
-            let mode = PIPE_READMODE_BYTE | PIPE_NOWAIT;
-            if SetNamedPipeHandleState(handle, &mode, std::ptr::null(), std::ptr::null()) == 0 {
-                let error = std::io::Error::last_os_error();
-                drop(std::fs::File::from_raw_handle(handle));
-                return Err(error);
-            }
-            Ok(Self(std::fs::File::from_raw_handle(handle)))
         }
     }
 
     fn set_timeouts(&self, _write: Duration, _read: Duration) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn windows_pipe_busy(error: &std::io::Error, pipe_busy: u32, timeout: u32) -> bool {
+    error.raw_os_error().is_some_and(|code| {
+        u32::try_from(code).is_ok_and(|code| code == pipe_busy || code == timeout)
+    })
 }
 
 #[cfg(windows)]
