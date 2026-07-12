@@ -10,15 +10,10 @@
 #   1. NO PANIC / no signal crash on any iteration (we scan combined
 #      stderr for panic / SIG* markers and check exit codes).
 #   2. integrity_check stays "ok" on the live graph.db every iteration.
-#   3. The drop-in grep result stays BYTE-EXACT vs the system grep
+#   3. Both grep-compatible entry points stay BYTE-EXACT vs system grep
 #      (stdout + stderr + exit code) on every iteration, even as the
-#      corpus is mutated underneath it. The pure drop-in path is the
-#      `greppy-grep` binary (no augmentation); that is the byte-exact
-#      contract surface.
-#   4. Sidecar temp files do NOT accumulate unboundedly: with a short
-#      TTL and periodic cleanup invocations, the sidecar count stays
-#      bounded over the whole run (TTL/cleanup actually reclaims).
-#   5. RSS does NOT grow unbounded: we sample resident set size of an
+#      corpus is mutated underneath it, even with a fresh index in scope.
+#   4. RSS does NOT grow unbounded: we sample resident set size of an
 #      index process early and late and require late <= early * factor.
 #
 # This is a BLACK-BOX harness: it never touches crate source or Cargo.
@@ -32,8 +27,6 @@
 #   BATTLE_SOAK_ITERS   iterations of the loop                (default 200)
 #   BATTLE_SOAK_FILES   corpus size                           (default 40)
 #   BATTLE_SOAK_RSS_FACTOR  max late/early RSS ratio          (default 3)
-#   BATTLE_SOAK_SIDECAR_CAP max live sidecars allowed at any  (default 64)
-#                           check point under short TTL
 
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -41,7 +34,6 @@ NAME="soak"
 ITERS="${BATTLE_SOAK_ITERS:-200}"
 N_FILES="${BATTLE_SOAK_FILES:-40}"
 RSS_FACTOR="${BATTLE_SOAK_RSS_FACTOR:-3}"
-SIDECAR_CAP="${BATTLE_SOAK_SIDECAR_CAP:-64}"
 
 require_bins "$GREPPY_BIN" "$GREPPY_GREP_BIN" || { emit_summary "$NAME"; exit 1; }
 
@@ -57,10 +49,7 @@ STORE="$WORK/store"
 LOG="$WORK/soak.log"            # accumulates stderr from every invocation
 : > "$LOG"
 
-# Short TTL so the soak loop actually exercises reclamation rather than
-# the 24 h production default. Cleanup runs on `greppy-grep` startup.
 export GREPPY_STORE_DIR="$STORE"
-export GREPPY_SIDECAR_TTL_SECS="${GREPPY_SIDECAR_TTL_SECS:-1}"
 
 echo "[soak] generating $N_FILES-file corpus ..."
 bash "$BATTLE_DIR/gen_corpus.sh" "$CORPUS" "$N_FILES" >/dev/null 2>&1
@@ -112,49 +101,30 @@ mutate_corpus() {
     printf '// SOAK_NEEDLE marker iter %d\n' "$iter" >> "$f"
 }
 
-# grep_byte_exact <pattern> <relpath>: run the pure drop-in grep and the
-# system grep with identical argv from inside the corpus; compare all
-# three observable channels. Returns 0 iff byte-identical.
+# grep_byte_exact <binary> <label> <argv...>: compare all observable channels.
 grep_byte_exact() {
-    local pat="$1" rel="$2"
-    local og or eg er rg rr
-    og="$( cd "$CORPUS" && "$GREPPY_GREP_BIN" -n "$pat" "$rel" 2>"$WORK/.eg" )"; rg=$?
-    eg="$(cat "$WORK/.eg")"
-    or="$( cd "$CORPUS" && "$REAL_GREP" -n "$pat" "$rel" 2>"$WORK/.er" )"; rr=$?
-    er="$(cat "$WORK/.er")"
-    # Capture greppy-grep stderr into the panic log too.
-    [[ -n "$eg" ]] && printf '%s\n' "$eg" >> "$LOG"
-    if [[ "$og" == "$or" && "$eg" == "$er" && "$rg" -eq "$rr" && "$rg" -lt 128 ]]; then
+    local bin="$1" label="$2" rg rr
+    shift 2
+    ( cd "$CORPUS" && "$bin" "$@" ) >"$WORK/.go" 2>"$WORK/.ge"; rg=$?
+    ( cd "$CORPUS" && "$REAL_GREP" "$@" ) >"$WORK/.ro" 2>"$WORK/.re"; rr=$?
+    [[ -s "$WORK/.ge" ]] && cat "$WORK/.ge" >> "$LOG"
+    if cmp -s "$WORK/.go" "$WORK/.ro" && cmp -s "$WORK/.ge" "$WORK/.re" \
+        && [[ "$rg" -eq "$rr" && "$rg" -lt 128 ]]; then
         return 0
     fi
     {
-        echo "[soak] grep mismatch pat=$pat rel=$rel"
+        echo "[soak] $label mismatch: $*"
         echo "  rc g=$rg r=$rr"
-        diff <(printf '%s' "$og") <(printf '%s' "$or") | head -6 | sed 's/^/  /'
-        echo "  stderr g=[$eg] r=[$er]"
+        diff -u "$WORK/.ro" "$WORK/.go" | head -8 | sed 's/^/  /'
+        diff -u "$WORK/.re" "$WORK/.ge" | head -8 | sed 's/^/  /'
     } >&2
     return 1
-}
-
-# count_sidecars: number of live sidecar files in the store.
-count_sidecars() {
-    find "$STORE" -name '*__GREPPY_SEMANTIC_NONCANONICAL.md' 2>/dev/null | wc -l | tr -d ' '
-}
-
-# drive_augment: run the augmenting drop-in (`greppy` cli) against a
-# graph-known symbol to *write* a sidecar, then run the pure drop-in
-# (`greppy-grep`) which performs the startup TTL cleanup. This is the
-# pair that exercises sidecar creation + reclamation.
-drive_augment() {
-    ( cd "$CORPUS" && "$GREPPY_BIN" -R 'Widget0' . ) >>"$LOG" 2>&1 || true
-    # greppy-grep startup runs cleanup_expired against cwd's store.
-    ( cd "$CORPUS" && "$GREPPY_GREP_BIN" -q 'Widget0' src/lib.rs ) >>"$LOG" 2>&1 || true
 }
 
 # ---------------------------------------------------------------------------
 # Run.
 # ---------------------------------------------------------------------------
-echo "[soak] $ITERS iterations, $N_FILES files, store=$STORE, TTL=${GREPPY_SIDECAR_TTL_SECS}s"
+echo "[soak] $ITERS iterations, $N_FILES files, store=$STORE"
 
 index_corpus; rc=$?
 if [[ "$rc" -ne 0 ]]; then
@@ -177,8 +147,6 @@ rss_early="$(rss_of_index)"
 declare -i loop_panics=0
 declare -i integ_bad=0
 declare -i grep_breaks=0
-declare -i sidecar_overflow=0
-declare -i max_sidecars=0
 rss_late=0
 
 i=0
@@ -198,30 +166,26 @@ while [[ "$i" -lt "$ITERS" ]]; do
 
     # Byte-exact drop-in grep on the moving needle's current home file.
     needle_rel="src/$(printf 'mod%04d' "$(( i % N_FILES ))").rs"
-    if ! grep_byte_exact 'SOAK_NEEDLE' "$needle_rel"; then
-        grep_breaks=$((grep_breaks + 1))
-    fi
-    # Also a never-matching pattern (rc=1 path) for breadth.
-    if ! grep_byte_exact 'zzzz_no_such_token_zzzz' "$needle_rel"; then
-        grep_breaks=$((grep_breaks + 1))
-    fi
+    for bin_label in "$GREPPY_BIN:greppy" "$GREPPY_GREP_BIN:greppy-grep"; do
+        bin="${bin_label%%:*}"
+        label="${bin_label##*:}"
+        if ! grep_byte_exact "$bin" "$label" -n SOAK_NEEDLE "$needle_rel"; then
+            grep_breaks=$((grep_breaks + 1))
+        fi
+        if ! grep_byte_exact "$bin" "$label" -n zzzz_no_such_token_zzzz "$needle_rel"; then
+            grep_breaks=$((grep_breaks + 1))
+        fi
+        if [[ $(( i % 10 )) -eq 0 ]] && ! grep_byte_exact "$bin" "$label" -R -n Widget0 .; then
+            grep_breaks=$((grep_breaks + 1))
+        fi
+    done
 
-    # Drive sidecar creation + TTL cleanup.
-    drive_augment
-
-    # Periodic integrity + sidecar-bound checks (every ~10 iters and on
-    # the last iter), to keep the loop fast while still sampling densely.
+    # Periodic integrity checks.
     if [[ $(( i % 10 )) -eq 0 || "$i" -eq "$ITERS" ]]; then
         integ="$(sqlite_q "$DB" 'PRAGMA integrity_check;' 2>/dev/null || echo ERR)"
         if [[ "$integ" != "ok" ]]; then
             echo "[soak] integrity_check=$integ on iter $i" >&2
             integ_bad=$((integ_bad + 1))
-        fi
-        sc="$(count_sidecars)"
-        [[ "$sc" -gt "$max_sidecars" ]] && max_sidecars="$sc"
-        if [[ "$sc" -gt "$SIDECAR_CAP" ]]; then
-            echo "[soak] sidecar count $sc exceeds cap $SIDECAR_CAP on iter $i" >&2
-            sidecar_overflow=$((sidecar_overflow + 1))
         fi
     fi
 done
@@ -243,26 +207,6 @@ fi
 assert_eq 0 "$loop_panics"      "no panic / signal crash across $ITERS iterations"
 assert_eq 0 "$integ_bad"        "integrity_check stayed ok at every checkpoint"
 assert_eq 0 "$grep_breaks"      "drop-in grep stayed byte-exact vs $REAL_GREP across iterations"
-assert_eq 0 "$sidecar_overflow" "sidecars stayed bounded (<= $SIDECAR_CAP) under TTL cleanup (peak=$max_sidecars)"
-
-# Final cleanup sweep: backdate all sidecars and run one greppy-grep so
-# its startup cleanup_expired reclaims them; the count must drop. This is
-# the strongest TTL assertion: reclamation actually deletes expired files.
-find "$STORE" -name '*__GREPPY_SEMANTIC_NONCANONICAL.md' -exec touch -t 200001010000 {} \; 2>/dev/null
-before_sweep="$(count_sidecars)"
-( cd "$CORPUS" && GREPPY_SIDECAR_TTL_SECS=1 "$GREPPY_GREP_BIN" -q 'zzz' src/lib.rs ) >>"$LOG" 2>&1 || true
-after_sweep="$(count_sidecars)"
-if [[ "$before_sweep" -gt 0 ]]; then
-    if [[ "$after_sweep" -lt "$before_sweep" ]]; then
-        pass "TTL cleanup reclaimed expired sidecars ($before_sweep -> $after_sweep)"
-    else
-        fail "TTL cleanup reclaimed expired sidecars ($before_sweep -> $after_sweep)"
-    fi
-else
-    # No sidecars were ever written (e.g. graph yielded no semantic hits);
-    # that is still a valid, non-leaking state.
-    pass "no sidecars accumulated (nothing to reclaim)"
-fi
 
 # RSS growth bound. Guard against a zero early sample (sampling can miss a
 # very fast child); only assert the ratio when we have a real baseline.

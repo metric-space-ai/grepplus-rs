@@ -1,14 +1,12 @@
 # greppy benchmark suite
 
-The `bench/` directory contains the empirical-heuristic benchmark
-corpus required before the default heuristic is
-declared stable. There are three scripts, each covering one of the
-three sub-areas:
+The `bench/` directory contains black-box compatibility, freshness, and agent
+utility corpora.
 
 | Script | Corpus | What it measures |
 |--------|--------|------------------|
-| `grep_compat.sh`     | grep-compatibility corpus | Byte-exact stdout/stderr/exit-code preservation against real `/usr/bin/grep` for 35 representative invocations, split across the three heuristic classes (Strict / Sidecar / VisibleAugment). |
-| `agent_utility.sh`   | agent-utility corpus        | Real agent-style invocations: sidecar presence, sentinel, exit-code preservation, and the "no synthetic line on miss" rule. |
+| `grep_compat.sh`     | grep-compatibility corpus | Byte-exact stdout/stderr/exit-code preservation against real `grep`, with no index or model side effects. |
+| `agent_utility.sh`   | agent-style grep corpus   | Representative recursive agent searches remain byte-exact even with a fresh graph in scope. |
 | `freshness_bench.sh` | freshness benchmark          | 9 mutation scenarios (cold start, fresh after index, edit, delete, add, rename, commit, branch, agent-temp-file) asserted against `greppy_freshness::check_files` via the `freshness-probe` example binary. |
 
 A combined runner is provided as `run_all.sh`.
@@ -44,22 +42,15 @@ pass: 35
 fail: 0
 ```
 
-A `pass` is an invocation that satisfied the class's contract:
-
-- **Strict / Sidecar** — full byte-exact stdout + stderr + exit code
-  against real grep.
-- **VisibleAugment** — real-grep output is a byte-exact prefix of
-  subject output; the suffix contains at least one labelled synthetic
-  line (`GREPPY_NON_CANONICAL_HIT`); exit code matches.
+A `pass` preserves stdout, stderr, and exit code byte-for-byte against real
+grep. Semantic code navigation is exercised separately through explicit
+commands such as `semantic-search` and `brief`.
 
 A `fail` is an invocation that violated the contract. The script
 prints the expected vs. actual output so a regression can be
 diagnosed quickly.
 
-`agent_utility.sh` adds a per-invocation table with `rc / real_b /
-sub_b / delta_b / sidecar_b / synth_n / side / sentinel?` columns.
-These help you see how much extra context greppy surfaces on top
-of raw grep.
+`agent_utility.sh` reports exit code and output byte counts for each invocation.
 
 `freshness_bench.sh` prints `expect / actual / elapsed_ms` per
 scenario. Elapsed is the per-check wall time; the production
@@ -82,10 +73,8 @@ the freshness bench can also exercise the git-fingerprint path.
 ## Adding a new bench entry
 
 1. Decide which script the entry belongs to:
-   - Pipeline-sensitive grep invocation → `grep_compat.sh` with
-     class `STRICT` or `SIDECAR`.
-   - Agent-style exploration with augmentation → `grep_compat.sh`
-     with class `VISIBLE_AUGMENT`, or `agent_utility.sh`.
+   - Pipeline-sensitive grep invocation → `grep_compat.sh`.
+   - Agent-style recursive grep invocation → `agent_utility.sh`.
    - Workspace mutation → `freshness_bench.sh`.
 2. Append the entry to the `CORPUS` (or `probe` call) in the
    appropriate script.

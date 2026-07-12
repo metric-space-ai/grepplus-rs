@@ -383,7 +383,7 @@ fn flush_embedding_batch(
 fn log_embedding_skip_once(err: &Error) {
     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        eprintln!("grep index: embedding unavailable; skipping embedding batch: {err}");
+        eprintln!("greppy index: embedding unavailable; skipping embedding batch: {err}");
     }
 }
 

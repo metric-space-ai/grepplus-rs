@@ -280,8 +280,36 @@ where
     Validate: FnMut(&str) -> Result<(), serde_json::Value>,
     Handle: FnMut(&str, &mut Option<M>) -> serde_json::Value,
 {
+    let code = run_server(
+        endpoint,
+        supplied_address,
+        policy,
+        prewarm,
+        &mut load,
+        &mut validate,
+        &mut handle,
+        log_prefix,
+    );
+    std::process::exit(code)
+}
+
+fn run_server<M, Load, Validate, Handle>(
+    endpoint: Endpoint,
+    supplied_address: &str,
+    policy: ServerPolicy,
+    prewarm: bool,
+    mut load: Load,
+    mut validate: Validate,
+    mut handle: Handle,
+    log_prefix: &'static str,
+) -> i32
+where
+    Load: FnMut() -> Result<M, String>,
+    Validate: FnMut(&str) -> Result<(), serde_json::Value>,
+    Handle: FnMut(&str, &mut Option<M>) -> serde_json::Value,
+{
     if supplied_address != endpoint.address() {
-        std::process::exit(64);
+        return 64;
     }
     let owner_lock = match greppy_core::cache::acquire_named_lock(
         &endpoint.lock_name(),
@@ -289,12 +317,12 @@ where
         true,
     ) {
         Ok(Some(lock)) => lock,
-        Ok(None) => std::process::exit(0),
-        Err(_) => std::process::exit(1),
+        Ok(None) => return 0,
+        Err(_) => return 1,
     };
     let listener = match TransportListener::bind(&endpoint) {
         Ok(listener) => listener,
-        Err(_) => std::process::exit(1),
+        Err(_) => return 1,
     };
     let _ = std::fs::remove_file(endpoint.cooldown_path());
     let endpoint_guard = EndpointGuard::new(endpoint.clone());
@@ -408,7 +436,7 @@ where
     drop(model);
     drop(endpoint_guard);
     drop(owner_lock);
-    std::process::exit(0)
+    0
 }
 
 fn spawn_accept_loop(
@@ -1196,6 +1224,127 @@ mod tests {
             thread.join().expect("spawn contender");
         }
         assert_eq!(acquired.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn live_server_serializes_clients_evicts_and_reloads_one_model() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let endpoint = Endpoint::for_identity(
+            "lifecycle-test",
+            &format!("{}-{}", std::process::id(), request_id()),
+        )
+        .unwrap();
+        let server_endpoint = endpoint.clone();
+        let server_address = endpoint.address().to_string();
+        let loads = Arc::new(AtomicUsize::new(0));
+        let handled = Arc::new(AtomicUsize::new(0));
+        let server_loads = Arc::clone(&loads);
+        let server_handled = Arc::clone(&handled);
+        let server = std::thread::spawn(move || {
+            run_server(
+                server_endpoint,
+                &server_address,
+                ServerPolicy {
+                    model_ttl: Duration::from_millis(150),
+                    exit_ttl: Duration::from_millis(700),
+                    request_deadline: Duration::from_secs(3),
+                    max_request_bytes: 4096,
+                    max_response_bytes: 4096,
+                },
+                false,
+                move || {
+                    server_loads.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, String>(())
+                },
+                |raw| {
+                    let value: serde_json::Value = serde_json::from_str(raw)
+                        .map_err(|_| serde_json::json!({"error": "malformed request"}))?;
+                    if value.get("op").and_then(serde_json::Value::as_str) == Some("infer") {
+                        Ok(())
+                    } else {
+                        Err(serde_json::json!({"error": "unsupported operation"}))
+                    }
+                },
+                move |_raw, model| {
+                    server_handled.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(5));
+                    serde_json::json!({"ok": model.is_some()})
+                },
+                "lifecycle-test",
+            )
+        });
+
+        let mut reachable = false;
+        for _ in 0..100 {
+            if matches!(
+                request(
+                    &endpoint,
+                    serde_json::json!({"op": "status"}),
+                    Duration::from_millis(250),
+                    4096,
+                ),
+                RequestOutcome::Response(_)
+            ) {
+                reachable = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(reachable, "lifecycle daemon became reachable");
+
+        let barrier = Arc::new(std::sync::Barrier::new(33));
+        let mut clients = Vec::new();
+        for _ in 0..32 {
+            let barrier = Arc::clone(&barrier);
+            let endpoint = endpoint.clone();
+            clients.push(std::thread::spawn(move || {
+                barrier.wait();
+                request(
+                    &endpoint,
+                    serde_json::json!({"op": "infer"}),
+                    Duration::from_secs(5),
+                    4096,
+                )
+            }));
+        }
+        barrier.wait();
+        let mut responses = 0usize;
+        let mut unavailable = 0usize;
+        for client in clients {
+            match client.join().expect("client thread") {
+                RequestOutcome::Response(_) => responses += 1,
+                RequestOutcome::NoDaemon | RequestOutcome::Failed => unavailable += 1,
+            }
+        }
+        assert_eq!(unavailable, 0, "live daemon lost client connections");
+        assert_eq!(responses, 32);
+        assert_eq!(loads.load(Ordering::SeqCst), 1);
+        assert!(handled.load(Ordering::SeqCst) > 0);
+
+        let evict_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state = diagnostic(&endpoint)["state"].as_str().map(str::to_string);
+            if state.as_deref() == Some("evicted") {
+                break;
+            }
+            assert!(
+                Instant::now() < evict_deadline,
+                "model did not evict: {state:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(matches!(
+            request(
+                &endpoint,
+                serde_json::json!({"op": "infer"}),
+                Duration::from_secs(3),
+                4096,
+            ),
+            RequestOutcome::Response(ref value) if value["ok"] == true
+        ));
+        assert_eq!(loads.load(Ordering::SeqCst), 2);
+        assert_eq!(server.join().expect("server thread"), 0);
     }
 
     #[cfg(unix)]

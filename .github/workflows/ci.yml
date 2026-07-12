@@ -18,6 +18,9 @@ on:
   push:
     branches: ["**"]
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 2 * * *"
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
@@ -128,13 +131,9 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo build --release --bins
-        run: cargo build --release --bins
-
-      # Black-box battle suite against the freshly built binaries. The
-      # default suite is fast; the long soak loop and the release
-      # invariant are opt-in via env (BATTLE_SOAK / BATTLE_RELEASE) so
-      # the per-push signal stays quick. We run the default suite here.
+      # Black-box battle suite against the freshly built debug binaries. The
+      # release workflow separately builds and tests the exact packages that
+      # ship, avoiding a second multi-hundred-MiB model link on every push.
       - name: battle suite (bench/battle/run_battle.sh)
         env:
           # Point the harness at the debug binaries we just built.
@@ -196,12 +195,11 @@ jobs:
           }
           exit 0
 
-  # Heavier validation: the soak/stress loop + the release-build
-  # invariant. Runs only on pull_request and on the default branch to
-  # avoid spending the long runtime on every feature-branch push.
+  # Heavier validation runs nightly and on explicit dispatch. Release package
+  # validation belongs to release.yml and is not duplicated here.
   soak:
-    name: soak + release invariant (${{ matrix.os }})
-    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    name: nightly soak (${{ matrix.os }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -236,20 +234,14 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y sqlite3
 
-      - name: Build debug + release binaries
-        run: |
-          cargo build --bins
-          cargo build --release --bins
+      - name: Build debug binaries
+        run: cargo build --bins
 
-      # BATTLE_RELEASE folds in a release-build invariant; BATTLE_SOAK
-      # appends the soak loop. We use a reduced iteration count so the
-      # job finishes in a few minutes while still soaking the loop.
-      - name: battle suite + soak + release invariant
+      - name: battle suite + soak
         env:
           GREPPY_BIN: ${{ github.workspace }}/target/debug/greppy
           GREPPY_GREP_BIN: ${{ github.workspace }}/target/debug/greppy-grep
           BATTLE_SOAK: "1"
-          BATTLE_RELEASE: "1"
           BATTLE_SOAK_ITERS: "100"
           BATTLE_SOAK_FILES: "40"
         run: bash bench/battle/run_battle.sh

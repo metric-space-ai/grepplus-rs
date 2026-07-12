@@ -1,16 +1,11 @@
-//! `greppy-grep` — the drop-in `grep` wrapper binary.
+//! `greppy-grep` — byte-exact real-`grep` passthrough.
 //!
-//! The safe baseline discovers the real `grep`
-//! binary, forwards argv verbatim, forwards stdin, and forwards stdout,
-//! stderr, and exit code. On top of that baseline the wrapper can apply
-//! heuristic augmentation.
+//! Structured and semantic code navigation lives behind explicit `greppy`
+//! subcommands. Ordinary grep invocations never synthesize output, create
+//! sidecars, inspect the code index, or alter grep's exit status.
 //!
 //! The binary is invoked as `greppy-grep` (or via a `greppy grep`
 //! subcommand in the unified `greppy` CLI in `crates/cli`).
-
-pub mod heuristic;
-pub mod run;
-pub mod sidecar;
 
 use std::ffi::OsString;
 use std::io::Read;

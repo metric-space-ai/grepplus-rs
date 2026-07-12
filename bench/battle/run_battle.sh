@@ -20,6 +20,11 @@ BATTLE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$BATTLE_DIR/../.." && pwd)}"
 export WORKSPACE_ROOT
 
+# Battle exercises graph, freshness, concurrency, and grep contracts. Debug
+# binaries may skip the embedded models here; release binaries ignore this
+# test-only switch. Packaged real inference has separate release gates.
+export GREPPY_TEST_SKIP_INFERENCE=1
+
 GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy}"
 GREPPY_GREP_BIN="${GREPPY_GREP_BIN:-$WORKSPACE_ROOT/target/debug/greppy-grep}"
 

@@ -92,10 +92,40 @@ fn run_with_env(
     store_dir: &Path,
     envs: &[(&str, &str)],
 ) -> (i32, String, String) {
+    run_command(args, cwd, store_dir, envs, true)
+}
+
+fn run_with_inference(args: &[&str], cwd: &Path, store_dir: &Path) -> (i32, String, String) {
+    run_command(
+        args,
+        cwd,
+        store_dir,
+        &[
+            ("GREPPY_EMBED_DAEMON_MODEL_TTL_S", "5"),
+            ("GREPPY_EMBED_DAEMON_EXIT_TTL_S", "15"),
+            ("GREPPY_SUMMARIZE_DAEMON_MODEL_TTL_S", "5"),
+            ("GREPPY_SUMMARIZE_DAEMON_EXIT_TTL_S", "15"),
+        ],
+        false,
+    )
+}
+
+fn run_command(
+    args: &[&str],
+    cwd: &Path,
+    store_dir: &Path,
+    envs: &[(&str, &str)],
+    skip_inference: bool,
+) -> (i32, String, String) {
     let mut cmd = Command::new(bin());
     cmd.args(args)
         .current_dir(cwd)
         .env("GREPPY_STORE_DIR", store_dir);
+    if skip_inference {
+        // Most cases verify deterministic navigation and freshness contracts.
+        // The dedicated semantic case below deliberately leaves this unset.
+        cmd.env("GREPPY_TEST_SKIP_INFERENCE", "1");
+    }
     for (key, value) in envs {
         cmd.env(key, value);
     }
@@ -113,6 +143,16 @@ fn index_fixture(tag: &str) -> (PathBuf, PathBuf) {
     assert_eq!(
         code, 0,
         "index . should succeed; stderr={err}\nstdout={out}"
+    );
+    (repo, store)
+}
+
+fn index_fixture_with_inference(tag: &str) -> (PathBuf, PathBuf) {
+    let (repo, store) = make_repo(tag);
+    let (code, out, err) = run_with_inference(&["index", "."], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "inference index should succeed; stderr={err}\nstdout={out}"
     );
     (repo, store)
 }
@@ -219,12 +259,12 @@ fn context_exact_module_header_uses_display_name() {
 // lexical union.
 #[test]
 fn context_multiword_query_returns_semantic_locators() {
-    let (repo, store) = index_fixture("ctx-rich-research");
+    let (repo, store) = index_fixture_with_inference("ctx-rich-research");
 
     // "do_it helper" is two tokens -> never a bare identifier. It should not
     // take the exact-name locator fast path; with the embedded model default it
     // takes the semantic locator/digest path.
-    let (code, out, err) = run(&["context", "do_it helper"], &repo, &store);
+    let (code, out, err) = run_with_inference(&["context", "do_it helper"], &repo, &store);
     assert_eq!(
         code, 0,
         "multi-word context should resolve and exit 0; stderr={err}\nstdout={out}"
@@ -409,12 +449,11 @@ fn context_requires_a_query() {
     );
 }
 
-/// D2 fail-open: stale context serves spans (from the CURRENT files on
-/// disk — the store only supplies locations), labeled with a stderr
-/// warning, instead of refusing. The kill switch pins the labeled
-/// path; the default policy would auto-heal this one-file drift.
+/// A stale graph location must never be combined with current source text.
+/// With automatic refresh disabled, context refuses the request and emits no
+/// indexed span.
 #[test]
-fn context_serves_labeled_stale_spans_when_auto_reindex_disabled() {
+fn context_refuses_stale_spans_when_auto_reindex_disabled() {
     let (repo, store) = index_fixture("ctx-stale");
     std::fs::write(
         repo.join("src/helper.rs"),
@@ -429,29 +468,24 @@ fn context_serves_labeled_stale_spans_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
-        "labeled-stale context must serve spans; stderr={err}\nstdout={out}"
+        code, 75,
+        "stale context must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grep index'"),
-        "labeled-stale context must warn on stderr; stderr={err:?}"
+        out.contains("graph freshness is drift") && out.contains("no stale indexed spans emitted"),
+        "stale context must explain the refusal; stdout={out:?}"
     );
     assert!(
-        out.contains("do_it"),
-        "labeled-stale context must serve the indexed definition; got: {out:?}"
-    );
-    // Span bodies come from the CURRENT file, never from a stale cache:
-    // the old body marker was removed on disk, so it must not appear.
-    assert!(
-        !out.contains("DO_IT_BODY_MARKER"),
-        "context bodies must reflect the current file content; got: {out:?}"
+        !out.contains("pub fn do_it") && !out.contains("DO_IT_BODY_MARKER"),
+        "stale context must not emit indexed source; got: {out:?}"
     );
 }
 
-/// D2: the same drift with the default policy is auto-healed; context
-/// then reflects the current tree.
+/// The default policy may start an inline/background refresh, but the current
+/// request still refuses the old generation. A later retry may use the newly
+/// published generation.
 #[test]
-fn context_auto_reindexes_small_stale_drift() {
+fn context_refuses_current_request_while_small_drift_refreshes() {
     let (repo, store) = index_fixture("ctx-heal");
     std::fs::write(
         repo.join("src/helper.rs"),
@@ -461,12 +495,13 @@ fn context_auto_reindexes_small_stale_drift() {
 
     let (code, out, err) = run(&["context", "do_it_changed"], &repo, &store);
     assert_eq!(
-        code, 0,
-        "healed context must find the CURRENT symbol; stderr={err}\nstdout={out}"
+        code, 75,
+        "refreshing context must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     assert!(
-        out.contains("do_it_changed") && out.contains("src/helper.rs:"),
-        "healed context must serve the new definition; got: {out:?}"
+        out.contains("graph freshness is refreshing")
+            && out.contains("no stale indexed spans emitted"),
+        "context must refuse while the replacement generation is publishing; got: {out:?}"
     );
 }
 
@@ -560,25 +595,10 @@ fn plus_json_reports_budget_and_ranked_hits_without_changing_text_default() {
 fn plus_vectors_json_skips_embedding_on_literal_control_before_model_load() {
     let (repo, store) = index_fixture("plus-vector-literal-control");
 
-    let (code, out, err) = run(
-        &[
-            "plus",
-            "do_it",
-            "--vectors",
-            "--json",
-            "--embedding-gguf",
-            "/missing/embeddinggemma.gguf",
-            "--embedding-tokenizer",
-            "/missing/tokenizer.json",
-            "--k",
-            "1",
-        ],
-        &repo,
-        &store,
-    );
+    let (code, out, err) = run(&["plus", "do_it", "--json", "--k", "1"], &repo, &store);
     assert_eq!(
         code, 0,
-        "literal plus --vectors should skip vector model load and still return exact plus hits; stderr={err}\nstdout={out}"
+        "literal plus should skip vector model load and still return exact plus hits; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
@@ -607,24 +627,13 @@ fn plus_vectors_json_skips_embedding_on_graph_control_before_model_load() {
     let (repo, store) = index_fixture("plus-vector-graph-control");
 
     let (code, out, err) = run(
-        &[
-            "plus",
-            "Who calls DoIt",
-            "--vectors",
-            "--json",
-            "--embedding-gguf",
-            "/missing/embeddinggemma.gguf",
-            "--embedding-tokenizer",
-            "/missing/tokenizer.json",
-            "--k",
-            "1",
-        ],
+        &["plus", "Who calls DoIt", "--json", "--k", "1"],
         &repo,
         &store,
     );
     assert!(
         code == 0 || code == 1,
-        "graph-control plus --vectors should skip vector model load and return normal plus JSON; code={code}; stderr={err}\nstdout={out}"
+        "graph-control plus should skip vector model load and return normal plus JSON; code={code}; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
@@ -666,11 +675,10 @@ fn plus_code_flag_prints_source_span_under_hit() {
     );
 }
 
-/// D2 fail-open, small drift: plus auto-heals the one-file edit and
-/// answers FRESH about the current tree (the old contract refused with
-/// `skipped_stale_index` + exit 1 and served nothing).
+/// A refresh can be started for small drift, but plus must not expose rows
+/// from the old generation in the triggering request.
 #[test]
-fn plus_json_auto_reindexes_small_stale_drift() {
+fn plus_json_refuses_current_request_while_small_drift_refreshes() {
     let (repo, store) = index_fixture("plus-json-stale");
     std::fs::write(
         repo.join("src/helper.rs"),
@@ -680,34 +688,21 @@ fn plus_json_auto_reindexes_small_stale_drift() {
 
     let (code, out, err) = run(&["plus", "do_it", "--json", "--k", "3"], &repo, &store);
     assert_eq!(
-        code, 0,
-        "healed plus must answer from the current tree; stderr={err}\nstdout={out}"
+        code, 75,
+        "refreshing plus must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "plus");
-    assert_eq!(v["status"], "ok");
-    assert_eq!(
-        v["fresh"], true,
-        "auto-reindex must yield a fresh answer: {v:?}"
-    );
-    // `do_it` is still referenced by the (unchanged) caller in lib.rs,
-    // so the healed index serves current hits.
-    assert!(
-        !v["hits"].as_array().unwrap().is_empty(),
-        "healed plus must serve current hits: {v:?}"
-    );
-    assert!(
-        !out.contains("DO_IT_BODY_MARKER"),
-        "healed plus must not emit bodies that no longer exist on disk; got: {out:?}"
-    );
+    assert_eq!(v["status"], "skipped_stale_index");
+    assert_eq!(v["fresh"], false);
+    assert_eq!(v["freshness"]["state"], "refreshing");
+    assert!(v["hits"].as_array().is_some_and(Vec::is_empty));
 }
 
-/// D2 fail-open: with the auto-reindex kill switch set, stale plus
-/// serves the OLD indexed hits, labeled via stderr, instead of
-/// suppressing all output.
+/// With automatic refresh disabled, stale plus refuses all indexed signals.
 #[test]
-fn plus_serves_labeled_stale_hits_when_auto_reindex_disabled() {
+fn plus_refuses_stale_hits_when_auto_reindex_disabled() {
     let (repo, store) = index_fixture("plus-stale");
     std::fs::write(
         repo.join("src/helper.rs"),
@@ -722,16 +717,16 @@ fn plus_serves_labeled_stale_hits_when_auto_reindex_disabled() {
         &[("GREPPY_AUTO_REINDEX", "0")],
     );
     assert_eq!(
-        code, 0,
-        "labeled-stale plus must serve indexed hits; stderr={err}\nstdout={out}"
+        code, 75,
+        "stale plus must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     assert!(
-        err.contains("index may be stale") && err.contains("run 'grep index'"),
-        "labeled-stale plus must warn on stderr; stderr={err:?}"
+        err.contains("graph freshness is drift") && err.contains("no stale indexed hits emitted"),
+        "stale plus must explain the refusal; stderr={err:?}"
     );
     assert!(
-        out.contains("src/") && out.contains("do_it"),
-        "labeled-stale plus must serve rows from the existing index; got: {out:?}"
+        out.contains("no usable index") && !out.contains("src/helper.rs"),
+        "stale plus must not serve indexed rows; got: {out:?}"
     );
 }
 
@@ -798,6 +793,46 @@ fn who_calls_without_code_omits_body() {
         out.contains("caller") && !out.contains("CALLER_BODY_MARKER"),
         "who-calls (no --code) must be pointer-only; got: {out:?}"
     );
+}
+
+#[test]
+fn brief_json_preserves_definition_and_expand_contract() {
+    let (repo, store) = index_fixture("brief-json-contract");
+
+    let (code, out, err) = run(&["brief", "caller", "--json"], &repo, &store);
+    assert_eq!(code, 0, "brief --json should exit 0; stderr={err}");
+    let value: serde_json::Value =
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("brief JSON invalid: {e}: {out}"));
+    assert_eq!(value["schema_version"], "greppy.brief.v1");
+    assert_eq!(value["command"], "brief");
+    assert_eq!(value["status"], "ok");
+    let definition = &value["definitions"][0];
+    assert_eq!(definition["file_path"], "src/lib.rs");
+    assert_eq!(definition["start_line"], 5);
+    assert_eq!(definition["end_line"], 8);
+    assert_eq!(definition["signature"], "fn caller()");
+    assert!(
+        definition["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("CALLER_BODY_MARKER")),
+        "brief JSON must contain the unchanged full source span: {definition}"
+    );
+    assert!(definition["summary"].is_array());
+
+    let expand_id = value["expand_id"]
+        .as_str()
+        .expect("brief JSON must return a stored expand id");
+    let (expand_code, expand_out, expand_err) =
+        run(&["expand", expand_id, "--json"], &repo, &store);
+    assert_eq!(
+        expand_code, 0,
+        "brief expand handle must be immediately readable; stderr={expand_err}"
+    );
+    let expanded: serde_json::Value = serde_json::from_str(&expand_out).unwrap();
+    assert_eq!(expanded["id"], expand_id);
+    assert!(expanded["payload_text"]
+        .as_str()
+        .is_some_and(|source| source.contains("CALLER_BODY_MARKER")));
 }
 
 #[test]

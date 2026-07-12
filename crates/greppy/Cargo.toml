@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "greppy grep drop-in wrapper (real grep passthrough + heuristics)"
+description = "greppy byte-exact real-grep passthrough"
 
 [[bin]]
 name = "greppy-grep"
@@ -17,11 +17,10 @@ path = "examples/freshness-probe.rs"
 
 [dependencies]
 greppy-core = { path = "../core" }
+which = { workspace = true }
+
+[dev-dependencies]
 greppy-freshness = { path = "../freshness" }
-greppy-search = { path = "../search" }
 greppy-store = { path = "../store" }
 greppy-indexer = { path = "../indexer" }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
-which = { workspace = true }

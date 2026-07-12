@@ -313,35 +313,7 @@ pub fn touch_last_used_dir(dir: &Path) {
             return;
         }
     }
-    if atomic_write(&marker, unix_now_secs().to_string().as_bytes()).is_ok() {
-        prune_expired_sidecars(dir);
-    }
-}
-
-fn prune_expired_sidecars(dir: &Path) {
-    let now = SystemTime::now();
-    let ttl = Duration::from_secs(24 * 60 * 60);
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if !name.ends_with("__CODE_CONTEXT_NONCANONICAL.md") {
-            continue;
-        }
-        let expired = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| now.duration_since(t).ok())
-            .is_some_and(|age| age > ttl);
-        if expired {
-            let _ = fs::remove_file(path);
-        }
-    }
+    let _ = atomic_write(&marker, unix_now_secs().to_string().as_bytes());
 }
 
 pub fn acquire_workspace_lifecycle(
@@ -387,6 +359,7 @@ pub fn acquire_named_lock(
         .create(true)
         .truncate(false)
         .open(&path)?;
+    secure_private_file(&path)?;
     match lock_file(&file, mode, nonblocking) {
         Ok(true) => Ok(Some(FileLock { file, path })),
         Ok(false) => Ok(None),
@@ -976,6 +949,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .create(true)
         .truncate(true)
         .open(&tmp)?;
+    secure_private_file(&tmp)?;
     f.write_all(bytes)?;
     f.sync_all()?;
     fs::rename(&tmp, path)
@@ -1008,12 +982,88 @@ fn ensure_one_directory(dir: &Path) -> io::Result<()> {
     } else {
         fs::create_dir_all(dir)?;
     }
+    secure_private_directory(dir)
+}
+
+pub fn secure_private_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+        return fs::set_permissions(path, fs::Permissions::from_mode(0o700));
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        secure_windows_path(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+pub fn secure_private_file(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(windows)]
+    {
+        secure_windows_path(path)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn secure_windows_path(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+
+    fn wide(value: &std::ffi::OsStr) -> Vec<u16> {
+        value.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let descriptor_text = wide(std::ffi::OsStr::new("D:P(A;;FA;;;OW)(A;;FA;;;SY)"));
+    let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            descriptor_text.as_ptr(),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let path = wide(path.as_os_str());
+    let applied = unsafe {
+        SetFileSecurityW(
+            path.as_ptr(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if applied == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 fn namespace_chain_is_safe(dir: &Path) -> bool {

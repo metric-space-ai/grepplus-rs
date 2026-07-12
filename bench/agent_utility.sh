@@ -1,48 +1,24 @@
 #!/usr/bin/env bash
-# Agent-utility corpus.
-#
-# For each agent-style invocation we record how much information
-# greppy-grep surfaces on top of real grep:
-#
-#   - real_grep_bytes: real grep's stdout byte count (control)
-#   - sub_grep_bytes : greppy-grep's stdout byte count (subject)
-#   - delta_bytes    : subject - control  (= 0 for STRICT/SIDECAR,
-#                       ≥ length-of-synthetic-line for VISIBLE_AUGMENT)
-#   - sidecar_path   : path to the .md sidecar file (if any)
-#   - sidecar_bytes  : size of the .md sidecar file
-#   - synth_count    : how many GREPPY_NON_CANONICAL_HIT lines appeared
-#                       in the subject's stdout
-#   - exit_code      : real-grep exit code (must be preserved by the
-#                       wrapper modulo signal handling)
-#
-# This is a smoke test, not a statistically rigorous benchmark. The
-# numbers it prints are useful for detecting regressions.
+# Agent-style grep passthrough corpus. Semantic value is exposed only through
+# explicit greppy commands; ordinary grep invocations remain byte-exact.
 
 set -uo pipefail
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy}"
-REAL_GREP="${REAL_GREP:-/usr/bin/grep}"
+REAL_GREP="${REAL_GREP:-$(command -v grep)}"
 CORPUS_SRC="${CORPUS_SRC:-$WORKSPACE_ROOT/bench/fixtures/sample}"
-# Copy the fixture to a temp dir so the indexer's
-# detect_repo_root / walk don't accidentally pick up the parent
-# greppy workspace. See bench/grep_compat.sh for the same
-# rationale.
+
 CORPUS_ROOT="$(mktemp -d -t greppy-agent-utility.XXXXXX)"
+STORE_ROOT="$(mktemp -d -t greppy-agent-store.XXXXXX)"
+trap 'rm -rf "$CORPUS_ROOT" "$STORE_ROOT"' EXIT
 cp -R "$CORPUS_SRC/." "$CORPUS_ROOT/"
 rm -rf "$CORPUS_ROOT/.greppy" "$CORPUS_ROOT/.git"
-trap 'rm -rf "$CORPUS_ROOT"' EXIT
+export GREPPY_STORE_DIR="$STORE_ROOT"
 
-cd "$CORPUS_ROOT"
+# Keep a fresh graph in scope to prove it cannot alter ordinary grep output.
+GREPPY_TEST_SKIP_INFERENCE=1 "$GREPPY_BIN" index "$CORPUS_ROOT" >/dev/null 2>&1
 
-# Always reindex from scratch so the freshness gate is Fresh and
-# VISIBLE_AUGMENT can take effect.
-rm -rf .greppy "${TMPDIR:-/tmp}"/greppy 2>/dev/null || true
-"$GREPPY_BIN" index "$CORPUS_ROOT" >/dev/null 2>&1
-
-# Corpus of agent-style invocations. Each row is space-separated argv
-# tokens (without the binary name). We use `|` as a separator and
-# decode with IFS.
 CORPUS=(
   "-R|hello|."
   "-R|ProcessOrder|."
@@ -51,17 +27,15 @@ CORPUS=(
   "-R|build_default_order|."
   "-R|Greeter|."
   "-R|fmt|."
-  "-R|payment_retry|."      # Python symbol — should still find via raw
-                            # grep but the sidecar will say no Rust
-                            # symbol because Python is unsupported.
-  "-R|process_payment|."    # Python symbol — same.
-  "-R|nonexistent_symbol_xyz|."  # No real-grep matches, sidecar
-                                # may still appear with empty hits.
+  "-R|payment_retry|."
+  "-R|process_payment|."
+  "-R|nonexistent_symbol_xyz|."
+  "-Rn|hello|."
+  "-Rc|hello|."
 )
 
-printf "%-50s %-4s %-12s %-12s %-12s %-12s %-12s %-6s %s\n" \
-  "command" "rc" "real_b" "sub_b" "delta_b" "sidecar_b" "synth_n" "side" "sentinel?"
-echo "------------------------------------------------------------------------------------------------------------------------------------------------------------------------"
+printf "%-50s %-6s %-12s %-12s %s\n" "command" "rc" "stdout_b" "stderr_b" "contract"
+echo "-----------------------------------------------------------------------------------------------"
 
 pass=0
 fail=0
@@ -70,89 +44,28 @@ declare -a failures
 for entry in "${CORPUS[@]}"; do
   IFS='|' read -r -a argv <<< "$entry"
   pretty="${argv[*]}"
+  sub_out="$(mktemp)"; sub_err="$(mktemp)"
+  ref_out="$(mktemp)"; ref_err="$(mktemp)"
 
-  real_out=$(mktemp)
-  sub_out=$(mktemp)
-  sub_err=$(mktemp)
-  # Real grep (control) — capture exit code without `|| true` masking it.
-  "$REAL_GREP" "${argv[@]}" >"$real_out" 2>/dev/null
-  real_rc=$?
-  # Subject.
-  "$GREPPY_BIN" "${argv[@]}" >"$sub_out" 2>"$sub_err"
+  ( cd "$CORPUS_ROOT" && "$GREPPY_BIN" "${argv[@]}" ) >"$sub_out" 2>"$sub_err"
   sub_rc=$?
+  ( cd "$CORPUS_ROOT" && "$REAL_GREP" "${argv[@]}" ) >"$ref_out" 2>"$ref_err"
+  ref_rc=$?
 
-  real_b=$(wc -c <"$real_out" | tr -d ' ')
-  sub_b=$(wc -c <"$sub_out" | tr -d ' ')
-  delta_b=$(( sub_b - real_b ))
-  synth_n=$(grep -c 'GREPPY_NON_CANONICAL_HIT' "$sub_out" 2>/dev/null || echo 0)
-  sidecar=$(find "${TMPDIR:-/tmp}" -type f \
-            -name "*__GREPPY_SEMANTIC_NONCANONICAL.md" \
-            -newer "$real_out" 2>/dev/null | sort | tail -1 || true)
-  sidecar_b=0
-  sentinel="no"
-  if [[ -n "$sidecar" && -f "$sidecar" ]]; then
-    sidecar_b=$(wc -c <"$sidecar" | tr -d ' ')
-    sentinel=$(grep -c 'GREPPY_NON_CANONICAL_HIT' "$sidecar" 2>/dev/null || echo 0)
-    [[ "$sentinel" -ge 1 ]] && sentinel="yes" || sentinel="no"
-  fi
-
-  # Expectations:
-  #   rc       — must match real_rc exactly
-  #   sidecar  — if real-grep found hits AND we are in VISIBLE_AUGMENT
-  #              territory, expect a sidecar with sentinel.
-  #              If real-grep found NO hits, no sidecar is expected
-  #              (semantic-on-miss is opt-in via
-  #              GREPPY_SEMANTIC_ON_MISS=1, default off).
-  ok=1
-  reason=""
-  if [[ "$real_rc" != "$sub_rc" ]]; then
-    ok=0
-    reason="rc mismatch (real=$real_rc sub=$sub_rc)"
-  fi
-  if [[ "${argv[0]}" == "-R" && ${#argv[@]} -ge 3 \
-        && "${argv[${#argv[@]}-1]}" == "." ]]; then
-    if [[ "$real_rc" == "0" ]]; then
-      # Real-grep found matches. The wrapper's stdout must be a
-      # byte-prefix of real-grep's output (no synthetic bytes
-      # interleaved) when in Strict or Sidecar mode, OR a
-      # byte-prefix + sentinel line when in VISIBLE_AUGMENT mode.
-      # We assert the byte-prefix property for every match case.
-      if [[ "$real_b" -gt 0 ]] && [[ "${real_out:0:$real_b}" != "${sub_out:0:$real_b}" ]]; then
-        ok=0
-        reason="subject output does not start with real-grep bytes"
-      fi
-    else
-      # Real-grep found no matches → no synthetic
-      # line / sidecar by default. Sub exit code must be 1, and
-      # subject stdout must be byte-exact empty (no synthetic
-      # line appended).
-      if [[ "$sub_rc" != "1" ]]; then
-        ok=0
-        reason="exit code should be 1 on no-match (got $sub_rc)"
-      fi
-      if [[ "$sub_b" -ne 0 ]]; then
-        ok=0
-        reason="stdout must be empty on no-match (got $sub_b bytes: <<<$(cat "$sub_out")>>>)"
-      fi
-      if [[ "$synth_n" -ne 0 ]]; then
-        ok=0
-        reason="no synthetic sentinel expected on no-match (found $synth_n)"
-      fi
-    fi
-  fi
-
-  if [[ "$ok" -eq 1 ]]; then
-    printf "%-50s %-4s %-12s %-12s %-12s %-12s %-12s %-6s %s\n" \
-      "$pretty" "$sub_rc" "$real_b" "$sub_b" "$delta_b" "$sidecar_b" "$synth_n" "$( [[ -n "$sidecar" ]] && echo yes || echo no )" "$sentinel"
+  stdout_b=$(wc -c <"$sub_out" | tr -d ' ')
+  stderr_b=$(wc -c <"$sub_err" | tr -d ' ')
+  if [[ "$sub_rc" -eq "$ref_rc" ]] && cmp -s "$sub_out" "$ref_out" \
+      && cmp -s "$sub_err" "$ref_err"; then
+    printf "%-50s %-6s %-12s %-12s %s\n" "$pretty" "$sub_rc" "$stdout_b" "$stderr_b" byte-exact
     pass=$((pass + 1))
   else
-    printf "%-50s %-4s %-12s %-12s %-12s %-12s %-12s %-6s %s  [FAIL: %s]\n" \
-      "$pretty" "$sub_rc" "$real_b" "$sub_b" "$delta_b" "$sidecar_b" "$synth_n" "$( [[ -n "$sidecar" ]] && echo yes || echo no )" "$sentinel" "$reason"
+    printf "%-50s %-6s %-12s %-12s %s\n" "$pretty" "$sub_rc" "$stdout_b" "$stderr_b" FAIL
+    failures+=("$pretty: rc $sub_rc/$ref_rc or byte mismatch")
+    diff -u "$ref_out" "$sub_out" | head -12
+    diff -u "$ref_err" "$sub_err" | head -12
     fail=$((fail + 1))
-    failures+=("$pretty: $reason")
   fi
-
-  rm -f "$real_out" "$sub_out" "$sub_err"
+  rm -f "$sub_out" "$sub_err" "$ref_out" "$ref_err"
 done
 
 echo ""
@@ -160,9 +73,6 @@ echo "=== agent_utility.sh summary ==="
 echo "pass: $pass"
 echo "fail: $fail"
 if [[ "$fail" -gt 0 ]]; then
-  echo "failed entries:"
-  for f in "${failures[@]}"; do
-    echo "  - $f"
-  done
+  printf '  - %s\n' "${failures[@]}"
 fi
 [[ "$fail" -eq 0 ]]

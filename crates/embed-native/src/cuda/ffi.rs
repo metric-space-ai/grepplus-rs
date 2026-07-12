@@ -607,6 +607,10 @@ fn materialize_cuda_library(blob: &[u8]) -> std::result::Result<PathBuf, String>
     let dir = cuda_runtime_cache_root().join(&digest);
     ensure_private_runtime_dir(&dir)?;
     let path = dir.join(format!("greppy-cuda-backend.{extension}"));
+    if path.exists() {
+        greppy_core::cache::secure_private_file(&path)
+            .map_err(|error| format!("secure CUDA backend {}: {error}", path.display()))?;
+    }
     if verified_cuda_library(&path, blob.len(), &digest) {
         return Ok(path);
     }
@@ -628,6 +632,8 @@ fn materialize_cuda_library(blob: &[u8]) -> std::result::Result<PathBuf, String>
     let mut file = options
         .open(&temporary)
         .map_err(|error| format!("create {}: {error}", temporary.display()))?;
+    greppy_core::cache::secure_private_file(&temporary)
+        .map_err(|error| format!("secure {}: {error}", temporary.display()))?;
     if let Err(error) = file.write_all(blob).and_then(|_| file.sync_all()) {
         let _ = std::fs::remove_file(&temporary);
         return Err(format!("write {}: {error}", temporary.display()));
@@ -645,6 +651,8 @@ fn materialize_cuda_library(blob: &[u8]) -> std::result::Result<PathBuf, String>
         let _ = std::fs::remove_file(&temporary);
         format!("install bundled CUDA backend {}: {error}", path.display())
     })?;
+    greppy_core::cache::secure_private_file(&path)
+        .map_err(|error| format!("secure installed CUDA backend {}: {error}", path.display()))?;
     if verified_cuda_library(&path, blob.len(), &digest) {
         Ok(path)
     } else {
@@ -700,6 +708,8 @@ fn cuda_runtime_cache_root() -> PathBuf {
 fn ensure_private_runtime_dir(path: &Path) -> std::result::Result<(), String> {
     std::fs::create_dir_all(path)
         .map_err(|error| format!("create CUDA runtime cache {}: {error}", path.display()))?;
+    greppy_core::cache::secure_private_directory(path)
+        .map_err(|error| format!("secure CUDA runtime cache {}: {error}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};

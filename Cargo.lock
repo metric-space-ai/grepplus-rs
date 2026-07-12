@@ -680,6 +680,7 @@ dependencies = [
  "block2",
  "bytemuck",
  "gemm",
+ "greppy-core",
  "half",
  "libc",
  "libloading",
@@ -717,11 +718,8 @@ dependencies = [
  "greppy-core",
  "greppy-freshness",
  "greppy-indexer",
- "greppy-search",
  "greppy-store",
  "serde_json",
- "thiserror 1.0.69",
- "tracing",
  "which",
 ]
 

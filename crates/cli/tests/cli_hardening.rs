@@ -538,10 +538,6 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
         &[
             "semantic-search",
             "--json",
-            "--embedding-gguf",
-            "/missing/embeddinggemma.gguf",
-            "--embedding-tokenizer",
-            "/missing/tokenizer.json",
             "find provider policy semantic vector marker",
         ],
         &repo,
@@ -576,16 +572,7 @@ fn provider_policy_require_complete_blocks_plus_vectors_before_model_config() {
     );
 
     let (code, out, err) = run_with_env(
-        &[
-            "plus",
-            "provider_policy_plus_marker",
-            "--vectors",
-            "--json",
-            "--embedding-gguf",
-            "/missing/embeddinggemma.gguf",
-            "--embedding-tokenizer",
-            "/missing/tokenizer.json",
-        ],
+        &["plus", "provider_policy_plus_marker", "--json"],
         &repo,
         &store,
         &[("GREPPY_PROVIDER_POLICY", "require_complete")],
@@ -1238,6 +1225,21 @@ fn doctor_json_reports_missing_index_as_structured_status() {
     assert_eq!(v["project"], "repo");
     assert_eq!(v["project_present"], false);
     assert_eq!(v["fresh"], false);
+    for model in ["embedding", "summary"] {
+        assert_eq!(v["inference"]["models"][model]["embedded"], true);
+        assert_eq!(
+            v["inference"]["models"][model]["model_sha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+        assert_eq!(
+            v["inference"]["models"][model]["tokenizer_sha256"]
+                .as_str()
+                .map(str::len),
+            Some(64)
+        );
+    }
 }
 
 #[test]

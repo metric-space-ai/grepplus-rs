@@ -33,7 +33,6 @@ standalone and prints its own `PASS`/`FAIL` lines plus a machine-readable
 | `BATTLE_SOAK_ITERS` | 200 | iterations of the SOAK index→edit→reindex→search→grep loop |
 | `BATTLE_SOAK_FILES` | 40 | corpus size for SOAK |
 | `BATTLE_SOAK_RSS_FACTOR` | 3 | max late/early RSS ratio for SOAK |
-| `BATTLE_SOAK_SIDECAR_CAP` | 64 | max live sidecars allowed at any checkpoint |
 | `BATTLE_RELEASE` | `0` | set `1` to add a release-build invariant to `run_battle.sh` |
 
 The **soak** battle is opt-in (slow). Run it directly with a small count:
@@ -178,29 +177,6 @@ during open to `EX_TEMPFAIL` with a diagnostic.
 The concurrency battle asserts this contract honestly and **fails** until
 the underlying behaviour is fixed.
 
-### Finding #3 — Sidecar TTL cleanup runs only on the `greppy-grep` binary — *informational*
-
-Sidecar `*__GREPPY_SEMANTIC_NONCANONICAL.md` files are written by **both**
-augmenting paths: the `greppy` (cli) drop-in and the `greppy-grep`
-drop-in. The probabilistic TTL cleanup (`maybe_run_sidecar_cleanup`,
-honouring `GREPPY_SIDECAR_TTL_SECS`) is wired into the startup of the
-**`greppy-grep`** binary only (`crates/greppy/src/main.rs`); the
-`greppy` cli binary (`crates/cli`) does not invoke it. The cleanup also
-walks the **current working directory's** store dir, not an explicit
-`--root`/`GREPPY_STORE_DIR` target passed to a one-shot invocation.
-
-**Impact:** in a deployment that only ever invokes the `greppy` cli
-(never `greppy-grep`), expired sidecars are never reclaimed and can
-accumulate. When `greppy-grep` is part of the loop (the common drop-in
-case), reclamation works correctly: `soak.sh` verifies that backdated,
-expired sidecars are deleted (`before → after` strictly decreases) and
-that the live count stays bounded across 100+ iterations.
-
-This is **not** asserted as a failure — the soak battle drives
-`greppy-grep` so cleanup fires — but it is flagged so the owning track
-can decide whether the `greppy` cli should also run cleanup on start.
-Belongs to `crates/cli` / `crates/greppy`, **not** this track.
-
 ### What passes cleanly
 
 - **Determinism** (10/10): node/edge counts *and* full sets are
@@ -227,12 +203,11 @@ Belongs to `crates/cli` / `crates/greppy`, **not** this track.
   `IMPORTS` edge; `stats` per-label/per-type counts match graph.db
   exactly; `who-calls`/`callees`/`path`/`find-usages` return the right
   symbol per language; `search-symbols`/`search-code` find known
-  symbols/content in all six; the drop-in grep contract holds in its
-  STRICT regime and the semantic augmentation is additive on a fresh
-  graph; index-twice is byte-identical; the unsupported `.txt` produces
+  symbols/content in all six; grep-compatible passthrough remains byte-exact
+  even with a fresh graph in scope; index-twice is byte-identical; the unsupported `.txt` produces
   zero nodes.
 
-### Observation — multilang edge resolution & the `greppy -R` contract
+### Observation — multilang edge resolution and grep passthrough
 
 From `multilang.sh` against a six-language mixed repo (all asserted, all
 green — these are characteristics the suite now pins, not failures):
@@ -247,20 +222,10 @@ green — these are characteristics the suite now pins, not failures):
   resolved cross-file `IMPORTS` edge is produced. Asserted both ways (node
   present, resolved-edge count == 0) so a future change either direction
   is noticed. Owner: `crates/resolver` / `crates/parser`, not this track.
-- **`greppy -R` is the drop-in surface but NOT unconditionally
-  byte-exact.** When the indexed graph for the cwd is **fresh** and the
-  pattern has semantic graph hits, a plain recursive listing appends one
-  synthetic `…:1:<!-- GREPPY_NON_CANONICAL_HIT: <pat> -->` line per
-  query (`Mode::VisibleAugment` in `greppy_grep::run`). This is the
-  intended value-add, gated by `freshness_gate`. The suite therefore
-  asserts byte-exactness on the STRICT cases (`-R` no-hit patterns, `-Rc`
-  count mode, non-recursive single-file, and the pure `greppy-grep`
-  binary with no fresh store in scope) and separately asserts the
-  augmentation is present *and strictly additive* (every raw-grep line
-  preserved verbatim) on a fresh-graph hit pattern. Both halves of the
-  contract are pinned. Note `greppy-grep` augments too when a fresh
-  store is in scope — the "pure drop-in" guarantee is *no fresh index in
-  scope*, which is the canonical drop-in scenario.
+- **Both `greppy` and `greppy-grep` preserve ordinary grep behavior.** The
+  suite compares stdout, stderr, and exit status against system grep for hit,
+  miss, recursive, count, and single-file invocations while a fresh index is
+  present. Semantic context is available only from explicit greppy commands.
 
 ### Observation — cross-file `CALLS` resolution
 

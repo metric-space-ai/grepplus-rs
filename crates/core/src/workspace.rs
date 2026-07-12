@@ -226,22 +226,30 @@ pub fn ensure_db_mode(path: &Path) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn set_mode_700(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    crate::cache::secure_private_directory(path)
 }
 
 #[cfg(unix)]
 fn set_mode_600(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    crate::cache::secure_private_file(path)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_mode_700(path: &Path) -> std::io::Result<()> {
+    crate::cache::secure_private_directory(path)
+}
+
+#[cfg(windows)]
+fn set_mode_600(path: &Path) -> std::io::Result<()> {
+    crate::cache::secure_private_file(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_mode_700(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn set_mode_600(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

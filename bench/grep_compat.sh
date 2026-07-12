@@ -1,24 +1,13 @@
 #!/usr/bin/env bash
-# Contract-level invocations (real greppy-grep path).
-#
-# Each entry is a failing test that PASSES
-# only when greppy-grep behaves correctly. The legacy smoke tests
-# were rewritten here as assertions:
-#
-#   - byte-exact real-grep passthrough on Strict / Sidecar / miss,
-#   - no visible augmentation when real grep returned a non-match,
-#   - no DB pollution (`<root>/.greppy/graph.db` absent),
-#   - real-grep rc=2 does not synthesise a sidecar,
-#   - Sidecar path lives under $GREPPY_STORE_DIR, not under /tmp,
-#   - the freshness Strict gate keeps the wrapper Strict (default
-#     behaviour — no VISIBLE_AUGMENT for -q even on a fresh graph).
+# Contract-level invocations for the standalone passthrough binary.
+# Every invocation must preserve stdout, stderr, and the exit code exactly and
+# must not create index, model, or sidecar state.
 
 set -uo pipefail
 
 WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
 GREPPY_BIN="${GREPPY_BIN:-$WORKSPACE_ROOT/target/debug/greppy-grep}"
-INDEX_BIN="${INDEX_BIN:-$WORKSPACE_ROOT/target/debug/greppy}"
 FIXTURE_SRC="$WORKSPACE_ROOT/bench/fixtures/sample"
 
 if [[ ! -x "$GREPPY_BIN" ]]; then
@@ -41,8 +30,6 @@ rm -rf "$WORK/repo/.greppy"
 mkdir -p "$WORK/store"
 export GREPPY_STORE_DIR="$WORK/store"
 
-"$INDEX_BIN" index "$WORK/repo" >/dev/null 2>&1
-
 REAL_GREP=$(command -v grep)
 if [[ -z "$REAL_GREP" ]]; then
     REAL_GREP=/usr/bin/grep
@@ -53,19 +40,12 @@ fi
 # the freshness gate, so we keep cwd == repo root.
 cd "$WORK/repo"
 
-# Run the wrapper with `argv`. Returns exit code on stdout? No: capture
-# into globals to keep the helper readable.
-#   $actual    : wrapper stdout
-#   $rc        : wrapper exit code
-#   $expected  : real-grep stdout
-#   $expected_rc_actual : real-grep exit code
 run_pair() {
-    local label="$1"
     shift
     local args=( "$@" )
-    actual=$("$GREPPY_BIN" "${args[@]}" 2>&1)
+    "$GREPPY_BIN" "${args[@]}" >"$WORK/actual.out" 2>"$WORK/actual.err"
     rc=$?
-    expected=$("$REAL_GREP" "${args[@]}" 2>&1)
+    "$REAL_GREP" "${args[@]}" >"$WORK/expected.out" 2>"$WORK/expected.err"
     expected_rc_actual=$?
 }
 
@@ -77,11 +57,15 @@ assert_byte_for_byte() {
 
     run_pair "$label" "${args[@]}"
 
-    # Compare wrapper output vs real-grep output byte-for-byte.
-    if [[ "$actual" != "$expected" ]]; then
-        echo "FAIL $label (output diverges; rc actual=$rc expected=$expected_rc_actual)"
-        echo "  expected: <<<$expected>>>"
-        echo "  actual:   <<<$actual>>>"
+    if ! cmp -s "$WORK/actual.out" "$WORK/expected.out"; then
+        echo "FAIL $label (stdout diverges; rc actual=$rc expected=$expected_rc_actual)"
+        diff -u "$WORK/expected.out" "$WORK/actual.out" | head -20
+        fail=$((fail+1))
+        return
+    fi
+    if ! cmp -s "$WORK/actual.err" "$WORK/expected.err"; then
+        echo "FAIL $label (stderr diverges; rc actual=$rc expected=$expected_rc_actual)"
+        diff -u "$WORK/expected.err" "$WORK/actual.err" | head -20
         fail=$((fail+1))
         return
     fi
@@ -91,25 +75,10 @@ assert_byte_for_byte() {
         return
     fi
 
-    # Real-grep miss must be byte-exact empty and
-    # contain no synthetic line. real-grep rc=2 must not synthesise
-    # a sidecar or sentinel either.
     case "$mode" in
         miss)
-            if [[ -n "$actual" ]]; then
-                echo "FAIL $label (visible output on miss; expected empty: <<<$actual>>>)"
-                fail=$((fail+1))
-                return
-            fi
-            if grep -q GREPPY_NON_CANONICAL_HIT <<<"$actual"; then
-                echo "FAIL $label (synthetic sentinel on miss)"
-                fail=$((fail+1))
-                return
-            fi
-            ;;
-        err)
-            if grep -q GREPPY_NON_CANONICAL_HIT <<<"$actual"; then
-                echo "FAIL $label (synthetic sentinel on rc=2)"
+            if [[ -s "$WORK/actual.out" ]]; then
+                echo "FAIL $label (stdout must be empty on a real-grep miss)"
                 fail=$((fail+1))
                 return
             fi
@@ -120,39 +89,15 @@ assert_byte_for_byte() {
     pass=$((pass+1))
 }
 
-assert_no_db_pollution() {
-    local repo="$WORK/repo"
-    if [[ -e "$repo/.greppy/graph.db" ]]; then
-        echo "FAIL no-db-pollution — .greppy/graph.db exists inside repo"
-        fail=$((fail+1))
-    else
-        local count
-        count=$(find "$WORK/store" -type f -name 'graph.db' | wc -l | tr -d ' ')
-        if [[ "$count" -ge 1 ]]; then
-            echo "PASS no-db-pollution — DB under $WORK/store"
-            pass=$((pass+1))
-        else
-            echo "FAIL no-db-pollution — no DB anywhere"
-            fail=$((fail+1))
-        fi
-    fi
-}
-
-assert_no_sidecar_on_miss() {
-    # A fresh real-grep miss must produce NO sidecar file
-    # anywhere under the configured store dir.
-    local label="$1"
-    shift
-    local args=( "$@" )
-    local before after
-    before=$(find "$WORK/store" -type f -name '*__GREPPY_SEMANTIC_NONCANONICAL.md' 2>/dev/null | wc -l | tr -d ' ')
-    "$GREPPY_BIN" "${args[@]}" >/dev/null 2>&1 || true
-    after=$(find "$WORK/store" -type f -name '*__GREPPY_SEMANTIC_NONCANONICAL.md' 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "$before" == "$after" ]]; then
-        echo "PASS $label (no sidecar written on real-grep miss)"
+assert_no_passthrough_state() {
+    local files
+    files=$(find "$WORK/store" "$WORK/repo/.greppy" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$files" -eq 0 ]]; then
+        echo "PASS no-passthrough-state"
         pass=$((pass+1))
     else
-        echo "FAIL $label (sidecar count: $before -> $after on a real-grep miss)"
+        echo "FAIL no-passthrough-state ($files files created)"
+        find "$WORK/store" "$WORK/repo/.greppy" -type f 2>/dev/null | sed 's/^/  /'
         fail=$((fail+1))
     fi
 }
@@ -175,15 +120,9 @@ assert_byte_for_byte "STRICT -F literal" ok -F "fn hello" src
 assert_byte_for_byte "STRICT --label" ok --label=foo -c hello src
 assert_byte_for_byte "STRICT -n -H" ok -nH hello src
 
-# Real-grep rc=2 path (e.g. unreadable dir). Augmentation must be
-# silent — no sentinel, no sidecar.
 assert_byte_for_byte "STRICT -R missing-dir (rc=2)" err -R anything /no/such/dir
 
-# Real-grep miss must not write a sidecar anywhere.
-assert_no_sidecar_on_miss "no-sidecar-on-miss" -q nonexistent_token src
-
-# No DB pollution.
-assert_no_db_pollution
+assert_no_passthrough_state
 
 echo ""
 echo "pass: $pass / fail: $fail"

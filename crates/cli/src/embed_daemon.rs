@@ -45,9 +45,6 @@ pub(super) fn embed_query_via_daemon(
     if std::env::var_os(ENV_DISABLE).is_some() {
         return None;
     }
-    let super::EmbeddingModelSource::Gguf { .. } = &cfg.source else {
-        return None;
-    };
     let endpoint = endpoint(cfg, model_key)?;
     match request_embedding(&endpoint, model_key, text) {
         RequestOutcome::Response(vector) => return Some(vector),
@@ -106,9 +103,7 @@ fn spawn_daemon(
     endpoint: &Endpoint,
     prewarm: bool,
 ) -> Option<()> {
-    let super::EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source else {
-        return None;
-    };
+    let super::EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source;
     let executable = std::env::current_exe().ok()?;
     let mut command = std::process::Command::new(executable);
     command

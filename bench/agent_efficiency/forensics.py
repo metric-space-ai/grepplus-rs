@@ -574,8 +574,6 @@ def candidate_uses_vector(row: dict[str, Any], candidate: str) -> bool:
     triggers = [
         "embeddinggemma",
         "embeddinggemma_context.py",
-        " semantic --vectors",
-        " plus --vectors",
         "--embedding-gguf",
         "--embedding-model-dir",
         "vector search",

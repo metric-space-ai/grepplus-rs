@@ -1095,9 +1095,7 @@ impl CpuQwen35Model {
                 _ => return Err(Error::Gguf("qwen35 layer/runtime state mismatch".into())),
             }
             add_in_place(&mut residual, &workspace.attention_out);
-            hidden = residual;
 
-            let mut residual = hidden;
             let mut x = residual.clone();
             rms_norm_qwen(&mut x, &layer.post_attention_norm);
             self.ffn_into(layer, &x, &mut state.decode_workspace)?;
@@ -1786,6 +1784,10 @@ fn delta_recurrent_step(
     }
 }
 
+#[cfg_attr(
+    all(target_arch = "aarch64", target_feature = "neon"),
+    allow(dead_code)
+)]
 fn delta_recurrent_step_scalar(
     state: &mut [f32],
     query: &[f32],

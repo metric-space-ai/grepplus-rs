@@ -233,9 +233,12 @@ pass "graph.db exists"
 integ="$(sqlite_q "$DB" "PRAGMA integrity_check;" 2>/dev/null || echo ERR)"
 assert_eq "ok" "$integ" "DB integrity_check ok on mixed-language repo"
 
-# The .txt file must NOT have produced any node rows (it is unsupported).
-txt_nodes="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE file_path LIKE '%notes.txt';" 2>/dev/null || echo ERR)"
-assert_eq "0" "$txt_nodes" "unsupported .txt file produced no graph nodes"
+# Unsupported content still receives its deterministic File node, but no
+# language-level definitions.
+txt_files="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE label='File' AND file_path LIKE '%notes.txt';" 2>/dev/null || echo ERR)"
+txt_defs="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE label<>'File' AND file_path LIKE '%notes.txt';" 2>/dev/null || echo ERR)"
+assert_eq "1" "$txt_files" "unsupported .txt file retained its File node"
+assert_eq "0" "$txt_defs" "unsupported .txt file produced no definition nodes"
 
 # ---------------------------------------------------------------------------
 # Per-language cross-file edge invariants (queried straight off graph.db).
@@ -269,14 +272,12 @@ for lang in "rust:rust/%" "python:py/%" "javascript:js/%" "typescript:ts/%"; do
     assert_ge "${c:-0}" 1 "cross-file IMPORTS edge present for $name"
 done
 
-# Go/Ruby: an Import NODE is produced but the package/relative import does
-# not resolve to a node, so there is no cross-file IMPORTS edge. Assert
-# both halves of this known characteristic so a future change either way is
-# noticed (the node must exist; the unresolved-edge count must be 0).
+# Go/Ruby package/relative imports currently do not resolve to a graph target.
+# They are not represented as standalone Import nodes either.
 for lang in "go:go/%" "ruby:rb/%"; do
     name="${lang%%:*}"; prefix="${lang##*:}"
     imp_nodes="$(sqlite_q "$DB" "SELECT count(*) FROM nodes WHERE label='Import' AND file_path LIKE '$prefix';" 2>/dev/null || echo 0)"
-    assert_ge "${imp_nodes:-0}" 1 "$name emits an Import node"
+    assert_eq "0" "${imp_nodes:-0}" "$name emits no standalone Import node"
     c="$(xfile_edges IMPORTS "$prefix")"
     assert_eq "0" "${c:-0}" "$name has no resolved cross-file IMPORTS edge (known: package/relative target unresolved)"
 done
@@ -381,18 +382,18 @@ for row in \
     fi
 done
 
-# find-usages on the Rust Widget struct (referenced by TYPE_REF from make()).
+# find-usages on the Rust Widget struct (referenced by USAGE from make()).
 # This guards the symbol-resolution layer: Widget names a struct used by a
-# TYPE_REF edge; resolution must land on the struct node that carries that
+# USAGE edge; resolution must land on the struct node that carries that
 # incoming edge.
 fu_out="$(nav find-usages Widget)"
 echo "[multilang] find-usages Widget ->"; echo "$fu_out" | sed 's/^/    /'
 if grep -q '(no usages)' <<<"$fu_out"; then
-    fail "find-usages Widget is NOT '(no usages)' — Widget IS referenced via TYPE_REF"
-elif grep -qE 'TYPE_REF|USES' <<<"$fu_out" && grep -q 'make' <<<"$fu_out"; then
-    pass "find-usages Widget names referrer 'make' with a TYPE_REF/USES edge"
+    fail "find-usages Widget is NOT '(no usages)' — Widget IS referenced via USAGE"
+elif grep -qE 'USAGE|TYPE_REF|USES' <<<"$fu_out" && grep -q 'make' <<<"$fu_out"; then
+    pass "find-usages Widget names referrer 'make' with a usage edge"
 else
-    fail "find-usages Widget names referrer 'make' with a TYPE_REF/USES edge (got: $fu_out)"
+    fail "find-usages Widget names referrer 'make' with a usage edge (got: $fu_out)"
 fi
 # Counter-case: a genuinely-absent symbol must still report no usages.
 nu_out="$(nav find-usages this_symbol_does_not_exist_anywhere)"
@@ -448,107 +449,46 @@ sc7_hits="$(grep -cE 'helper\.(py|js|ts|go)' <<<"$sc7_out")"
 assert_ge "${sc7_hits:-0}" 2 "search-code 'return 7' finds the body across multiple languages"
 
 # ---------------------------------------------------------------------------
-# Drop-in grep contract on the mixed repo.
-#
-# IMPORTANT — the contract this asserts (verified against the source, not
-# assumed): `greppy -R <pat>` is the drop-in surface that is byte-exact
-# with the system grep WHENEVER greppy does not apply its semantic
-# augmentation. Augmentation (a synthetic
-# "<file>:1:<!-- NON_CANONICAL_CODE_HINT: <pat> -->" line appended to
-# stdout) is greppy's INTENDED value-add and fires only for a plain
-# recursive listing (`-R`/`-r` without -c) when (a) the indexed graph for
-# the cwd is FRESH and (b) the pattern has semantic graph hits. It is
-# gated by the freshness check in `greppy_grep::run::freshness_gate`
-# (Mode::VisibleAugment). So:
-#   * greppy -R on a NO-semantic-hit pattern   -> byte-exact
-#   * greppy -R with -c (count)                -> byte-exact
-#   * greppy (non-recursive, single file)      -> byte-exact
-#   * greppy-grep (the pure drop-in binary)    -> ALWAYS byte-exact,
-#                                                   even on a hit pattern
-# A plain `greppy -R -n <hit-pattern> .` on this freshly-indexed repo
-# DELIBERATELY differs (augmented) — asserting byte-exact there would be
-# asserting the wrong contract. We assert byte-exact on the STRICT cases
-# and separately assert that the augmentation is present-and-correct, so
-# both the drop-in guarantee AND the value-add are pinned.
+# Grep-compatible passthrough contract on the mixed repo. A fresh index is in
+# scope deliberately: ordinary grep invocations must still be byte-exact and
+# side-effect-free.
 # ---------------------------------------------------------------------------
 if [[ ! -x "$REAL_GREP" ]]; then
     fail "real grep oracle present ($REAL_GREP)"
 else
-    # --- greppy -R, STRICT (non-augmented) cases: byte-exact vs grep ------
     grep_case() {
-        # $@ = argv given identically to `greppy` and the system grep, run
-        # from inside $CORPUS so relative paths resolve the same. Used only
-        # for invocations greppy does NOT augment (see header).
-        local og or rcg rcr
-        og="$( cd "$CORPUS" && "$GREPPY_BIN" "$@" 2>/dev/null )"; rcg=$?
-        or="$( cd "$CORPUS" && "$REAL_GREP" "$@" 2>/dev/null )"; rcr=$?
-        if [[ "$og" == "$or" && "$rcg" -eq "$rcr" && "$rcg" -lt 128 ]]; then
-            pass "greppy drop-in byte-exact: $* (rc=$rcg)"
+        local bin="$1" label="$2" rcg rcr
+        shift 2
+        ( cd "$CORPUS" && "$bin" "$@" ) >"$WORK/grep-sub.out" 2>"$WORK/grep-sub.err"; rcg=$?
+        ( cd "$CORPUS" && "$REAL_GREP" "$@" ) >"$WORK/grep-ref.out" 2>"$WORK/grep-ref.err"; rcr=$?
+        if cmp -s "$WORK/grep-sub.out" "$WORK/grep-ref.out" \
+            && cmp -s "$WORK/grep-sub.err" "$WORK/grep-ref.err" \
+            && [[ "$rcg" -eq "$rcr" && "$rcg" -lt 128 ]]; then
+            pass "$label byte-exact: $* (rc=$rcg)"
         else
-            fail "greppy drop-in byte-exact: $* (rc $rcg vs $rcr)"
-            diff <(printf '%s' "$og") <(printf '%s' "$or") | head -6 | sed 's/^/      /'
+            fail "$label byte-exact: $* (rc $rcg vs $rcr)"
+            diff -u "$WORK/grep-ref.out" "$WORK/grep-sub.out" | head -8 | sed 's/^/      /'
+            diff -u "$WORK/grep-ref.err" "$WORK/grep-sub.err" | head -8 | sed 's/^/      /'
         fi
     }
-    # -R recursive, pattern with NO semantic graph hit -> not augmented.
-    grep_case -R -n "no_such_needle_anywhere_xyz" .
-    # -R recursive count mode -> not augmented (augment only adds a listing
-    # line, which -c would not emit; greppy keeps -c byte-exact).
-    grep_case -Rc "helper" .
-    # -R recursive, a literal that exists only in code bodies, no graph node.
-    grep_case -R "return 7" .
-    # Non-recursive single-file searches are never augmented.
-    grep_case -n "helper" "rust/src/helper.rs"
-    grep_case -n "caller" "py/main.py"
 
-    # --- greppy-grep, the pure drop-in: byte-exact on the canonical
-    # drop-in scenario (a tree with NO fresh index in scope) even for a hit
-    # pattern. Augmentation is gated on a fresh graph for the cwd's store;
-    # with GREPPY_STORE_DIR unset there is no fresh store, so the value-add
-    # never fires and the contract is pure byte-exact. (When a fresh store IS
-    # in scope, greppy-grep augments too — that path is covered by the
-    # `greppy -R` augmentation assertions above.) `env -u` runs the child
-    # with the store var removed; both tools see the same (empty) env.
+    for args in \
+        '-R -n helper .' \
+        '-R -n no_such_needle_anywhere_xyz .' \
+        '-Rc helper .' \
+        '-R return 7 .' \
+        '-n helper rust/src/helper.rs' \
+        '-n caller py/main.py'; do
+        read -r -a argv <<<"$args"
+        grep_case "$GREPPY_BIN" greppy "${argv[@]}"
+    done
+
     if [[ -x "$GREPPY_GREP_BIN" ]]; then
-        gg_case() {
-            local og or rcg rcr
-            og="$( cd "$CORPUS" && env -u GREPPY_STORE_DIR "$GREPPY_GREP_BIN" "$@" 2>/dev/null )"; rcg=$?
-            or="$( cd "$CORPUS" && env -u GREPPY_STORE_DIR "$REAL_GREP" "$@" 2>/dev/null )"; rcr=$?
-            if [[ "$og" == "$or" && "$rcg" -eq "$rcr" && "$rcg" -lt 128 ]]; then
-                pass "greppy-grep drop-in byte-exact (no fresh store): $* (rc=$rcg)"
-            else
-                fail "greppy-grep drop-in byte-exact (no fresh store): $* (rc $rcg vs $rcr)"
-                diff <(printf '%s' "$og") <(printf '%s' "$or") | head -6 | sed 's/^/      /'
-            fi
-        }
-        gg_case -R -n "helper" .
-        gg_case -R -n "caller" .
-        gg_case -R "function" .
+        grep_case "$GREPPY_GREP_BIN" greppy-grep -R -n helper .
+        grep_case "$GREPPY_GREP_BIN" greppy-grep -R -n caller .
+        grep_case "$GREPPY_GREP_BIN" greppy-grep -R function .
     else
-        echo "[multilang] note: greppy-grep binary absent; skipping pure drop-in checks"
-    fi
-
-    # --- the augmentation value-add fires AND is well-formed ----------------
-    # A plain recursive listing on a fresh graph for a pattern WITH a graph
-    # node ("helper" matches every *_helper Function) must append exactly one
-    # synthetic semantic line per query, pointing at a sidecar .md in the
-    # store. This pins greppy's documented divergence from raw grep so a
-    # regression that silently dropped the value-add (or that started
-    # augmenting count/no-hit queries) is caught.
-    aug_out="$( cd "$CORPUS" && "$GREPPY_BIN" -R -n "helper" . 2>/dev/null )"
-    raw_out="$( cd "$CORPUS" && "$REAL_GREP" -R -n "helper" . 2>/dev/null )"
-    if [[ "$aug_out" != "$raw_out" ]] && grep -q 'NON_CANONICAL_CODE_HINT: helper' <<<"$aug_out"; then
-        pass "greppy -R augments a fresh-graph hit pattern with a semantic line (intended value-add)"
-    else
-        fail "greppy -R augments a fresh-graph hit pattern with a semantic line (intended value-add)"
-    fi
-    # The augmented output must be a strict SUPERSET of raw grep: every raw
-    # grep line is still present and byte-identical (augmentation only ADDS).
-    missing="$(comm -23 <(printf '%s\n' "$raw_out" | sort) <(printf '%s\n' "$aug_out" | sort) | head -3)"
-    if [[ -z "$missing" ]]; then
-        pass "greppy -R augmentation is additive: every raw grep line preserved verbatim"
-    else
-        fail "greppy -R augmentation is additive: every raw grep line preserved verbatim"
-        printf '      dropped: %s\n' "$missing"
+        echo "[multilang] note: greppy-grep binary absent; skipping standalone passthrough checks"
     fi
 fi
 

@@ -12,10 +12,8 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 os.chdir(HERE)
-# API key: env, else ~/.minimax.key. Embedding model: none needed — a
-# binary built with --features embedded-model carries EmbeddingGemma, so
-# context self-builds vectors. Set GREPPY_EMBEDDINGGEMMA_GGUF/_TOKENIZER
-# only to override with an external model.
+# API key: env, else ~/.minimax.key. The binary always carries
+# EmbeddingGemma, so context self-builds vectors without model configuration.
 if not os.environ.get("MINIMAX_API_KEY"):
     keyfile = pathlib.Path.home() / ".minimax.key"
     if keyfile.exists():

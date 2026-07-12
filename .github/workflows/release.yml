@@ -9,9 +9,9 @@ name: release
 #                          artifacts (no Release is created)
 #
 # Each job builds NATIVELY on its own runner (no cross-compilation), so the
-# bundled C deps (tree-sitter grammars, SQLite) and the pure-Rust candle
-# engine compile with the platform's own toolchain. The Rust version is the
-# one pinned by rust-toolchain.toml.
+# bundled C deps (tree-sitter grammars, SQLite) and the native embedded
+# inference engines compile with the platform's own toolchain. The Rust
+# version is the one pinned by rust-toolchain.toml.
 
 on:
   push:
@@ -19,7 +19,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed to create/attach the Release on tag builds
+  contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   build:
@@ -125,9 +127,9 @@ jobs:
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/release/greppy dist/grep          # ship it under the name it runs as
-          cp target/release/greppy dist/greppy       # and its own name
-          cp README.md LICENSE dist/ 2>/dev/null || true
+          cp target/release/greppy dist/greppy
+          cp bench/release_package_smoke.sh dist/
+          cp README.md LICENSE THIRD_PARTY.md dist/ 2>/dev/null || true
           tar -C dist -czf "${{ matrix.asset }}" .
 
       - name: Package (Windows)
@@ -136,7 +138,8 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/release/greppy.exe dist/greppy.exe
-          Copy-Item README.md,LICENSE dist/ -ErrorAction SilentlyContinue
+          Copy-Item bench/release_package_smoke.ps1 dist/release_package_smoke.ps1
+          Copy-Item README.md,LICENSE,THIRD_PARTY.md dist/ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}" -Force
 
       - name: Smoke-test packaged artifact (Unix)
@@ -146,11 +149,8 @@ jobs:
           clean="$RUNNER_TEMP/greppy-package-smoke"
           mkdir -p "$clean/bin" "$clean/store" "$clean/repo"
           tar -C "$clean/bin" -xzf "${{ matrix.asset }}"
-          "$clean/bin/greppy" --help >/dev/null
-          set +e
-          GREPPY_STORE_DIR="$clean/store" "$clean/bin/greppy" --device cpu doctor --json --root "$clean/repo" > "$clean/doctor.json"
-          set -e
-          jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' "$clean/doctor.json"
+          test ! -e "$clean/bin/grep"
+          bash "$clean/bin/release_package_smoke.sh" "$clean/bin/greppy" "$clean/work"
 
       - name: Smoke-test packaged artifact (Windows)
         if: runner.os == 'Windows'
@@ -159,26 +159,32 @@ jobs:
           $clean = Join-Path $env:RUNNER_TEMP 'greppy-package-smoke'
           New-Item -ItemType Directory -Force "$clean/bin","$clean/store","$clean/repo" | Out-Null
           Expand-Archive -Path "${{ matrix.asset }}" -DestinationPath "$clean/bin" -Force
-          & "$clean/bin/greppy.exe" --help | Out-Null
-          $env:GREPPY_STORE_DIR = "$clean/store"
-          $output = & "$clean/bin/greppy.exe" --device cpu doctor --json --root "$clean/repo"
-          $doctorExit = $LASTEXITCODE
-          $output | Out-File -Encoding utf8 "$clean/doctor.json"
-          if ($doctorExit -ne 0 -and $doctorExit -ne 1) {
-            Write-Error "packaged Windows doctor failed with unexpected exit code $doctorExit"
-            exit 1
-          }
-          $doctor = Get-Content "$clean/doctor.json" -Raw | ConvertFrom-Json
-          if ($doctor.command -ne 'doctor' -or $doctor.inference.registry.selected_backend -ne 'cpu') {
-            Write-Error 'packaged Windows doctor contract failed'
-            exit 1
-          }
+          & "$clean/bin/release_package_smoke.ps1" -Binary "$clean/bin/greppy.exe" -Work "$clean/work"
+
+      - name: Generate SHA256 checksum (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+
+      - name: Generate SHA256 checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 "${{ matrix.asset }}").Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.asset }}" | Set-Content -Encoding ascii "${{ matrix.asset }}.sha256"
+
+      - name: Attest release package provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ matrix.asset }}
 
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.asset }}
-          path: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sha256
 
   verify-packages:
     name: clean package (${{ matrix.name }})
@@ -208,12 +214,10 @@ jobs:
         shell: bash
         run: |
           mkdir -p unpack store repo
+          (cd package && shasum -a 256 -c "${{ matrix.asset }}.sha256")
           tar -C unpack -xzf "package/${{ matrix.asset }}"
-          unpack/greppy --help >/dev/null
-          set +e
-          GREPPY_STORE_DIR="$PWD/store" unpack/greppy --device cpu doctor --json --root "$PWD/repo" > doctor.json
-          set -e
-          jq -e '.command == "doctor" and .inference.registry.selected_backend == "cpu"' doctor.json
+          test ! -e unpack/grep
+          bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
           if [ "${{ runner.os }}" = Linux ]; then
             ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
           fi
@@ -223,21 +227,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force unpack,store,repo | Out-Null
+          $line = (Get-Content "package/${{ matrix.asset }}.sha256" -Raw).Trim()
+          $want = ($line -split '\s+')[0]
+          $got = (Get-FileHash -Algorithm SHA256 "package/${{ matrix.asset }}").Hash.ToLowerInvariant()
+          if ($want -ne $got) { throw "package checksum mismatch: $got != $want" }
           Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
-          & unpack/greppy.exe --help | Out-Null
-          $env:GREPPY_STORE_DIR = "$PWD/store"
-          $output = & unpack/greppy.exe --device cpu doctor --json --root "$PWD/repo"
-          $doctorExit = $LASTEXITCODE
-          $output | Out-File -Encoding utf8 doctor.json
-          if ($doctorExit -ne 0 -and $doctorExit -ne 1) {
-            Write-Error "clean Windows doctor failed with unexpected exit code $doctorExit"
-            exit 1
-          }
-          $doctor = Get-Content doctor.json -Raw | ConvertFrom-Json
-          if ($doctor.command -ne 'doctor' -or $doctor.inference.registry.selected_backend -ne 'cpu') {
-            Write-Error 'clean Windows package verification failed'
-            exit 1
-          }
+          & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
 
   publish:
     name: publish gated release
@@ -254,4 +249,5 @@ jobs:
           files: |
             release-assets/**/*.tar.gz
             release-assets/**/*.zip
+            release-assets/**/*.sha256
           fail_on_unmatched_files: true

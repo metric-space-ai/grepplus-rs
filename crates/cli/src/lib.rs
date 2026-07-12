@@ -9,7 +9,7 @@
 //! - `search-code` / `search-symbols` — indexed code and symbol search.
 //! - `install`      — agent installer      (out of scope)
 //! - `uninstall`    — agent uninstaller    (out of scope)
-//! - `update`       — self-updater for GitHub release binaries
+//! - `update`       — explains the signed-release installation policy
 //! - `config`       — runtime config       (out of scope)
 //!
 //! Out-of-scope lifecycle subcommands print a structured error and exit
@@ -44,11 +44,6 @@ pub const EXIT_IO: u8 = 73;
 pub const EXIT_TEMPFAIL: u8 = 75;
 
 const DEFAULT_EMBEDDINGGEMMA_MODEL_ID: &str = "google/embeddinggemma-300m";
-const ENV_EMBED_MODEL_DIR: &str = "GREPPY_EMBEDDINGGEMMA_MODEL";
-const ENV_EMBED_GGUF: &str = "GREPPY_EMBEDDINGGEMMA_GGUF";
-const ENV_EMBED_TOKENIZER: &str = "GREPPY_EMBEDDINGGEMMA_TOKENIZER";
-const ENV_EMBED_MODEL_ID: &str = "GREPPY_EMBEDDINGGEMMA_MODEL_ID";
-const ENV_EMBED_MAX_LENGTH: &str = "GREPPY_EMBEDDINGGEMMA_MAX_LENGTH";
 const ENV_DEVICE: &str = "GREPPY_DEVICE";
 const ENV_NO_GPU: &str = "GREPPY_NO_GPU";
 const ENV_EMBED_CUDA_DEVICE: &str = "EMBED_NATIVE_CUDA_DEVICE";
@@ -58,7 +53,6 @@ const ENV_PROVIDER_POLICY: &str = "GREPPY_PROVIDER_POLICY";
 const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
-const DEFAULT_UPDATE_REPO: &str = "metric-space-ai/greppy";
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 #[cfg(debug_assertions)]
@@ -101,11 +95,6 @@ fn cli_inference_override() -> CliInferenceOverride {
 
 #[derive(Debug, Clone, Copy)]
 struct EmbeddingCliArgs<'a> {
-    model_dir: Option<&'a str>,
-    gguf: Option<&'a str>,
-    tokenizer: Option<&'a str>,
-    model_id: Option<&'a str>,
-    max_length: Option<usize>,
     device: Option<&'a str>,
     no_gpu: bool,
 }
@@ -143,7 +132,6 @@ struct EmbeddingModelConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EmbeddingModelSource {
-    SafetensorsDir(std::path::PathBuf),
     Gguf {
         gguf: std::path::PathBuf,
         tokenizer: std::path::PathBuf,
@@ -160,10 +148,10 @@ struct QwenSummaryConfig {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "grep",
-    bin_name = "grep",
+    name = "greppy",
+    bin_name = "greppy",
     version,
-    about = "A drop-in grep that also answers code-structure questions over an indexed codebase (who-calls / callees / impact / semantic-search).",
+    about = "Code navigation for coding agents, with byte-exact real-grep passthrough for ordinary grep invocations.",
     long_about = None,
     allow_external_subcommands = true,
     disable_help_subcommand = true,
@@ -209,21 +197,6 @@ pub enum Command {
     Index {
         /// Path to the repository root (default: cwd).
         path: Option<String>,
-        /// Safetensors model directory containing config.json, tokenizer.json and model.safetensors.
-        #[arg(long)]
-        embedding_model_dir: Option<String>,
-        /// Q4 GGUF model file.
-        #[arg(long)]
-        embedding_gguf: Option<String>,
-        /// Tokenizer JSON for --embedding-gguf.
-        #[arg(long)]
-        embedding_tokenizer: Option<String>,
-        /// Logical model id persisted with vector rows.
-        #[arg(long)]
-        embedding_model_id: Option<String>,
-        /// Optional tokenizer/model truncation length.
-        #[arg(long)]
-        embedding_max_length: Option<usize>,
         /// With path `status`, emit machine-readable status JSON.
         #[arg(long)]
         json: bool,
@@ -536,24 +509,6 @@ pub enum Command {
         /// Emit machine-readable JSON with freshness and output-budget metadata.
         #[arg(long)]
         json: bool,
-        /// Add EmbeddingGemma vector hits from current-generation indexed code spans.
-        #[arg(long)]
-        vectors: bool,
-        /// Safetensors model directory containing config.json, tokenizer.json and model.safetensors.
-        #[arg(long)]
-        embedding_model_dir: Option<String>,
-        /// Q4 GGUF model file.
-        #[arg(long)]
-        embedding_gguf: Option<String>,
-        /// Tokenizer JSON for --embedding-gguf.
-        #[arg(long)]
-        embedding_tokenizer: Option<String>,
-        /// Logical model id used to select indexed vectors.
-        #[arg(long)]
-        embedding_model_id: Option<String>,
-        /// Override model max sequence length.
-        #[arg(long)]
-        embedding_max_length: Option<usize>,
     },
     /// Semantic query using EmbeddingGemma vectors with Qwen purpose hints.
     #[command(name = "semantic-search", alias = "semantic")]
@@ -562,21 +517,6 @@ pub enum Command {
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
-        /// Safetensors model directory containing config.json, tokenizer.json and model.safetensors.
-        #[arg(long)]
-        embedding_model_dir: Option<String>,
-        /// Q4 GGUF model file.
-        #[arg(long)]
-        embedding_gguf: Option<String>,
-        /// Tokenizer JSON for --embedding-gguf.
-        #[arg(long)]
-        embedding_tokenizer: Option<String>,
-        /// Logical model id used to select vector rows.
-        #[arg(long)]
-        embedding_model_id: Option<String>,
-        /// Optional tokenizer/model truncation length.
-        #[arg(long)]
-        embedding_max_length: Option<usize>,
     },
     /// Legacy compatibility command for resolving definitions. Prefer
     /// `semantic-search` for meaning-based search and `brief` for a compact
@@ -619,21 +559,6 @@ pub enum Command {
         /// Accepted for agent ergonomics — no-op.
         #[arg(long)]
         all: bool,
-        /// Safetensors model directory containing config.json, tokenizer.json and model.safetensors.
-        #[arg(long)]
-        embedding_model_dir: Option<String>,
-        /// Q4 GGUF model file.
-        #[arg(long)]
-        embedding_gguf: Option<String>,
-        /// Tokenizer JSON for --embedding-gguf.
-        #[arg(long)]
-        embedding_tokenizer: Option<String>,
-        /// Logical model id used to select indexed vectors.
-        #[arg(long)]
-        embedding_model_id: Option<String>,
-        /// Optional tokenizer/model truncation length.
-        #[arg(long)]
-        embedding_max_length: Option<usize>,
     },
     /// Agent installer — out of scope.
     Install {
@@ -645,25 +570,9 @@ pub enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Update greppy from the latest GitHub release.
+    /// Self-update is disabled; install a signed release artifact explicitly.
     #[command(alias = "upgrade")]
-    Update {
-        /// Only check whether a newer release exists.
-        #[arg(long)]
-        check: bool,
-        /// Resolve the release and asset, but do not download or replace the binary.
-        #[arg(long)]
-        dry_run: bool,
-        /// Install without an interactive confirmation prompt.
-        #[arg(long, short = 'y')]
-        yes: bool,
-        /// Install a specific release tag instead of the latest release.
-        #[arg(long)]
-        tag: Option<String>,
-        /// GitHub repository slug to read releases from (OWNER/REPO).
-        #[arg(long)]
-        repo: Option<String>,
-    },
+    Update,
     /// Runtime config — out of scope.
     Config { subcmd: Option<String> },
     /// Internal: warm embedding daemon (spawned automatically by query
@@ -788,15 +697,6 @@ const SUBCOMMANDS: &[&str] = &[
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
-    // Best-effort cache maintenance on binary start. A cross-process state
-    // file throttles scans to the configured interval (10 minutes by
-    // default), so a tight loop of invocations does not repeatedly walk the
-    // data root. The `--root`
-    // of THIS invocation (peeked from argv before clap runs) is what the
-    // eviction must protect — protecting only the cwd store while the
-    // command operates on `--root elsewhere` evicted the very store the
-    // invocation was about to serve from.
-    maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
     if is_grep_passthrough(&argv) {
         // argv[0] is the binary name; the rest are grep args. Build a
         // synthetic argv for the shared runner whose argv[0] is a
@@ -811,6 +711,10 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             Err(_) => EXIT_IO,
         };
     }
+    // Structured Greppy commands perform throttled cache maintenance. This
+    // intentionally runs after passthrough detection so an ordinary grep
+    // invocation cannot touch Greppy state.
+    maybe_run_store_cleanup(peek_root_arg(&argv).as_deref());
     // Structured subcommand (or help/version): clap can parse it. Any
     // non-UTF-8 here is a genuine usage error for a structured command.
     // P3: a failed agent call must TEACH the correct retry in the same
@@ -889,10 +793,6 @@ pub fn maybe_run_store_cleanup(root: Option<&str>) {
             greppy_core::cache::GcPolicy::from_env().ttl,
         );
         prune_expired_evidence_packs();
-    }
-    if let Some(root) = effective.as_deref() {
-        let _ =
-            greppy_grep::sidecar::cleanup_expired(root, greppy_grep::sidecar::sidecar_ttl_secs());
     }
 }
 
@@ -1266,8 +1166,8 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     // No subcommand and no pattern: a usage MISTAKE (often an agent's).
     // Print a compact cheat sheet, not the 2.5KB curated help — mid-task
     // token bombs teach nothing (P3). `--help` still prints everything.
-    println!("usage: grep PATTERN [FILES..]           (drop-in grep)");
-    println!("   or: grep <command> [--root DIR]      commands:");
+    println!("usage: greppy PATTERN [FILES..]        (real-grep passthrough)");
+    println!("   or: greppy <command> [--root DIR]   commands:");
     println!("       index PATH  who-calls S   callees S   find-usages S");
     println!("       references S (who depends on S)   impact S [--direction incoming|outgoing]");
     println!("       brief S   semantic-search \"QUERY\"");
@@ -1347,26 +1247,8 @@ fn dispatch_subcommand(
             };
             summarize_daemon::daemon_main(socket, cfg, prewarm)
         }
-        Command::Index {
-            path,
-            embedding_model_dir,
-            embedding_gguf,
-            embedding_tokenizer,
-            embedding_model_id,
-            embedding_max_length,
-            json,
-        } => {
+        Command::Index { path, json } => {
             if path.as_deref() == Some("status") {
-                if embedding_model_dir.is_some()
-                    || embedding_gguf.is_some()
-                    || embedding_tokenizer.is_some()
-                    || embedding_model_id.is_some()
-                    || embedding_max_length.is_some()
-                {
-                    return Err(Error::Invalid(
-                        "index status does not accept embedding index flags".into(),
-                    ));
-                }
                 dispatch_index_status(json, root)
             } else {
                 if json {
@@ -1378,11 +1260,6 @@ fn dispatch_subcommand(
                     path.as_deref(),
                     root,
                     EmbeddingCliArgs {
-                        model_dir: embedding_model_dir.as_deref(),
-                        gguf: embedding_gguf.as_deref(),
-                        tokenizer: embedding_tokenizer.as_deref(),
-                        model_id: embedding_model_id.as_deref(),
-                        max_length: embedding_max_length,
                         device,
                         no_gpu,
                     },
@@ -1439,8 +1316,8 @@ fn dispatch_subcommand(
             symbol,
             code: _,
             all: _,
-            json: _,
-        } => dispatch_brief(symbol.as_deref(), root),
+            json,
+        } => dispatch_brief(symbol.as_deref(), json, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
@@ -1520,50 +1397,19 @@ fn dispatch_subcommand(
             code,
             explain,
             json,
-            vectors,
-            embedding_model_dir,
-            embedding_gguf,
-            embedding_tokenizer,
-            embedding_model_id,
-            embedding_max_length,
         } => dispatch_plus(
             query.as_deref(),
             k,
             code,
             explain,
             json,
-            vectors,
-            EmbeddingCliArgs {
-                model_dir: embedding_model_dir.as_deref(),
-                gguf: embedding_gguf.as_deref(),
-                tokenizer: embedding_tokenizer.as_deref(),
-                model_id: embedding_model_id.as_deref(),
-                max_length: embedding_max_length,
-                device,
-                no_gpu,
-            },
+            EmbeddingCliArgs { device, no_gpu },
             root,
         ),
-        Command::Semantic {
-            query,
-            json,
-            embedding_model_dir,
-            embedding_gguf,
-            embedding_tokenizer,
-            embedding_model_id,
-            embedding_max_length,
-        } => dispatch_semantic(
+        Command::Semantic { query, json } => dispatch_semantic(
             query.as_deref(),
             json,
-            EmbeddingCliArgs {
-                model_dir: embedding_model_dir.as_deref(),
-                gguf: embedding_gguf.as_deref(),
-                tokenizer: embedding_tokenizer.as_deref(),
-                model_id: embedding_model_id.as_deref(),
-                max_length: embedding_max_length,
-                device,
-                no_gpu,
-            },
+            EmbeddingCliArgs { device, no_gpu },
             root,
         ),
         Command::Context {
@@ -1573,732 +1419,22 @@ fn dispatch_subcommand(
             json,
             code: _,
             all: _,
-            embedding_model_dir,
-            embedding_gguf,
-            embedding_tokenizer,
-            embedding_model_id,
-            embedding_max_length,
         } => dispatch_context(
             query.as_deref(),
             k,
             lines,
             json,
-            EmbeddingCliArgs {
-                model_dir: embedding_model_dir.as_deref(),
-                gguf: embedding_gguf.as_deref(),
-                tokenizer: embedding_tokenizer.as_deref(),
-                model_id: embedding_model_id.as_deref(),
-                max_length: embedding_max_length,
-                device,
-                no_gpu,
-            },
+            EmbeddingCliArgs { device, no_gpu },
             root,
         ),
-        Command::Install { .. } => Err(Error::out_of_scope("grep install")),
-        Command::Uninstall { .. } => Err(Error::out_of_scope("grep uninstall")),
-        Command::Update {
-            check,
-            dry_run,
-            yes,
-            tag,
-            repo,
-        } => dispatch_update(check, dry_run, yes, tag.as_deref(), repo.as_deref()),
-        Command::Config { .. } => Err(Error::out_of_scope("grep config")),
+        Command::Install { .. } => Err(Error::out_of_scope("greppy install")),
+        Command::Uninstall { .. } => Err(Error::out_of_scope("greppy uninstall")),
+        Command::Update => Err(Error::Config(
+            "self-update is disabled; install a signed and attested Greppy release artifact explicitly"
+                .into(),
+        )),
+        Command::Config { .. } => Err(Error::out_of_scope("greppy config")),
     }
-}
-
-fn dispatch_update(
-    check: bool,
-    dry_run: bool,
-    yes: bool,
-    tag: Option<&str>,
-    repo: Option<&str>,
-) -> Result<i32> {
-    let repo = update_repo_slug(repo)?;
-    let release = fetch_github_release(&repo, tag)?;
-    let current = env!("CARGO_PKG_VERSION");
-    let newer = release_is_newer(&release.tag, current);
-
-    if check {
-        if newer {
-            println!(
-                "greppy update available: {} -> {} ({})",
-                current, release.tag, release.html_url
-            );
-        } else {
-            println!(
-                "greppy {} is current (latest: {}, {})",
-                current, release.tag, release.html_url
-            );
-        }
-        return Ok(0);
-    }
-
-    if tag.is_none() && !newer {
-        println!(
-            "greppy {} is current (latest: {}, {})",
-            current, release.tag, release.html_url
-        );
-        return Ok(0);
-    }
-
-    let asset = select_release_asset(
-        &release.assets,
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    )
-    .ok_or_else(|| {
-        Error::Config(format!(
-            "release {} has no greppy asset for {}-{}",
-            release.tag,
-            std::env::consts::ARCH,
-            std::env::consts::OS
-        ))
-    })?;
-    let current_exe =
-        std::env::current_exe().map_err(|e| Error::io("locate current greppy executable", e))?;
-
-    println!("greppy update: {} -> {}", current, release.tag.as_str());
-    println!("release: {}", release.html_url);
-    println!(
-        "asset: {} ({} bytes) for {}",
-        asset.name,
-        asset.size,
-        current_platform_label()
-    );
-    println!("target: {}", current_exe.display());
-
-    if dry_run {
-        println!("dry-run: no download or replacement performed");
-        return Ok(0);
-    }
-
-    if !confirm_update(yes, &release, asset, &current_exe)? {
-        println!("greppy update cancelled");
-        return Ok(0);
-    }
-
-    let temp_dir = create_update_temp_dir()?;
-    let result = (|| {
-        let candidate = download_and_prepare_release_asset(asset, &temp_dir)?;
-        let outcome = replace_current_exe(&candidate, &current_exe)?;
-        match outcome {
-            ReplaceOutcome::Replaced => {
-                println!("greppy updated to {}", release.tag);
-            }
-            #[cfg(windows)]
-            ReplaceOutcome::ScheduledAfterExit => {
-                println!(
-                    "greppy update to {} is scheduled and will finish after this process exits",
-                    release.tag
-                );
-            }
-        }
-        Ok(0)
-    })();
-    let _ = std::fs::remove_dir_all(&temp_dir);
-    result
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GithubRelease {
-    tag: String,
-    html_url: String,
-    assets: Vec<ReleaseAsset>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReleaseAsset {
-    name: String,
-    download_url: String,
-    size: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplaceOutcome {
-    Replaced,
-    #[cfg(windows)]
-    ScheduledAfterExit,
-}
-
-fn update_repo_slug(repo: Option<&str>) -> Result<String> {
-    let raw = repo.unwrap_or(DEFAULT_UPDATE_REPO);
-    let parts: Vec<&str> = raw.split('/').collect();
-    if parts.len() != 2
-        || parts.iter().any(|p| p.is_empty())
-        || !parts.iter().all(|p| {
-            p.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        })
-    {
-        return Err(Error::Invalid(format!(
-            "--repo must be OWNER/REPO, got {raw:?}"
-        )));
-    }
-    Ok(raw.to_string())
-}
-
-fn fetch_github_release(repo: &str, tag: Option<&str>) -> Result<GithubRelease> {
-    let endpoint = match tag {
-        Some(tag) => format!("https://api.github.com/repos/{repo}/releases/tags/{tag}"),
-        None => format!("https://api.github.com/repos/{repo}/releases/latest"),
-    };
-    let raw = curl_to_string(&endpoint)?;
-    parse_github_release(&raw)
-}
-
-fn parse_github_release(raw: &str) -> Result<GithubRelease> {
-    let v: serde_json::Value =
-        serde_json::from_str(raw).map_err(|e| Error::Parse(format!("GitHub release JSON: {e}")))?;
-    if let Some(message) = v.get("message").and_then(|m| m.as_str()) {
-        return Err(Error::Config(format!(
-            "GitHub release lookup failed: {message}"
-        )));
-    }
-    let tag = v
-        .get("tag_name")
-        .and_then(|s| s.as_str())
-        .ok_or_else(|| Error::Parse("GitHub release JSON missing tag_name".into()))?
-        .to_string();
-    let html_url = v
-        .get("html_url")
-        .and_then(|s| s.as_str())
-        .unwrap_or("")
-        .to_string();
-    let assets = v
-        .get("assets")
-        .and_then(|a| a.as_array())
-        .ok_or_else(|| Error::Parse("GitHub release JSON missing assets".into()))?
-        .iter()
-        .filter_map(|a| {
-            let name = a.get("name")?.as_str()?.to_string();
-            let download_url = a.get("browser_download_url")?.as_str()?.to_string();
-            let size = a.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
-            Some(ReleaseAsset {
-                name,
-                download_url,
-                size,
-            })
-        })
-        .collect();
-    Ok(GithubRelease {
-        tag,
-        html_url,
-        assets,
-    })
-}
-
-fn curl_to_string(url: &str) -> Result<String> {
-    let out = std::process::Command::new("curl")
-        .arg("-fsSL")
-        .arg("-H")
-        .arg("Accept: application/vnd.github+json")
-        .arg("-H")
-        .arg("User-Agent: greppy-updater")
-        .arg(url)
-        .output()
-        .map_err(|e| Error::io("run curl for greppy update", e))?;
-    if !out.status.success() {
-        return Err(Error::Config(format!(
-            "curl failed for {url}: {}",
-            stderr_summary(&out.stderr)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-fn curl_download(url: &str, dest: &std::path::Path) -> Result<()> {
-    let out = std::process::Command::new("curl")
-        .arg("-fL")
-        .arg("--show-error")
-        .arg("--silent")
-        .arg("-H")
-        .arg("User-Agent: greppy-updater")
-        .arg("-o")
-        .arg(dest)
-        .arg(url)
-        .output()
-        .map_err(|e| Error::io("run curl for greppy update download", e))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(dest);
-        return Err(Error::Config(format!(
-            "download failed for {url}: {}",
-            stderr_summary(&out.stderr)
-        )));
-    }
-    Ok(())
-}
-
-fn stderr_summary(stderr: &[u8]) -> String {
-    let s = String::from_utf8_lossy(stderr);
-    s.lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("command exited unsuccessfully")
-        .trim()
-        .to_string()
-}
-
-fn release_is_newer(tag: &str, current: &str) -> bool {
-    matches!(
-        compare_version_numbers(tag, current),
-        Some(std::cmp::Ordering::Greater)
-    )
-}
-
-fn compare_version_numbers(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    let a = numeric_version_parts(a)?;
-    let b = numeric_version_parts(b)?;
-    let len = a.len().max(b.len());
-    for i in 0..len {
-        let left = *a.get(i).unwrap_or(&0);
-        let right = *b.get(i).unwrap_or(&0);
-        match left.cmp(&right) {
-            std::cmp::Ordering::Equal => {}
-            other => return Some(other),
-        }
-    }
-    Some(std::cmp::Ordering::Equal)
-}
-
-fn numeric_version_parts(s: &str) -> Option<Vec<u64>> {
-    let trimmed = s.trim_start_matches(['v', 'V']);
-    let parts: Vec<u64> = trimmed
-        .split(|c: char| !c.is_ascii_digit())
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| p.parse::<u64>().ok())
-        .collect();
-    (!parts.is_empty()).then_some(parts)
-}
-
-fn select_release_asset<'a>(
-    assets: &'a [ReleaseAsset],
-    os: &str,
-    arch: &str,
-) -> Option<&'a ReleaseAsset> {
-    let os_aliases = os_aliases(os);
-    let arch_aliases = arch_aliases(arch);
-    let mut best: Option<(&ReleaseAsset, i32)> = None;
-    for asset in assets {
-        let lower = asset.name.to_ascii_lowercase();
-        if update_asset_is_auxiliary(&lower) || !lower.contains("greppy") {
-            continue;
-        }
-        let os_match = os_aliases.iter().any(|token| lower.contains(token));
-        let arch_match = arch_aliases.iter().any(|token| lower.contains(token))
-            || (os == "macos" && lower.contains("universal"));
-        if !os_match || !arch_match {
-            continue;
-        }
-        let mut score = 100;
-        if lower.contains("greppy-") || lower.starts_with("greppy") {
-            score += 20;
-        }
-        if lower.contains(&format!("{arch}-")) || lower.contains(&format!("-{arch}")) {
-            score += 20;
-        }
-        if lower.contains(".tar.") || lower.ends_with(".tgz") || lower.ends_with(".zip") {
-            score += 10;
-        }
-        if lower.contains("debug") {
-            score -= 30;
-        }
-        match best {
-            Some((_, best_score)) if best_score >= score => {}
-            _ => best = Some((asset, score)),
-        }
-    }
-    best.map(|(asset, _)| asset)
-}
-
-fn os_aliases(os: &str) -> Vec<&'static str> {
-    match os {
-        "macos" => vec!["apple-darwin", "darwin", "macos"],
-        "linux" => vec!["unknown-linux", "linux", "musl", "gnu"],
-        "windows" => vec!["pc-windows", "windows", "msvc", "mingw"],
-        _ => vec![],
-    }
-}
-
-fn arch_aliases(arch: &str) -> Vec<&'static str> {
-    match arch {
-        "x86_64" => vec!["x86_64", "amd64", "x64"],
-        "aarch64" => vec!["aarch64", "arm64"],
-        "arm" => vec!["armv7", "arm"],
-        _ => vec![],
-    }
-}
-
-fn update_asset_is_auxiliary(lower_name: &str) -> bool {
-    lower_name.ends_with(".sha256")
-        || lower_name.ends_with(".sha256sum")
-        || lower_name.ends_with(".sig")
-        || lower_name.ends_with(".asc")
-        || lower_name.ends_with(".pem")
-        || lower_name.ends_with(".txt")
-        || lower_name.contains("checksum")
-}
-
-fn current_platform_label() -> String {
-    format!("{}-{}", std::env::consts::ARCH, std::env::consts::OS)
-}
-
-fn confirm_update(
-    yes: bool,
-    release: &GithubRelease,
-    asset: &ReleaseAsset,
-    current_exe: &std::path::Path,
-) -> Result<bool> {
-    if yes {
-        return Ok(true);
-    }
-    use std::io::{IsTerminal, Write};
-    if !std::io::stdin().is_terminal() {
-        return Err(Error::Invalid(
-            "greppy update requires -y/--yes when stdin is not a terminal".into(),
-        ));
-    }
-    eprint!(
-        "Install {} from {} over {}? [y/N] ",
-        release.tag,
-        asset.name,
-        current_exe.display()
-    );
-    std::io::stderr()
-        .flush()
-        .map_err(|e| Error::io("flush update prompt", e))?;
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| Error::io("read update prompt", e))?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
-}
-
-fn create_update_temp_dir() -> Result<std::path::PathBuf> {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("greppy-update-{}-{stamp}", std::process::id()));
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| Error::io(format!("create temp dir {}", dir.display()), e))?;
-    Ok(dir)
-}
-
-fn download_and_prepare_release_asset(
-    asset: &ReleaseAsset,
-    temp_dir: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    let download_path = temp_dir.join(sanitize_update_filename(&asset.name));
-    println!("downloading {}", asset.download_url);
-    curl_download(&asset.download_url, &download_path)?;
-    prepare_downloaded_asset(&download_path, &asset.name, temp_dir)
-}
-
-fn sanitize_update_filename(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "greppy-download".into()
-    } else {
-        sanitized
-    }
-}
-
-fn prepare_downloaded_asset(
-    download_path: &std::path::Path,
-    asset_name: &str,
-    temp_dir: &std::path::Path,
-) -> Result<std::path::PathBuf> {
-    let lower = asset_name.to_ascii_lowercase();
-    let candidate = if lower.ends_with(".zip") {
-        let extract_dir = temp_dir.join("extract");
-        std::fs::create_dir_all(&extract_dir)
-            .map_err(|e| Error::io(format!("create {}", extract_dir.display()), e))?;
-        extract_zip_asset(download_path, &extract_dir)?;
-        find_greppy_binary(&extract_dir)?
-    } else if lower.ends_with(".tar")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.xz")
-        || lower.ends_with(".txz")
-    {
-        let extract_dir = temp_dir.join("extract");
-        std::fs::create_dir_all(&extract_dir)
-            .map_err(|e| Error::io(format!("create {}", extract_dir.display()), e))?;
-        extract_tar_asset(download_path, &extract_dir)?;
-        find_greppy_binary(&extract_dir)?
-    } else {
-        download_path.to_path_buf()
-    };
-    ensure_update_binary_permissions(&candidate)?;
-    Ok(candidate)
-}
-
-fn extract_tar_asset(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
-    let out = std::process::Command::new("tar")
-        .arg("-xf")
-        .arg(archive)
-        .arg("-C")
-        .arg(dest)
-        .output()
-        .map_err(|e| Error::io("run tar for greppy update", e))?;
-    if !out.status.success() {
-        return Err(Error::Config(format!(
-            "tar failed to extract {}: {}",
-            archive.display(),
-            stderr_summary(&out.stderr)
-        )));
-    }
-    Ok(())
-}
-
-fn extract_zip_asset(archive: &std::path::Path, dest: &std::path::Path) -> Result<()> {
-    let unzip = std::process::Command::new("unzip")
-        .arg("-qq")
-        .arg(archive)
-        .arg("-d")
-        .arg(dest)
-        .output();
-    match unzip {
-        Ok(out) if out.status.success() => return Ok(()),
-        Ok(out) => {
-            let tar = std::process::Command::new("tar")
-                .arg("-xf")
-                .arg(archive)
-                .arg("-C")
-                .arg(dest)
-                .output()
-                .map_err(|e| Error::io("run tar fallback for greppy zip update", e))?;
-            if tar.status.success() {
-                return Ok(());
-            }
-            Err(Error::Config(format!(
-                "zip extraction failed for {}: unzip: {}; tar: {}",
-                archive.display(),
-                stderr_summary(&out.stderr),
-                stderr_summary(&tar.stderr)
-            )))
-        }
-        Err(unzip_err) => {
-            let tar = std::process::Command::new("tar")
-                .arg("-xf")
-                .arg(archive)
-                .arg("-C")
-                .arg(dest)
-                .output()
-                .map_err(|e| Error::io("run tar fallback for greppy zip update", e))?;
-            if tar.status.success() {
-                return Ok(());
-            }
-            Err(Error::Config(format!(
-                "zip extraction failed for {}: unzip unavailable ({unzip_err}); tar: {}",
-                archive.display(),
-                stderr_summary(&tar.stderr)
-            )))
-        }
-    }
-}
-
-fn find_greppy_binary(root: &std::path::Path) -> Result<std::path::PathBuf> {
-    let exact = update_binary_file_name();
-    let mut stack = vec![root.to_path_buf()];
-    let mut fallback = None;
-    while let Some(dir) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| Error::io(format!("scan {}", dir.display()), e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| Error::io(format!("scan {}", dir.display()), e))?;
-            let path = entry.path();
-            let ty = entry
-                .file_type()
-                .map_err(|e| Error::io(format!("stat {}", path.display()), e))?;
-            if ty.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if !ty.is_file() {
-                continue;
-            }
-            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            let lower = name.to_ascii_lowercase();
-            if lower == exact {
-                return Ok(path);
-            }
-            if fallback.is_none()
-                && lower.starts_with("greppy")
-                && !update_asset_is_auxiliary(&lower)
-            {
-                fallback = Some(path);
-            }
-        }
-    }
-    fallback.ok_or_else(|| {
-        Error::Config(format!(
-            "release archive did not contain {}",
-            update_binary_file_name()
-        ))
-    })
-}
-
-fn update_binary_file_name() -> &'static str {
-    if cfg!(windows) {
-        "greppy.exe"
-    } else {
-        "greppy"
-    }
-}
-
-#[cfg(unix)]
-fn ensure_update_binary_permissions(path: &std::path::Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)
-        .map_err(|e| Error::io(format!("stat {}", path.display()), e))?
-        .permissions();
-    let mode = perms.mode() | 0o755;
-    perms.set_mode(mode);
-    std::fs::set_permissions(path, perms)
-        .map_err(|e| Error::io(format!("chmod {}", path.display()), e))
-}
-
-#[cfg(not(unix))]
-fn ensure_update_binary_permissions(_path: &std::path::Path) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn replace_current_exe(
-    candidate: &std::path::Path,
-    current_exe: &std::path::Path,
-) -> Result<ReplaceOutcome> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let new_path = update_sibling_path(current_exe, "new");
-    let backup_path = update_sibling_path(current_exe, "old");
-    let current_mode = std::fs::metadata(current_exe)
-        .map(|m| m.permissions().mode() & 0o777)
-        .unwrap_or(0o755);
-
-    std::fs::copy(candidate, &new_path).map_err(|e| {
-        Error::io(
-            format!(
-                "copy update candidate {} to {}",
-                candidate.display(),
-                new_path.display()
-            ),
-            e,
-        )
-    })?;
-    std::fs::set_permissions(
-        &new_path,
-        std::fs::Permissions::from_mode(current_mode | 0o111),
-    )
-    .map_err(|e| Error::io(format!("chmod {}", new_path.display()), e))?;
-    sync_file(&new_path)?;
-
-    if let Err(e) = std::fs::rename(current_exe, &backup_path) {
-        let _ = std::fs::remove_file(&new_path);
-        return Err(Error::io(
-            format!(
-                "replace {} with downloaded greppy binary (rename current to {})",
-                current_exe.display(),
-                backup_path.display()
-            ),
-            e,
-        ));
-    }
-
-    match std::fs::rename(&new_path, current_exe) {
-        Ok(()) => {
-            sync_file(current_exe)?;
-            let _ = std::fs::remove_file(&backup_path);
-            sync_parent_dir(current_exe)?;
-            Ok(ReplaceOutcome::Replaced)
-        }
-        Err(e) => {
-            let publish_error = Error::io(
-                format!(
-                    "replace {} with downloaded greppy binary",
-                    current_exe.display()
-                ),
-                e,
-            );
-            match std::fs::rename(&backup_path, current_exe) {
-                Ok(()) => Err(publish_error),
-                Err(restore_error) => Err(Error::Store(format!(
-                    "{publish_error}; failed to restore previous binary {} from {}: {restore_error}",
-                    current_exe.display(),
-                    backup_path.display()
-                ))),
-            }
-        }
-    }
-}
-
-#[cfg(windows)]
-fn replace_current_exe(
-    candidate: &std::path::Path,
-    current_exe: &std::path::Path,
-) -> Result<ReplaceOutcome> {
-    let new_path = update_sibling_path(current_exe, "new.exe");
-    std::fs::copy(candidate, &new_path).map_err(|e| {
-        Error::io(
-            format!(
-                "copy update candidate {} to {}",
-                candidate.display(),
-                new_path.display()
-            ),
-            e,
-        )
-    })?;
-    let script = format!(
-        "$ErrorActionPreference = 'Stop'; Wait-Process -Id {}; Move-Item -LiteralPath {} -Destination {} -Force",
-        std::process::id(),
-        powershell_quote_path(&new_path),
-        powershell_quote_path(current_exe)
-    );
-    std::process::Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(script)
-        .spawn()
-        .map_err(|e| Error::io("spawn PowerShell updater", e))?;
-    Ok(ReplaceOutcome::ScheduledAfterExit)
-}
-
-fn update_sibling_path(path: &std::path::Path, label: &str) -> std::path::PathBuf {
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("greppy");
-    path.with_file_name(format!(
-        ".{file_name}.{label}.{}.{}",
-        std::process::id(),
-        stamp
-    ))
-}
-
-#[cfg(windows)]
-fn powershell_quote_path(path: &std::path::Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
 }
 
 fn dispatch_search_graph(
@@ -4756,11 +3892,6 @@ fn try_auto_reindex_inline(root: Option<&str>) -> bool {
     drop(store);
     let embedding_cfg = if had_vectors {
         let no_args = EmbeddingCliArgs {
-            model_dir: None,
-            gguf: None,
-            tokenizer: None,
-            model_id: None,
-            max_length: None,
             device: None,
             no_gpu: false,
         };
@@ -4796,10 +3927,8 @@ fn vector_auto_reindex_can_rebuild(args: EmbeddingCliArgs<'_>) -> bool {
 }
 
 fn embedding_model_source_exists(source: &EmbeddingModelSource) -> bool {
-    match source {
-        EmbeddingModelSource::SafetensorsDir(dir) => dir.join("model.safetensors").is_file(),
-        EmbeddingModelSource::Gguf { gguf, tokenizer } => gguf.is_file() && tokenizer.is_file(),
-    }
+    let EmbeddingModelSource::Gguf { gguf, tokenizer } = source;
+    gguf.is_file() && tokenizer.is_file()
 }
 
 /// Atomically published status for the one allowed background index job.
@@ -5868,7 +4997,9 @@ fn summarize_definition_span(source_span: &str) -> Option<Vec<String>> {
 /// answer "how does S work / what is its role / what depends on it" from a
 /// SINGLE call instead of three, which is exactly where the benchmark showed
 /// research-task iteration eating the token/time savings.
-fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
+const BRIEF_JSON_SCHEMA_VERSION: &str = "greppy.brief.v1";
+
+fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
     let store = open_default_store_query_writer(root)?;
     let project = project_for(root)?;
     let query_symbol = symbol.unwrap_or("");
@@ -5877,9 +5008,9 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
         root,
         &project,
         "brief",
-        false,
-        serde_json::Value::Null,
-        "hits",
+        json,
+        serde_json::json!({"schema_version": BRIEF_JSON_SCHEMA_VERSION}),
+        "definitions",
     )? {
         return Ok(code);
     }
@@ -5888,17 +5019,39 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
         root,
         &project,
         "brief",
-        false,
-        serde_json::Value::Null,
-        "hits",
+        json,
+        serde_json::json!({"schema_version": BRIEF_JSON_SCHEMA_VERSION}),
+        "definitions",
     )? {
         return Ok(code);
     }
     let targets = resolve_symbol_nodes(&store, symbol)?;
     if targets.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": BRIEF_JSON_SCHEMA_VERSION,
+                    "command": "brief",
+                    "status": "not_found",
+                    "project": project,
+                    "query": query_symbol,
+                    "definitions": [],
+                    "callers": [],
+                    "references": [],
+                    "calls": [],
+                    "expand_id": serde_json::Value::Null,
+                }))
+                .map_err(|e| Error::Invalid(format!("serialize brief JSON: {e}")))?
+            );
+            return Ok(1);
+        }
         return content_fallback(&store, root, symbol.unwrap_or(""), "brief");
     }
     let root_path = resolve_root(root)?;
+    if json {
+        return dispatch_brief_json(&store, &project, query_symbol, &targets, &root_path, root);
+    }
     let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
 
     // Definition(s) + source span.
@@ -6022,6 +5175,166 @@ fn dispatch_brief(symbol: Option<&str>, root: Option<&str>) -> Result<i32> {
     ) {
         println!("{}", expand.text_line());
     }
+    Ok(0)
+}
+
+fn dispatch_brief_json(
+    store: &greppy_store::Store,
+    project: &str,
+    query_symbol: &str,
+    targets: &[i64],
+    root_path: &std::path::Path,
+    root: Option<&str>,
+) -> Result<i32> {
+    let mut evidence_nodes: Vec<(String, greppy_store::Node, serde_json::Value)> = Vec::new();
+    let mut definitions = Vec::new();
+    let mut seen_def = std::collections::BTreeSet::new();
+    for id in targets {
+        let Some(node) = store.get_node(*id)? else {
+            continue;
+        };
+        if !seen_def.insert(node.id) {
+            continue;
+        }
+        let span = read_span_with_meta(
+            root_path,
+            &node.file_path,
+            node.start_line,
+            node.end_line,
+            CONTEXT_SPAN_CAP,
+            false,
+        );
+        let source = span.as_ref().map(|span| span.text.as_str()).unwrap_or("");
+        let end_line = span
+            .as_ref()
+            .map(|span| span.end_line)
+            .unwrap_or(node.end_line);
+        let signature = node
+            .properties
+            .get("source_signature")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .or_else(|| semantic_signature_from_span(source));
+        let summary = summarize_definition_span(source).unwrap_or_default();
+        let summary_prompt_version = if summary.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::json!(greppy_qwen35_native::PROMPT_VERSION)
+        };
+        definitions.push(serde_json::json!({
+            "qualified_name": &node.qualified_name,
+            "name": display_node_name(&node),
+            "label": &node.label,
+            "file_path": &node.file_path,
+            "start_line": node.start_line,
+            "end_line": end_line,
+            "signature": signature,
+            "summary": summary,
+            "summary_prompt_version": summary_prompt_version,
+            "source": source,
+        }));
+        evidence_nodes.push((
+            format!("definition {}", display_node_name(&node)),
+            node,
+            serde_json::json!({"section": "definition"}),
+        ));
+    }
+
+    let callers = incoming_call_nodes_for_targets(store, targets)?;
+    let callers_json = callers.iter().map(node_hit_json).collect::<Vec<_>>();
+    for node in &callers {
+        evidence_nodes.push((
+            format!("caller {}", display_node_name(node)),
+            node.clone(),
+            serde_json::json!({"section": "callers"}),
+        ));
+    }
+
+    let mut references_json = Vec::new();
+    if targets_include_non_callable(store, targets)? {
+        for reference in greppy_search::find_references_to_any(store, targets, BRIEF_LIMIT)? {
+            references_json.push(serde_json::json!({
+                "edge_type": &reference.edge_type,
+                "qualified_name": &reference.node.qualified_name,
+                "file_path": &reference.node.file_path,
+                "start_line": reference.node.start_line,
+                "end_line": reference.node.end_line,
+            }));
+            if let Some(node) = store.get_node(reference.node.id)? {
+                evidence_nodes.push((
+                    format!(
+                        "reference {} {}",
+                        reference.edge_type,
+                        display_node_name(&node)
+                    ),
+                    node,
+                    serde_json::json!({
+                        "section": "references",
+                        "edge_type": reference.edge_type,
+                    }),
+                ));
+            }
+        }
+    }
+
+    let mut callees = std::collections::BTreeMap::<i64, greppy_store::Node>::new();
+    for id in callee_source_ids_for_symbols(store, project, targets)? {
+        for step in greppy_search::callees_of(store, id)? {
+            if let Some(node) = step.node {
+                callees.entry(step.node_id).or_insert(node);
+            }
+        }
+    }
+    let calls_json = callees.values().map(node_hit_json).collect::<Vec<_>>();
+    for node in callees.values() {
+        evidence_nodes.push((
+            format!("callee {}", display_node_name(node)),
+            node.clone(),
+            serde_json::json!({"section": "calls"}),
+        ));
+    }
+
+    let evidence_rows = evidence_nodes
+        .iter()
+        .map(|(title, node, extra_json)| ExpandEvidenceNode {
+            title: title.clone(),
+            node,
+            site_lines: Vec::new(),
+            extra_json: extra_json.clone(),
+        })
+        .collect::<Vec<_>>();
+    let expand = insert_nav_expand_pack(
+        store,
+        root,
+        project,
+        "brief",
+        query_symbol,
+        evidence_rows.len(),
+        &evidence_rows,
+    );
+    let freshness = nav_freshness_json(store, root, project);
+    let mut output = serde_json::json!({
+        "schema_version": BRIEF_JSON_SCHEMA_VERSION,
+        "command": "brief",
+        "status": "ok",
+        "project": project,
+        "query": query_symbol,
+        "freshness": freshness,
+        "definitions": definitions,
+        "callers": callers_json,
+        "references": references_json,
+        "calls": calls_json,
+        "expand_id": serde_json::Value::Null,
+    });
+    if let Some(expand) = expand {
+        output["expand_id"] = serde_json::json!(&expand.id);
+        output["expand"] = expand.json_value();
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output)
+            .map_err(|e| Error::Invalid(format!("serialize brief JSON: {e}")))?
+    );
     Ok(0)
 }
 
@@ -6162,22 +5475,72 @@ fn inference_registry_status() -> Result<greppy_embed_native::InferenceBackendRe
     ))
 }
 
+fn inference_model_status() -> serde_json::Value {
+    let embedding_args = EmbeddingCliArgs {
+        device: None,
+        no_gpu: false,
+    };
+    let embedding = match embedding_config_optional(embedding_args) {
+        Ok(Some(cfg)) => {
+            let EmbeddingModelSource::Gguf { gguf, tokenizer } = cfg.source;
+            serde_json::json!({
+                "model_id": cfg.model_id,
+                "format": "gguf-q4k",
+                "embedded": cached_model_digest(&gguf).is_some(),
+                "model_sha256": model_file_digest(&gguf).ok(),
+                "tokenizer_sha256": model_file_digest(&tokenizer).ok(),
+                "model_bytes": std::fs::metadata(&gguf).ok().map(|metadata| metadata.len()),
+                "prompt_version": greppy_embed_native::PROMPT_VERSION,
+                "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
+            })
+        }
+        Ok(None) => serde_json::json!({
+            "model_id": DEFAULT_EMBEDDINGGEMMA_MODEL_ID,
+            "format": "gguf-q4k",
+            "embedded": true,
+            "model_sha256": env!("GREPPY_EMBEDDED_GGUF_SHA"),
+            "tokenizer_sha256": env!("GREPPY_EMBEDDED_TOK_SHA"),
+            "runtime_state": "not_loaded",
+            "prompt_version": greppy_embed_native::PROMPT_VERSION,
+            "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
+        }),
+        Err(error) => serde_json::json!({"state": "faulted", "last_error": error.to_string()}),
+    };
+    let summary = match qwen_summary_config_optional() {
+        Ok(Some(cfg)) => serde_json::json!({
+            "model_id": cfg.model_id,
+            "format": "gguf-q4-k-m-mtp",
+            "embedded": cached_model_digest(&cfg.gguf).is_some(),
+            "model_sha256": model_file_digest(&cfg.gguf).ok(),
+            "tokenizer_sha256": model_file_digest(&cfg.tokenizer).ok(),
+            "model_bytes": std::fs::metadata(&cfg.gguf).ok().map(|metadata| metadata.len()),
+            "prompt_version": greppy_qwen35_native::PROMPT_VERSION,
+        }),
+        Ok(None) => serde_json::json!({
+            "model_id": greppy_qwen35_native::MODEL_ID,
+            "format": "gguf-q4-k-m-mtp",
+            "embedded": true,
+            "model_sha256": env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA"),
+            "tokenizer_sha256": env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA"),
+            "runtime_state": "not_loaded",
+            "prompt_version": greppy_qwen35_native::PROMPT_VERSION,
+        }),
+        Err(error) => serde_json::json!({"state": "faulted", "last_error": error.to_string()}),
+    };
+    serde_json::json!({"embedding": embedding, "summary": summary})
+}
+
 fn combined_inference_gpu_memory() -> u64 {
     let embedding_args = EmbeddingCliArgs {
-        model_dir: None,
-        gguf: None,
-        tokenizer: None,
-        model_id: None,
-        max_length: None,
         device: None,
         no_gpu: false,
     };
     let embedding = embedding_config_optional(embedding_args)
         .ok()
         .flatten()
-        .and_then(|cfg| match cfg.source {
-            EmbeddingModelSource::Gguf { gguf, .. } => std::fs::metadata(gguf).ok(),
-            EmbeddingModelSource::SafetensorsDir(_) => None,
+        .and_then(|cfg| {
+            let EmbeddingModelSource::Gguf { gguf, .. } = cfg.source;
+            std::fs::metadata(gguf).ok()
         })
         .map(|metadata| {
             greppy_embed_native::estimated_gpu_memory(
@@ -6250,11 +5613,6 @@ fn inference_daemon_status() -> serde_json::Value {
     #[cfg(any(unix, windows))]
     {
         let embedding_args = EmbeddingCliArgs {
-            model_dir: None,
-            gguf: None,
-            tokenizer: None,
-            model_id: None,
-            max_length: None,
             device: None,
             no_gpu: false,
         };
@@ -6510,6 +5868,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         serde_json::json!({
             "registry": registry,
             "daemons": inference_daemons,
+            "models": inference_model_status(),
         })
     });
 
@@ -6536,7 +5895,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             "skip_counts_by_reason": [],
             "dirty_overlay": dirty_overlay.to_json(),
             "inference": inference_diagnostics,
-            "message": "no active index; run grep index first",
+            "message": "no active index; run greppy index first",
         });
         if json {
             println!(
@@ -6548,7 +5907,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
             println!("status: no_index");
             println!("root: {}", effective_root.display());
             println!("store: {}", store_path.display());
-            println!("message: run `grep index {}` first", root.unwrap_or("."));
+            println!("message: run `greppy index {}` first", root.unwrap_or("."));
             if let Some(inference) = &inference {
                 print_inference_registry(inference);
             }
@@ -6622,11 +5981,6 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         })
         .unwrap_or(0);
     let configured_embedding_model = embedding_config_optional(EmbeddingCliArgs {
-        model_dir: None,
-        gguf: None,
-        tokenizer: None,
-        model_id: None,
-        max_length: None,
         device: None,
         no_gpu: false,
     })
@@ -6660,7 +6014,7 @@ fn dispatch_index_health(command: &str, json: bool, root: Option<&str>) -> Resul
         Some(tracked) if tracked >= 100 && (indexed_files as u64) * 5 < tracked => Some(format!(
             "store indexed {indexed_files} files but git tracks {tracked} — \
              discovery may be dropping files (nested-repo ignore rules?); \
-             re-run `grep index` with the current binary"
+             re-run `greppy index` with the current binary"
         )),
         _ => None,
     };
@@ -9322,8 +8676,9 @@ fn plus_json(
 /// answer the user's question, and does not invent context. It emits ranked
 /// hits with stable locations and signal labels, combining the "plus" parts
 /// grep lacks: symbol matching, fuzzy semantic matching, and graph-neighbour
-/// hints. `--vectors` adds EmbeddingGemma code-retrieval hits as one more
-/// search signal, scoped to the current graph generation.
+/// hints. EmbeddingGemma code-retrieval hits are always available as another
+/// signal, scoped to the current graph generation. Exact literal/graph control
+/// queries still short-circuit before loading the model.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_plus(
     query: Option<&str>,
@@ -9331,10 +8686,10 @@ fn dispatch_plus(
     code: bool,
     explain: bool,
     json: bool,
-    vectors: bool,
     embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
 ) -> Result<i32> {
+    let vectors = true;
     let store = open_default_store(root)?;
     let q = query.unwrap_or("").trim();
     if q.is_empty() {
@@ -9379,7 +8734,7 @@ fn dispatch_plus(
         } else {
             eprintln!("{}", plus_stale_skip_message(freshness));
             println!(
-                "(no usable index; run `grep index {}` first)",
+                "(no usable index; run `greppy index {}` first)",
                 root.unwrap_or(".")
             );
         }
@@ -10225,7 +9580,7 @@ fn dispatch_semantic(
                 )?;
             } else {
                 println!(
-                    "(no vector embeddings for model {}; run `grep index` first)",
+                    "(no vector embeddings for model {}; run `greppy index` first)",
                     cfg.model_id
                 );
             }
@@ -10305,6 +9660,7 @@ fn dispatch_semantic(
 const SEMANTIC_VECTOR_DISPLAY_LIMIT: usize = 3;
 const SEMANTIC_VECTOR_RESULT_LIMIT: usize = 6;
 const SEMANTIC_VECTOR_CANDIDATE_LIMIT: usize = 24;
+const SEMANTIC_JSON_SCHEMA_VERSION: &str = "greppy.semantic-search.v1";
 const SEMANTIC_PURPOSE_SPAN_CAP_LINES: usize = 40;
 const SEMANTIC_PURPOSE_SPAN_MAX_BYTES: usize = 2 * 1024;
 
@@ -10645,7 +10001,7 @@ fn current_graph_generation(store: &greppy_store::Store, root: Option<&str>) -> 
     let root_key = root_path.to_string_lossy().into_owned();
     let state = store.get_workspace_state(&root_key)?.ok_or_else(|| {
         Error::Invalid(format!(
-            "no workspace_state for {}; run `grep index {}` first",
+            "no workspace_state for {}; run `greppy index {}` first",
             root_path.display(),
             root.unwrap_or(".")
         ))
@@ -10701,6 +10057,7 @@ fn semantic_vector_json_with_expand(
         .collect::<Vec<_>>();
     let shown = rows.len() as i64;
     let mut v = serde_json::json!({
+        "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
         "command": "semantic-search",
         "mode": "vector",
         "status": status,
@@ -10748,6 +10105,7 @@ fn semantic_provider_incomplete_json(
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
             "command": "semantic-search",
             "mode": mode,
             "status": "skipped_incomplete_provider",
@@ -11105,21 +10463,7 @@ fn context_vector_fallback(
     embedding_args: EmbeddingCliArgs<'_>,
     root: Option<&str>,
 ) -> Result<Option<(Vec<ContextVectorDef>, bool)>> {
-    // Model configuration is OPTIONAL here: with no model the command must
-    // behave exactly as before (lexical-only), just with a clear note so the
-    // operator knows the semantic lever was available but unconfigured.
-    let cfg = match embedding_config_optional(embedding_args)? {
-        Some(cfg) => cfg,
-        None => {
-            eprintln!(
-                "context: no EmbeddingGemma model configured; skipping vector \
-                 fallback for the natural-language query (set \
-                 {ENV_EMBED_MODEL_DIR}, or {ENV_EMBED_GGUF}+{ENV_EMBED_TOKENIZER}, \
-                 to enable semantic discovery). Returning exact/FTS results only."
-            );
-            return Ok(None);
-        }
-    };
+    let cfg = embedding_config_for_required_use(embedding_args)?;
 
     let generation = current_graph_generation(store, root)?;
     let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
@@ -11152,17 +10496,14 @@ fn context_vector_fallback(
         return Ok(None);
     }
     if !freshness_json_is_fresh(freshness) {
-        eprintln!(
-            "{}",
-            vector_stale_skip_message("context --vectors", freshness)
-        );
+        eprintln!("{}", vector_stale_skip_message("context", freshness));
         return Ok(None);
     }
     let candidate_limit = vector_exact_candidate_limit()?;
     if let Some(limit) = vector_exact_scan_exceeds_limit(total, candidate_limit) {
         eprintln!(
             "{}",
-            vector_exact_scan_skip_message("context --vectors", total, limit)
+            vector_exact_scan_skip_message("context", total, limit)
         );
         return Ok(None);
     }
@@ -11170,7 +10511,7 @@ fn context_vector_fallback(
     let query_vector = match embed_query_cached(&cfg, root, query) {
         Ok(query_vector) => query_vector,
         Err(e) => {
-            log_embedding_skip_once("context --vectors", &e);
+            log_embedding_skip_once("context", &e);
             return Ok(None);
         }
     };
@@ -11825,61 +11166,299 @@ fn embedding_config_for_index(args: EmbeddingCliArgs<'_>) -> Result<Option<Embed
     if test_inference_skipped() {
         return Ok(None);
     }
-    // Every index contains EmbeddingGemma vectors. Explicit model/device
-    // arguments may override the source or backend, but cannot disable it.
-    match embedding_config_optional(args)? {
-        Some(cfg) => Ok(Some(cfg)),
-        None => Ok(Some(embedding_config_required(args)?)),
-    }
+    Ok(Some(embedding_config_required(args)?))
 }
 
 fn embedding_config_for_required_use(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
-    match embedding_config_optional(args)? {
-        Some(cfg) => Ok(cfg),
-        None => embedding_config_required(args),
+    embedding_config_required(args)
+}
+
+/// Resolve the mandatory embedded EmbeddingGemma model. The `Option` remains
+/// only for non-fatal query paths that predate the always-embedded contract.
+fn embedding_config_optional(args: EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>> {
+    embedding_config_required(args).map(Some)
+}
+
+static EMBEDDED_ASSET_TMP_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn extract_embedded_asset(
+    model_root: &std::path::Path,
+    expected_sha: &str,
+    name: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    let model = model_root.file_name()?.to_str()?.to_owned();
+    let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
+    let dest = root.join(name);
+    let marker = root.join(format!("{name}.sha256"));
+    if embedded_asset_marker_matches(&dest, &marker, expected_sha, bytes.len()) {
+        greppy_core::cache::touch_last_used_dir(&root);
+        return Some(dest.to_string_lossy().into_owned());
+    }
+
+    let _lease = greppy_core::cache::acquire_model_lifecycle(
+        expected_sha,
+        greppy_core::cache::LockMode::Exclusive,
+        false,
+    )
+    .ok()??;
+    let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
+    let dest = root.join(name);
+    let marker = root.join(format!("{name}.sha256"));
+    if embedded_asset_marker_matches(&dest, &marker, expected_sha, bytes.len()) {
+        greppy_core::cache::touch_last_used_dir(&root);
+        return Some(dest.to_string_lossy().into_owned());
+    }
+
+    let nonce = EMBEDDED_ASSET_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = root.join(format!("{name}.tmp.{}.{}", std::process::id(), nonce));
+    let marker_tmp = root.join(format!(
+        "{name}.sha256.tmp.{}.{}",
+        std::process::id(),
+        nonce
+    ));
+
+    // Upgrade legacy markers without rewriting a valid multi-hundred-MiB
+    // model. A changed metadata fingerprint always re-enters this digest path.
+    let result = if embedded_asset_digest_matches(&dest, expected_sha, bytes.len()) {
+        write_embedded_asset_marker(&dest, &marker_tmp, &marker, expected_sha, bytes.len())
+    } else {
+        write_verified_embedded_asset(&tmp, &dest, &marker_tmp, &marker, expected_sha, bytes)
+    };
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&marker_tmp);
+    }
+
+    if embedded_asset_marker_matches(&dest, &marker, expected_sha, bytes.len()) {
+        greppy_core::cache::touch_last_used_dir(&root);
+        Some(dest.to_string_lossy().into_owned())
+    } else {
+        None
     }
 }
 
-/// Resolve an embedding model config when one is available, without erroring
-/// when it is not. Returns `Ok(None)` only when NO model source is configured
-/// at all (no `--embedding-*` flag and no `GREPPY_EMBEDDINGGEMMA_*` env),
-/// which lets a caller degrade gracefully instead of failing. A partially
-/// specified source (e.g. `--embedding-gguf` without a tokenizer) is a real
-/// misconfiguration and still surfaces as an error via
-/// [`embedding_config_required`].
-fn embedding_config_optional(args: EmbeddingCliArgs<'_>) -> Result<Option<EmbeddingModelConfig>> {
-    let has_source = cli_or_env(args.model_dir, ENV_EMBED_MODEL_DIR).is_some()
-        || cli_or_env(args.gguf, ENV_EMBED_GGUF).is_some()
-        || cli_or_env(args.tokenizer, ENV_EMBED_TOKENIZER).is_some();
-    if !has_source {
-        // Owner rule: semantic search must ALWAYS work. Release binaries
-        // carry EmbeddingGemma inside; when no
-        // explicit source is configured, extract it once to the data dir
-        // and use it. Env/CLI settings above still override.
-        if let Some((gguf, tokenizer)) = embeddinggemma_assets::paths() {
-            let args = EmbeddingCliArgs {
-                gguf: Some(&gguf),
-                tokenizer: Some(&tokenizer),
-                ..args
-            };
-            return embedding_config_required(args).map(Some);
-        }
-        return Ok(None);
+fn embedded_asset_marker_matches(
+    dest: &std::path::Path,
+    marker: &std::path::Path,
+    expected_sha: &str,
+    expected_len: usize,
+) -> bool {
+    let Ok(metadata_fingerprint) = embedded_asset_metadata_fingerprint(dest, expected_len) else {
+        return false;
+    };
+    let Ok(marker_metadata) = std::fs::symlink_metadata(marker) else {
+        return false;
+    };
+    if !marker_metadata.file_type().is_file() {
+        return false;
     }
-    embedding_config_required(args).map(Some)
+    let Ok(raw) = std::fs::read(marker) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    value.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+        && value.get("sha256").and_then(serde_json::Value::as_str) == Some(expected_sha)
+        && value.get("length").and_then(serde_json::Value::as_u64)
+            == u64::try_from(expected_len).ok()
+        && value
+            .get("metadata_fingerprint")
+            .and_then(serde_json::Value::as_str)
+            == Some(metadata_fingerprint.as_str())
+}
+
+fn embedded_asset_metadata_fingerprint(
+    path: &std::path::Path,
+    expected_len: usize,
+) -> std::io::Result<String> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("embedded asset {} is not a regular file", path.display()),
+        ));
+    }
+    let expected_len = u64::try_from(expected_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedded asset length does not fit u64",
+        )
+    })?;
+    if metadata.len() != expected_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "embedded asset {} has length {}, expected {expected_len}",
+                path.display(),
+                metadata.len()
+            ),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "embedded asset {} is not private to its owner",
+                    path.display()
+                ),
+            ));
+        }
+        return Ok(format!(
+            "unix:{}:{}:{}:{}:{}",
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mtime(),
+            metadata.mtime_nsec(),
+            metadata.ctime_nsec()
+        ));
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = metadata
+            .modified()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(std::io::Error::other)?
+            .as_nanos();
+        Ok(format!("portable:{modified}:{}", metadata.len()))
+    }
+}
+
+fn embedded_asset_digest_matches(
+    path: &std::path::Path,
+    expected_sha: &str,
+    expected_len: usize,
+) -> bool {
+    if make_embedded_asset_private(path).is_err()
+        || embedded_asset_metadata_fingerprint(path, expected_len).is_err()
+    {
+        return false;
+    }
+    embedded_asset_sha256_file(path).is_ok_and(|digest| digest == expected_sha)
+}
+
+fn embedded_asset_sha256_file(path: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn make_embedded_asset_private(path: &std::path::Path) -> std::io::Result<()> {
+    greppy_core::cache::secure_private_file(path)
+}
+
+fn write_verified_embedded_asset(
+    tmp: &std::path::Path,
+    dest: &std::path::Path,
+    marker_tmp: &std::path::Path,
+    marker: &std::path::Path,
+    expected_sha: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let _ = std::fs::remove_file(tmp);
+    let mut file = options.open(tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    if !embedded_asset_digest_matches(tmp, expected_sha, bytes.len()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "embedded asset {} failed SHA-256 verification",
+                tmp.display()
+            ),
+        ));
+    }
+
+    // Invalidate trust before replacing the payload. Other processes either
+    // see the old verified pair or wait for the exclusive lifecycle lease.
+    let _ = std::fs::remove_file(marker);
+    let _ = std::fs::remove_file(dest);
+    std::fs::rename(tmp, dest)?;
+    make_embedded_asset_private(dest)?;
+    write_embedded_asset_marker(dest, marker_tmp, marker, expected_sha, bytes.len())
+}
+
+fn write_embedded_asset_marker(
+    dest: &std::path::Path,
+    marker_tmp: &std::path::Path,
+    marker: &std::path::Path,
+    expected_sha: &str,
+    expected_len: usize,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    make_embedded_asset_private(dest)?;
+    let metadata_fingerprint = embedded_asset_metadata_fingerprint(dest, expected_len)?;
+    let length = u64::try_from(expected_len).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedded asset length does not fit u64",
+        )
+    })?;
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "sha256": expected_sha,
+        "length": length,
+        "metadata_fingerprint": metadata_fingerprint,
+    }))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let _ = std::fs::remove_file(marker_tmp);
+    let mut file = options.open(marker_tmp)?;
+    file.write_all(&payload)?;
+    file.sync_all()?;
+    drop(file);
+    let _ = std::fs::remove_file(marker);
+    std::fs::rename(marker_tmp, marker)?;
+    make_embedded_asset_private(marker)
+}
+
+#[cfg(test)]
+fn embedded_asset_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
 }
 
 /// Built-in EmbeddingGemma: the Q4_K GGUF and
 /// tokenizer are baked into the binary at build time and extracted once
 /// to `<data>/greppy/models/embeddinggemma-300m-q4k/<sha>/` (mmap needs a real
 /// file). The
-/// extraction is atomic (tmp + rename) and trusts cached files only when their
-/// tiny marker file matches the baked SHA and their length matches the baked
-/// bytes, so stale or torn cache entries self-repair without hashing the model
-/// on every CLI invocation.
+/// extraction is atomic (tmp + rename). A cache entry is hashed before it is
+/// first trusted and whenever its metadata identity changes; a private marker
+/// makes the unchanged fast path constant-time without accepting stale or torn
+/// payloads.
 mod embeddinggemma_assets {
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_TOK_SHA");
@@ -11898,104 +11477,7 @@ mod embeddinggemma_assets {
         name: &str,
         bytes: &[u8],
     ) -> Option<String> {
-        let model = root.file_name()?.to_str()?.to_owned();
-        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
-        let dest = root.join(name);
-        let marker = root.join(format!("{name}.sha256"));
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
-            greppy_core::cache::touch_last_used_dir(&root);
-            return Some(dest.to_string_lossy().into_owned());
-        }
-
-        let _lease = greppy_core::cache::acquire_model_lifecycle(
-            expected_sha,
-            greppy_core::cache::LockMode::Exclusive,
-            false,
-        )
-        .ok()??;
-        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
-        let dest = root.join(name);
-        let marker = root.join(format!("{name}.sha256"));
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
-            greppy_core::cache::touch_last_used_dir(&root);
-            return Some(dest.to_string_lossy().into_owned());
-        }
-
-        let nonce = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = root.join(format!("{name}.tmp.{}.{}", std::process::id(), nonce));
-        let marker_tmp = root.join(format!(
-            "{name}.sha256.tmp.{}.{}",
-            std::process::id(),
-            nonce
-        ));
-
-        let written =
-            write_verified_cache_entry(&tmp, &dest, &marker_tmp, &marker, expected_sha, bytes);
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            let _ = std::fs::remove_file(&marker_tmp);
-        }
-
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
-            greppy_core::cache::touch_last_used_dir(&root);
-            Some(dest.to_string_lossy().into_owned())
-        } else {
-            None
-        }
-    }
-
-    fn cache_entry_is_valid(
-        dest: &std::path::Path,
-        marker: &std::path::Path,
-        expected_sha: &str,
-        expected_len: usize,
-    ) -> bool {
-        let marker_ok = std::fs::read_to_string(marker)
-            .map(|s| s.trim() == expected_sha)
-            .unwrap_or(false);
-        if !marker_ok {
-            return false;
-        }
-        std::fs::metadata(dest)
-            .map(|m| m.len() == expected_len as u64)
-            .unwrap_or(false)
-    }
-
-    fn write_verified_cache_entry(
-        tmp: &std::path::Path,
-        dest: &std::path::Path,
-        marker_tmp: &std::path::Path,
-        marker: &std::path::Path,
-        expected_sha: &str,
-        bytes: &[u8],
-    ) -> std::io::Result<()> {
-        std::fs::write(tmp, bytes)?;
-        ensure_len(tmp, bytes.len())?;
-
-        // Invalidate before replacing the data file, so readers never trust an
-        // old marker for bytes that are currently being repaired.
-        let _ = std::fs::remove_file(marker);
-        let _ = std::fs::remove_file(dest);
-        std::fs::rename(tmp, dest)?;
-        ensure_len(dest, bytes.len())?;
-
-        std::fs::write(marker_tmp, expected_sha.as_bytes())?;
-        std::fs::rename(marker_tmp, marker)?;
-        Ok(())
-    }
-
-    fn ensure_len(path: &std::path::Path, expected_len: usize) -> std::io::Result<()> {
-        let len = std::fs::metadata(path)?.len();
-        if len == expected_len as u64 {
-            return Ok(());
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "embedded model cache entry {} has length {len}, expected {expected_len}",
-                path.display()
-            ),
-        ))
+        super::extract_embedded_asset(root, expected_sha, name, bytes)
     }
 
     #[cfg(test)]
@@ -12005,22 +11487,23 @@ mod embeddinggemma_assets {
         #[test]
         fn cached_asset_resolves_while_model_has_shared_lease() {
             const MODEL: &str = "embeddinggemma-asset-lock-test";
-            const SHA: &str = "1111111111111111111111111111111111111111111111111111111111111111";
             const NAME: &str = "asset.bin";
             const BYTES: &[u8] = b"cached embedding asset";
 
+            let sha = crate::embedded_asset_sha256(BYTES);
             let root = std::path::Path::new(MODEL);
-            assert!(extract(root, SHA, NAME, BYTES).is_some());
+            assert!(extract(root, &sha, NAME, BYTES).is_some());
             let lease = greppy_core::cache::acquire_model_lifecycle(
-                SHA,
+                &sha,
                 greppy_core::cache::LockMode::Shared,
                 false,
             )
             .expect("shared model lease")
             .expect("model lease available");
             let (tx, rx) = std::sync::mpsc::channel();
+            let waiter_sha = sha.clone();
             let waiter = std::thread::spawn(move || {
-                let result = extract(std::path::Path::new(MODEL), SHA, NAME, BYTES);
+                let result = extract(std::path::Path::new(MODEL), &waiter_sha, NAME, BYTES);
                 let _ = tx.send(result.clone());
                 result
             });
@@ -12032,12 +11515,31 @@ mod embeddinggemma_assets {
             assert!(waiter.join().expect("asset lookup thread").is_some());
             let _ = std::fs::remove_dir_all(greppy_core::cache::models_root().join(MODEL));
         }
+
+        #[test]
+        fn same_length_cached_asset_tampering_is_repaired() {
+            const MODEL: &str = "embeddinggemma-asset-tamper-test";
+            const NAME: &str = "asset.bin";
+            const BYTES: &[u8] = b"verified model bytes";
+
+            let sha = crate::embedded_asset_sha256(BYTES);
+            let root = std::path::Path::new(MODEL);
+            let path = extract(root, &sha, NAME, BYTES).expect("extract verified asset");
+            std::fs::remove_file(&path).expect("remove verified payload");
+            std::fs::write(&path, b"tampered model bytes").expect("write same-length tamper");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                u64::try_from(BYTES.len()).unwrap()
+            );
+
+            let repaired = extract(root, &sha, NAME, BYTES).expect("repair tampered asset");
+            assert_eq!(std::fs::read(repaired).unwrap(), BYTES);
+            let _ = std::fs::remove_dir_all(greppy_core::cache::models_root().join(MODEL));
+        }
     }
 }
 
 mod qwen35_assets {
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
     pub fn paths() -> Option<(String, String)> {
         const GGUF_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_GGUF_SHA");
         const TOK_SHA: &str = env!("GREPPY_EMBEDDED_QWEN35_TOK_SHA");
@@ -12056,99 +11558,7 @@ mod qwen35_assets {
         name: &str,
         bytes: &[u8],
     ) -> Option<String> {
-        let model = root.file_name()?.to_str()?.to_owned();
-        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
-        let dest = root.join(name);
-        let marker = root.join(format!("{name}.sha256"));
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
-            greppy_core::cache::touch_last_used_dir(&root);
-            return Some(dest.to_string_lossy().into_owned());
-        }
-
-        let _lease = greppy_core::cache::acquire_model_lifecycle(
-            expected_sha,
-            greppy_core::cache::LockMode::Exclusive,
-            false,
-        )
-        .ok()??;
-        let root = greppy_core::cache::ensure_model_entry(&model, expected_sha).ok()?;
-        let dest = root.join(name);
-        let marker = root.join(format!("{name}.sha256"));
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
-            greppy_core::cache::touch_last_used_dir(&root);
-            return Some(dest.to_string_lossy().into_owned());
-        }
-
-        let nonce = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = root.join(format!("{name}.tmp.{}.{}", std::process::id(), nonce));
-        let marker_tmp = root.join(format!(
-            "{name}.sha256.tmp.{}.{}",
-            std::process::id(),
-            nonce
-        ));
-        let written =
-            write_verified_cache_entry(&tmp, &dest, &marker_tmp, &marker, expected_sha, bytes);
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            let _ = std::fs::remove_file(&marker_tmp);
-        }
-
-        if cache_entry_is_valid(&dest, &marker, expected_sha, bytes.len()) {
-            greppy_core::cache::touch_last_used_dir(&root);
-            Some(dest.to_string_lossy().into_owned())
-        } else {
-            None
-        }
-    }
-
-    fn cache_entry_is_valid(
-        dest: &std::path::Path,
-        marker: &std::path::Path,
-        expected_sha: &str,
-        expected_len: usize,
-    ) -> bool {
-        let marker_ok = std::fs::read_to_string(marker)
-            .map(|s| s.trim() == expected_sha)
-            .unwrap_or(false);
-        if !marker_ok {
-            return false;
-        }
-        std::fs::metadata(dest)
-            .map(|m| m.len() == expected_len as u64)
-            .unwrap_or(false)
-    }
-
-    fn write_verified_cache_entry(
-        tmp: &std::path::Path,
-        dest: &std::path::Path,
-        marker_tmp: &std::path::Path,
-        marker: &std::path::Path,
-        expected_sha: &str,
-        bytes: &[u8],
-    ) -> std::io::Result<()> {
-        std::fs::write(tmp, bytes)?;
-        ensure_len(tmp, bytes.len())?;
-        let _ = std::fs::remove_file(marker);
-        let _ = std::fs::remove_file(dest);
-        std::fs::rename(tmp, dest)?;
-        ensure_len(dest, bytes.len())?;
-        std::fs::write(marker_tmp, expected_sha.as_bytes())?;
-        std::fs::rename(marker_tmp, marker)?;
-        Ok(())
-    }
-
-    fn ensure_len(path: &std::path::Path, expected_len: usize) -> std::io::Result<()> {
-        let len = std::fs::metadata(path)?.len();
-        if len == expected_len as u64 {
-            return Ok(());
-        }
-        Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "embedded Qwen3.5 cache entry {} has length {len}, expected {expected_len}",
-                path.display()
-            ),
-        ))
+        super::extract_embedded_asset(root, expected_sha, name, bytes)
     }
 
     #[cfg(test)]
@@ -12158,22 +11568,23 @@ mod qwen35_assets {
         #[test]
         fn cached_asset_resolves_while_model_has_shared_lease() {
             const MODEL: &str = "qwen35-asset-lock-test";
-            const SHA: &str = "2222222222222222222222222222222222222222222222222222222222222222";
             const NAME: &str = "asset.bin";
             const BYTES: &[u8] = b"cached qwen asset";
 
+            let sha = crate::embedded_asset_sha256(BYTES);
             let root = std::path::Path::new(MODEL);
-            assert!(extract(root, SHA, NAME, BYTES).is_some());
+            assert!(extract(root, &sha, NAME, BYTES).is_some());
             let lease = greppy_core::cache::acquire_model_lifecycle(
-                SHA,
+                &sha,
                 greppy_core::cache::LockMode::Shared,
                 false,
             )
             .expect("shared model lease")
             .expect("model lease available");
             let (tx, rx) = std::sync::mpsc::channel();
+            let waiter_sha = sha.clone();
             let waiter = std::thread::spawn(move || {
-                let result = extract(std::path::Path::new(MODEL), SHA, NAME, BYTES);
+                let result = extract(std::path::Path::new(MODEL), &waiter_sha, NAME, BYTES);
                 let _ = tx.send(result.clone());
                 result
             });
@@ -12255,69 +11666,23 @@ fn qwen_summary_model_key(cfg: &QwenSummaryConfig) -> String {
 }
 
 fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingModelConfig> {
-    let model_dir = cli_or_env(args.model_dir, ENV_EMBED_MODEL_DIR);
-    let gguf = cli_or_env(args.gguf, ENV_EMBED_GGUF);
-    let tokenizer = cli_or_env(args.tokenizer, ENV_EMBED_TOKENIZER);
-    let model_id = cli_or_env(args.model_id, ENV_EMBED_MODEL_ID)
-        .unwrap_or_else(|| DEFAULT_EMBEDDINGGEMMA_MODEL_ID.to_string());
-    let max_length = match args.max_length {
-        Some(v) => Some(v),
-        None => env_nonempty(ENV_EMBED_MAX_LENGTH)
-            .map(|s| {
-                s.parse::<usize>().map_err(|_| {
-                    Error::Invalid(format!("{ENV_EMBED_MAX_LENGTH} must be a positive integer"))
-                })
-            })
-            .transpose()?,
-    };
     let device = embedding_device_preference(args.device, args.no_gpu)?;
-
-    let source = match (model_dir, gguf, tokenizer) {
-        (Some(dir), None, None) => EmbeddingModelSource::SafetensorsDir(dir.into()),
-        (None, Some(gguf), Some(tokenizer)) => EmbeddingModelSource::Gguf {
+    let source = match embeddinggemma_assets::paths() {
+        Some((gguf, tokenizer)) => EmbeddingModelSource::Gguf {
             gguf: gguf.into(),
             tokenizer: tokenizer.into(),
         },
-        (Some(_), Some(_), _) | (Some(_), None, Some(_)) => {
-            return Err(Error::Invalid(
-                "configure either --embedding-model-dir or --embedding-gguf/--embedding-tokenizer, not both"
-                    .into(),
-            ));
-        }
-        (None, Some(_), None) => {
-            return Err(Error::Invalid(
-                "--embedding-gguf requires --embedding-tokenizer (or GREPPY_EMBEDDINGGEMMA_TOKENIZER)"
-                    .into(),
-            ));
-        }
-        (None, None, Some(_)) => {
-            return Err(Error::Invalid(
-                "--embedding-tokenizer requires --embedding-gguf (or GREPPY_EMBEDDINGGEMMA_GGUF)"
-                    .into(),
-            ));
-        }
-        (None, None, None) => {
-            // Owner hard rule: embeddings always work by default. With no
-            // explicit model, fall back to the EmbeddingGemma baked into the
-            // binary, exactly like the index path.
-            match embeddinggemma_assets::paths() {
-                Some((gguf, tokenizer)) => EmbeddingModelSource::Gguf {
-                    gguf: gguf.into(),
-                    tokenizer: tokenizer.into(),
-                },
-                None => {
-                    return Err(Error::Invalid(format!(
-                        "EmbeddingGemma model required: pass --embedding-model-dir, or --embedding-gguf with --embedding-tokenizer, or set {ENV_EMBED_MODEL_DIR}/{ENV_EMBED_GGUF}/{ENV_EMBED_TOKENIZER}"
-                    )));
-                }
-            }
+        None => {
+            return Err(Error::Config(
+                "embedded EmbeddingGemma assets are unavailable".into(),
+            ))
         }
     };
     let source_digest = embedding_source_content_digest(&source)?;
     Ok(EmbeddingModelConfig {
-        model_id: format!("{model_id}@sha256:{source_digest}"),
+        model_id: format!("{DEFAULT_EMBEDDINGGEMMA_MODEL_ID}@sha256:{source_digest}"),
         source,
-        max_length,
+        max_length: None,
         device,
     })
 }
@@ -12325,16 +11690,8 @@ fn embedding_config_required(args: EmbeddingCliArgs<'_>) -> Result<EmbeddingMode
 fn embedding_source_content_digest(source: &EmbeddingModelSource) -> Result<String> {
     use sha2::{Digest, Sha256};
 
-    let paths = match source {
-        EmbeddingModelSource::SafetensorsDir(dir) => vec![
-            dir.join("model.safetensors"),
-            dir.join("config.json"),
-            dir.join("tokenizer.json"),
-        ],
-        EmbeddingModelSource::Gguf { gguf, tokenizer } => {
-            vec![gguf.clone(), tokenizer.clone()]
-        }
-    };
+    let EmbeddingModelSource::Gguf { gguf, tokenizer } = source;
+    let paths = vec![gguf.clone(), tokenizer.clone()];
     let mut combined = Sha256::new();
     for path in paths {
         let digest = model_file_digest(&path)
@@ -12390,17 +11747,10 @@ fn load_embedding_model(
         max_length: cfg.max_length,
         tokenizer_cache_dir,
     };
-    let (inner, lease) = match &cfg.source {
-        EmbeddingModelSource::SafetensorsDir(_) => Err(greppy_embed_native::Error::InvalidGguf(
-            "native EmbeddingGemma supports GGUF + tokenizer.json only; configure --embedding-gguf with --embedding-tokenizer".into(),
-        )),
-        EmbeddingModelSource::Gguf { gguf, tokenizer } => {
-            let lease = acquire_cached_model_lease(gguf)?;
-            greppy_embed_native::EmbeddingGemma::load_gguf(gguf, tokenizer, options)
-                .map(|model| (model, lease))
-        }
-    }
-    .map_err(|e| Error::Store(format!("load EmbeddingGemma model {}: {e}", cfg.model_id)))?;
+    let EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source;
+    let lease = acquire_cached_model_lease(gguf)?;
+    let inner = greppy_embed_native::EmbeddingGemma::load_gguf(gguf, tokenizer, options)
+        .map_err(|e| Error::Store(format!("load EmbeddingGemma model {}: {e}", cfg.model_id)))?;
     Ok(LoadedEmbeddingModel {
         inner,
         _model_lease: lease,
@@ -12414,14 +11764,8 @@ fn embedding_query_cache_key(cfg: &EmbeddingModelConfig) -> String {
     fn file_fp(path: &std::path::Path) -> String {
         model_file_digest(path).unwrap_or_else(|_| format!("{}:unknown", path.display()))
     }
-    let source_fp = match &cfg.source {
-        EmbeddingModelSource::SafetensorsDir(dir) => {
-            format!("st;{}", file_fp(&dir.join("model.safetensors")))
-        }
-        EmbeddingModelSource::Gguf { gguf, tokenizer } => {
-            format!("gguf;{};{}", file_fp(gguf), file_fp(tokenizer))
-        }
-    };
+    let EmbeddingModelSource::Gguf { gguf, tokenizer } = &cfg.source;
+    let source_fp = format!("gguf;{};{}", file_fp(gguf), file_fp(tokenizer));
     format!(
         "{}|{}|{}|{}",
         cfg.model_id,
@@ -12522,13 +11866,6 @@ fn log_embedding_skip_once(command: &str, err: &Error) {
     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
         eprintln!("{command}: embedding unavailable; skipping vector search: {err}");
     }
-}
-
-fn cli_or_env(cli: Option<&str>, env: &str) -> Option<String> {
-    cli.map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| env_nonempty(env))
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
@@ -12680,29 +12017,29 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     if !path.exists() {
         let shown_root = root.unwrap_or(".");
         if auto_reindex_enabled() {
-            eprintln!("grep: indexing {} (first use)…", effective_root.display());
+            eprintln!("greppy: indexing {} (first use)…", effective_root.display());
             if try_auto_index_inline(root) && path.exists() {
                 // Index built: fall through to the normal read-only open.
             } else {
                 eprintln!(
-                    "grep: no index for {} — run `grep index {}` first",
+                    "greppy: no index for {} — run `greppy index {}` first",
                     effective_root.display(),
                     shown_root
                 );
                 return Err(Error::Invalid(format!(
-                    "no index for {}; run `grep index {}` first",
+                    "no index for {}; run `greppy index {}` first",
                     effective_root.display(),
                     shown_root
                 )));
             }
         } else {
             eprintln!(
-                "grep: no index for {} — run `grep index {}` first",
+                "greppy: no index for {} — run `greppy index {}` first",
                 effective_root.display(),
                 shown_root
             );
             return Err(Error::Invalid(format!(
-                "no index for {}; run `grep index {}` first",
+                "no index for {}; run `greppy index {}` first",
                 effective_root.display(),
                 shown_root
             )));
@@ -12733,11 +12070,6 @@ fn open_default_store(root: Option<&str>) -> Result<greppy_store::Store> {
     #[cfg(any(unix, windows))]
     {
         let no_args = EmbeddingCliArgs {
-            model_dir: None,
-            gguf: None,
-            tokenizer: None,
-            model_id: None,
-            max_length: None,
             device: None,
             no_gpu: false,
         };
@@ -12813,11 +12145,6 @@ fn try_auto_index_inline(root: Option<&str>) -> bool {
         None
     } else {
         let args = EmbeddingCliArgs {
-            model_dir: None,
-            gguf: None,
-            tokenizer: None,
-            model_id: None,
-            max_length: None,
             device: None,
             no_gpu: false,
         };
@@ -12846,9 +12173,9 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
     //
     // After stripping, argv contains only real grep arguments. We
     // build a synthetic argv where argv[0] is a binary-name placeholder
-    // and argv[1..] is the user's args, then call
-    // `greppy_grep::run::run_with_optional_augment` which both runs
-    // real grep and applies the heuristic + freshness augmentation.
+    // and argv[1..] is the user's args, then forward it byte-exactly to
+    // real grep. Semantic behavior is available only through explicit greppy
+    // subcommands and never changes ordinary grep output.
     let stripped: &[String] = match argv.first().map(|s| s.as_str()) {
         Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => &argv[1..],
         _ => argv,
@@ -12858,16 +12185,14 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
     full.push("greppy-grep".to_string());
     full.extend_from_slice(stripped);
 
-    let parsed = greppy_grep::heuristic::GrepArgs::parse(&full[1..]);
     let real = greppy_grep::discover_grep()?;
-    greppy_grep::run::run_with_optional_augment(&real, &full, &parsed)
+    greppy_grep::run_grep(&real, &full)
 }
 
 /// `OsString` argv variant of [`dispatch_grep`].
 ///
 /// forwards the original (possibly non-UTF-8) argv to
-/// real grep byte-for-byte via the shared
-/// [`greppy_grep::run::run_with_optional_augment_os`] path. `full`
+/// real grep byte-for-byte via [`greppy_grep::run_grep_os`]. `full`
 /// includes a synthetic argv[0] placeholder; `full[1..]` are the user's
 /// grep arguments. A leading grep-family placeholder (when the user
 /// wrote `greppy grep …`) is handled by the pre-clap router, which
@@ -12888,9 +12213,8 @@ fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     rebuilt.push(std::ffi::OsString::from("greppy-grep"));
     rebuilt.extend_from_slice(stripped);
 
-    let parsed = greppy_grep::heuristic::GrepArgs::parse_os(&rebuilt[1..]);
     let real = greppy_grep::discover_grep()?;
-    greppy_grep::run::run_with_optional_augment_os(&real, &rebuilt, &parsed)
+    greppy_grep::run_grep_os(&real, &rebuilt)
 }
 
 /// Run the indexer against `path` (default: current directory).
@@ -13337,7 +12661,7 @@ fn index_atomic_snapshot(
             return Ok(report);
         }
         if attempt == 0 {
-            eprintln!("grep: workspace changed during indexing; rebuilding snapshot once");
+            eprintln!("greppy: workspace changed during indexing; rebuilding snapshot once");
         }
     }
     Err(Error::Store(
@@ -14089,7 +13413,7 @@ pub fn dispatch_to_code(cli: Cli) -> u8 {
     match dispatch(cli) {
         Ok(code) => code.clamp(0, 255) as u8,
         Err(e) => {
-            eprintln!("grep: {e}");
+            eprintln!("greppy: {e}");
             let mut source = std::error::Error::source(&e);
             while let Some(cause) = source {
                 eprintln!("  caused by: {cause}");
@@ -14528,133 +13852,38 @@ mod tests {
     }
 
     #[test]
-    fn parse_update_and_upgrade_alias() {
-        let cli = Cli::try_parse_from(["greppy", "update", "--check"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Update {
-                check: true,
-                dry_run: false,
-                yes: false,
-                tag: None,
-                repo: None,
-            })
-        ));
+    fn parse_update_is_a_non_executing_policy_command() {
+        let cli = Cli::try_parse_from(["greppy", "update"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Update)));
+        assert!(Cli::try_parse_from(["greppy", "update", "--check"]).is_err());
 
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "upgrade",
-            "--dry-run",
-            "-y",
-            "--tag",
-            "v0.2.0",
-            "--repo",
-            "metric-space-ai/greppy",
-        ])
-        .unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Update {
-                check: false,
-                dry_run: true,
-                yes: true,
-                tag: Some(ref tag),
-                repo: Some(ref repo),
-            }) if tag == "v0.2.0" && repo == "metric-space-ai/greppy"
-        ));
+        let cli = Cli::try_parse_from(["greppy", "upgrade"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::Update)));
     }
 
     #[test]
-    fn release_version_comparison_handles_v_prefix_and_width() {
-        assert!(release_is_newer("v0.10.0", "0.9.9"));
-        assert!(release_is_newer("0.1.3", "0.1.2"));
-        assert!(!release_is_newer("v0.1.2", "0.1.2"));
-        assert!(!release_is_newer("v0.1.1", "0.1.2"));
-    }
-
-    #[test]
-    fn update_asset_selection_matches_platform_and_skips_checksums() {
-        let assets = vec![
-            ReleaseAsset {
-                name: "greppy-x86_64-apple-darwin.tar.gz".into(),
-                download_url: "https://example.invalid/darwin".into(),
-                size: 1,
-            },
-            ReleaseAsset {
-                name: "greppy-aarch64-apple-darwin.tar.gz.sha256".into(),
-                download_url: "https://example.invalid/checksum".into(),
-                size: 1,
-            },
-            ReleaseAsset {
-                name: "greppy-aarch64-apple-darwin.tar.gz".into(),
-                download_url: "https://example.invalid/arm64".into(),
-                size: 1,
-            },
-        ];
-        let selected = select_release_asset(&assets, "macos", "aarch64").unwrap();
-        assert_eq!(selected.name, "greppy-aarch64-apple-darwin.tar.gz");
-    }
-
-    #[test]
-    fn parse_index_embedding_configuration() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "index",
-            "--embedding-gguf",
-            "model.gguf",
-            "--embedding-tokenizer",
-            "tokenizer.json",
-            "--embedding-model-id",
-            "google/embeddinggemma-300m-q4",
-            ".",
-        ])
-        .unwrap();
+    fn index_always_uses_the_embedded_model() {
+        let cli = Cli::try_parse_from(["greppy", "index", "."]).unwrap();
         match cli.command {
-            Some(Command::Index {
-                path,
-                embedding_gguf,
-                embedding_tokenizer,
-                embedding_model_id,
-                ..
-            }) => {
-                assert_eq!(path.as_deref(), Some("."));
-                assert_eq!(embedding_gguf.as_deref(), Some("model.gguf"));
-                assert_eq!(embedding_tokenizer.as_deref(), Some("tokenizer.json"));
-                assert_eq!(
-                    embedding_model_id.as_deref(),
-                    Some("google/embeddinggemma-300m-q4")
-                );
-            }
+            Some(Command::Index { path, .. }) => assert_eq!(path.as_deref(), Some(".")),
             other => panic!("unexpected command: {other:?}"),
         }
 
+        assert!(
+            Cli::try_parse_from(["greppy", "index", "--embedding-gguf", "model.gguf", "."])
+                .is_err()
+        );
         assert!(Cli::try_parse_from(["greppy", "index", "--embeddings", "."]).is_err());
     }
 
     #[test]
     fn parse_semantic_search_flags() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "semantic-search",
-            "--json",
-            "--embedding-model-dir",
-            "/models/embeddinggemma",
-            "retry handler",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["greppy", "semantic-search", "--json", "retry handler"]).unwrap();
         match cli.command {
-            Some(Command::Semantic {
-                query,
-                json,
-                embedding_model_dir,
-                ..
-            }) => {
+            Some(Command::Semantic { query, json }) => {
                 assert_eq!(query.as_deref(), Some("retry handler"));
                 assert!(json);
-                assert_eq!(
-                    embedding_model_dir.as_deref(),
-                    Some("/models/embeddinggemma")
-                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
@@ -14663,6 +13892,14 @@ mod tests {
             Cli::try_parse_from(["greppy", "semantic-search", "--vectors", "retry handler"])
                 .is_err()
         );
+        assert!(Cli::try_parse_from([
+            "greppy",
+            "semantic-search",
+            "--embedding-model-dir",
+            "/models/embeddinggemma",
+            "retry handler"
+        ])
+        .is_err());
 
         let cli = Cli::try_parse_from(["greppy", "semantic", "retry handler"]).unwrap();
         match cli.command {
@@ -14674,64 +13911,27 @@ mod tests {
     }
 
     #[test]
-    fn parse_plus_vector_flags() {
-        let cli = Cli::try_parse_from([
-            "greppy",
-            "plus",
-            "--json",
-            "--vectors",
-            "--embedding-gguf",
-            "model.gguf",
-            "--embedding-tokenizer",
-            "tokenizer.json",
-            "--embedding-model-id",
-            "google/embeddinggemma-300m-q4",
-            "--k",
-            "5",
-            "refund workflow",
-        ])
-        .unwrap();
+    fn parse_plus_uses_vectors_without_a_public_flag() {
+        let cli = Cli::try_parse_from(["greppy", "plus", "--json", "--k", "5", "refund workflow"])
+            .unwrap();
         match cli.command {
-            Some(Command::Plus {
-                query,
-                k,
-                json,
-                vectors,
-                embedding_gguf,
-                embedding_tokenizer,
-                embedding_model_id,
-                ..
-            }) => {
+            Some(Command::Plus { query, k, json, .. }) => {
                 assert_eq!(query.as_deref(), Some("refund workflow"));
                 assert_eq!(k, 5);
                 assert!(json);
-                assert!(vectors);
-                assert_eq!(embedding_gguf.as_deref(), Some("model.gguf"));
-                assert_eq!(embedding_tokenizer.as_deref(), Some("tokenizer.json"));
-                assert_eq!(
-                    embedding_model_id.as_deref(),
-                    Some("google/embeddinggemma-300m-q4")
-                );
             }
             other => panic!("unexpected command: {other:?}"),
         }
-    }
 
-    #[test]
-    fn embedding_config_rejects_conflicting_model_sources() {
-        let err = embedding_config_required(EmbeddingCliArgs {
-            model_dir: Some("/models/safetensors"),
-            gguf: Some("/models/model.gguf"),
-            tokenizer: Some("/models/tokenizer.json"),
-            model_id: None,
-            max_length: None,
-            device: None,
-            no_gpu: false,
-        })
-        .unwrap_err();
-        assert!(
-            matches!(err, Error::Invalid(msg) if msg.contains("either --embedding-model-dir or --embedding-gguf"))
-        );
+        assert!(Cli::try_parse_from(["greppy", "plus", "--vectors", "refund workflow"]).is_err());
+        assert!(Cli::try_parse_from([
+            "greppy",
+            "plus",
+            "--embedding-gguf",
+            "model.gguf",
+            "refund workflow"
+        ])
+        .is_err());
     }
 
     #[test]
@@ -14742,11 +13942,6 @@ mod tests {
         // This locks the fix for the regression where semantic-search silently
         // ran on the lexical/algorithmic path with no vectors at all.
         let cfg = embedding_config_required(EmbeddingCliArgs {
-            model_dir: None,
-            gguf: None,
-            tokenizer: None,
-            model_id: None,
-            max_length: None,
             device: None,
             no_gpu: true,
         })
