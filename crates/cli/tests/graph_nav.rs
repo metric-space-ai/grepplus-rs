@@ -475,11 +475,10 @@ fn direct_navigation_json_reports_exact_counts() {
     }
 }
 
-/// D2 fail-open, small drift: a single edited file is auto-reindexed
-/// inline and the query answers FRESH from the healed graph (the old
-/// contract failed closed with `skipped_stale_index` here).
+/// A refresh may start for small drift, but the triggering request must not
+/// observe the old graph generation.
 #[test]
-fn direct_navigation_json_auto_reindexes_small_stale_drift() {
+fn direct_navigation_json_refuses_while_small_stale_drift_refreshes() {
     let (repo, store) = index_fixture("nav-json-stale");
     std::fs::write(
         repo.join("src/lib.rs"),
@@ -498,50 +497,38 @@ fn render(w: types::Widget) -> u32 { w.w + 1 }
 
     let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
     assert_eq!(
-        code, 0,
-        "small stale drift must be auto-healed, not refused; stderr={err}\nstdout={out}"
+        code, 75,
+        "refreshing navigation must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     assert!(
         err.is_empty(),
-        "auto-healed query must not warn about staleness; stderr={err:?}"
+        "JSON freshness refusal must stay on stdout; stderr={err:?}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid nav json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "who-calls");
     assert_eq!(
-        v["status"],
-        serde_json::Value::Null,
-        "healed query must not be skipped: {v:?}"
+        v["status"], "skipped_stale_index",
+        "stale navigation must be skipped: {v:?}"
     );
     assert_eq!(
-        v["fresh"], true,
-        "auto-reindex must yield a fresh answer: {v:?}"
+        v["fresh"], false,
+        "the triggering request must not claim freshness: {v:?}"
     );
-    assert_eq!(v["freshness"]["state"], "fresh");
+    assert_eq!(v["freshness"]["state"], "refreshing");
     let hits = v["hits"].as_array().expect("hits array");
-    assert!(
-        hits.iter().any(|h| h["qualified_name"]
-            .as_str()
-            .unwrap_or("")
-            .contains("caller")),
-        "healed graph must resolve the CURRENT caller of do_it: {v:?}"
-    );
+    assert!(hits.is_empty(), "stale graph rows must not escape: {v:?}");
 }
 
-/// D2 fail-open, large drift: with more files changed than the inline
-/// auto-reindex cap (10), the commands serve rows FROM THE EXISTING
-/// INDEX, honestly labeled (`fresh: false` + stderr warning), instead
-/// of refusing with exit 1 as the old fail-closed contract did.
-#[test]
-fn graph_commands_serve_labeled_rows_on_large_stale_drift() {
-    let (repo, store) = index_fixture("graph-stale-gate");
+/// Large drift starts a background refresh and fails closed. No command may
+/// expose rows from the old generation while that refresh is in flight.
+fn large_stale_graph_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let (repo, store) = index_fixture(tag);
     std::fs::write(
         repo.join("src/helper.rs"),
         "pub fn do_it_renamed() -> u32 { 42 }\n",
     )
     .unwrap();
-    // Push the drift past AUTO_REINDEX_MAX_FILES (10) so the inline
-    // heal is skipped and the labeled-stale path is exercised.
     for i in 0..11 {
         std::fs::write(
             repo.join(format!("src/extra_{i}.rs")),
@@ -549,6 +536,28 @@ fn graph_commands_serve_labeled_rows_on_large_stale_drift() {
         )
         .unwrap();
     }
+    (repo, store)
+}
+
+#[test]
+fn graph_commands_refuse_rows_on_large_stale_drift() {
+    let (repo, store) = large_stale_graph_fixture("graph-stale-gate-brief");
+
+    let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
+    assert_eq!(
+        code, 75,
+        "refreshing brief must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        err.is_empty(),
+        "brief freshness refusal must stay on stdout; stderr={err:?}"
+    );
+    assert!(
+        out.contains("graph freshness is refreshing")
+            && out.contains("no stale indexed hits emitted")
+            && !out.contains("== do_it"),
+        "refreshing brief must explain the refusal without old evidence; got: {out:?}"
+    );
 
     let json_cases: Vec<(Vec<&str>, &str, &str)> = vec![
         (
@@ -569,57 +578,38 @@ fn graph_commands_serve_labeled_rows_on_large_stale_drift() {
         (vec!["impact", "do_it", "--json"], "impact", "hits"),
         (vec!["fan-in", "--json"], "fan-in", "hits"),
     ];
-    for (args, command, collection_field) in json_cases {
+    for (case, (args, command, collection_field)) in json_cases.into_iter().enumerate() {
+        let (repo, store) = large_stale_graph_fixture(&format!("graph-stale-gate-{case}"));
         let (code, out, err) = run(&args, &repo, &store);
         assert_eq!(
-            code, 0,
-            "labeled-stale {command} must serve results, not refuse; stderr={err}\nstdout={out}"
+            code, 75,
+            "refreshing {command} must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
         );
         assert!(
-            err.contains("index may be stale"),
-            "labeled-stale {command} must warn on stderr; stderr={err:?}"
+            err.is_empty(),
+            "JSON freshness refusal must stay on stdout; stderr={err:?}"
         );
-        assert!(
-            err.contains("run 'grep index'"),
-            "stale warning must tell the agent the fix; stderr={err:?}"
-        );
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_else(|e| {
-            panic!("invalid labeled-stale {command} json: {e}; stdout={out:?}")
-        });
+        let v: serde_json::Value = serde_json::from_str(&out)
+            .unwrap_or_else(|e| panic!("invalid refreshing {command} json: {e}; stdout={out:?}"));
         assert_eq!(v["command"], command);
         assert_eq!(
-            v["status"],
-            serde_json::Value::Null,
-            "labeled-stale {command} must not be skipped: {v:?}"
+            v["status"], "skipped_stale_index",
+            "refreshing {command} must be skipped: {v:?}"
         );
         assert_eq!(
             v["fresh"], false,
             "{command} must label the result stale: {v:?}"
         );
-        assert_eq!(v["freshness"]["state"], "stale");
+        assert_eq!(v["freshness"]["state"], "refreshing");
         assert_eq!(
             v["freshness"]["stale_file_count"], 12,
             "{command} must report the drift extent: {v:?}"
         );
         assert!(
-            !v[collection_field].as_array().unwrap().is_empty(),
-            "labeled-stale {command} must serve rows from the existing index: {v:?}"
+            v[collection_field].as_array().unwrap().is_empty(),
+            "refreshing {command} must not serve rows from the old index: {v:?}"
         );
     }
-
-    let (code, out, err) = run(&["brief", "do_it"], &repo, &store);
-    assert_eq!(
-        code, 0,
-        "labeled-stale brief must serve the indexed brief; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.contains("index may be stale"),
-        "labeled-stale brief must warn on stderr; stderr={err:?}"
-    );
-    assert!(
-        out.contains("do_it"),
-        "labeled-stale brief must serve rows from the existing index; got: {out:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -817,12 +807,10 @@ fn search_symbols_json_reports_exact_counts_and_metadata() {
     );
 }
 
-/// D2 fail-open, small drift: renaming one symbol's file is healed by
-/// the inline auto-reindex, so the query reflects the CURRENT tree —
-/// the renamed-away symbol is gone, the new one is findable — instead
-/// of the old fail-closed `skipped_stale_index` refusal.
+/// Renaming a symbol starts refresh, but the triggering search must not mix
+/// current names with the old graph generation.
 #[test]
-fn search_symbols_json_auto_reindexes_and_reports_current_state() {
+fn search_symbols_json_refuses_while_small_stale_drift_refreshes() {
     let (repo, store) = index_fixture("symbols-json-stale");
     std::fs::write(
         repo.join("src/types.rs"),
@@ -836,27 +824,21 @@ fn search_symbols_json_auto_reindexes_and_reports_current_state() {
         &store,
     );
     assert_eq!(
-        code, 0,
-        "healed search-symbols must find the CURRENT symbol; stderr={err}\nstdout={out}"
+        code, 75,
+        "refreshing search-symbols must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-symbols");
-    assert_eq!(v["status"], "ok");
+    assert_eq!(v["status"], "skipped_stale_index");
     assert_eq!(
-        v["fresh"], true,
-        "auto-reindex must yield a fresh answer: {v:?}"
+        v["fresh"], false,
+        "the triggering search must not claim freshness: {v:?}"
     );
+    assert_eq!(v["freshness"]["state"], "refreshing");
     assert!(
-        v["hits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|h| h["qualified_name"]
-                .as_str()
-                .unwrap_or("")
-                .contains("WidgetRenamed")),
-        "healed index must expose the renamed symbol: {v:?}"
+        v["hits"].as_array().is_some_and(Vec::is_empty),
+        "stale symbol rows must not escape: {v:?}"
     );
 }
 
@@ -978,8 +960,8 @@ fn graph_locate_maps_grep_line_to_enclosing_symbol() {
         "graph-locate src/lib.rs:6 must locate the enclosing caller function; got: {out:?}"
     );
     assert!(
-        out.contains("match=nearest_preceding"),
-        "body-line fallback must be explicit in text output; got: {out:?}"
+        out.contains("match=enclosing"),
+        "enclosing-body match must be explicit in text output; got: {out:?}"
     );
     assert!(
         out.contains("Function"),
