@@ -54,6 +54,12 @@ jq -e '
 ' "$WORK/semantic.json" >/dev/null
 semantic_expand="$(jq -r '.expand_id' "$WORK/semantic.json")"
 "$BIN" --root "$WORK/repo" expand "$semantic_expand" --json >"$WORK/semantic-expand.json"
-jq -e --arg id "$semantic_expand" '.id == $id and (.payload_text | length > 0)' "$WORK/semantic-expand.json" >/dev/null
+semantic_omitted="$(jq -r '.omitted' "$WORK/semantic.json")"
+jq -e --arg id "$semantic_expand" --argjson omitted "$semantic_omitted" '
+  .id == $id and
+  (.payload_text | length > 0) and
+  .payload_json.further_hits == $omitted and
+  (.payload_json.hits | length) == $omitted
+' "$WORK/semantic-expand.json" >/dev/null
 
 printf 'release package inference smoke passed: %s\n' "$BIN"

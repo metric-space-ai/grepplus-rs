@@ -62,7 +62,9 @@ if ($summaries.Count -lt 1 -or $invalidSpans.Count -gt 0) {
 }
 $semanticExpanded = (& $Binary --root "$Work/repo" expand $semantic.expand_id --json) | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0 -or $semanticExpanded.id -ne $semantic.expand_id -or
-    [string]::IsNullOrWhiteSpace($semanticExpanded.payload_text)) {
+    [string]::IsNullOrWhiteSpace($semanticExpanded.payload_text) -or
+    $semanticExpanded.payload_json.further_hits -ne $semantic.omitted -or
+    $semanticExpanded.payload_json.hits.Count -ne $semantic.omitted) {
     throw 'semantic expand contract failed'
 }
 

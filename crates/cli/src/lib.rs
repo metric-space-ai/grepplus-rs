@@ -2292,10 +2292,10 @@ impl ExpandHandle {
         })
     }
 
-    fn semantic_text_line(&self, further_hits: usize) -> String {
+    fn semantic_text_line(&self) -> String {
         format!(
-            "greppy expand {}  → source evidence for {further_hits} further hits",
-            self.id
+            "greppy expand {}  → source evidence for {}",
+            self.id, self.summary
         )
     }
 }
@@ -9750,6 +9750,7 @@ fn dispatch_semantic(
                         &cfg,
                         generation,
                         total,
+                        hits.len(),
                         candidate_limit,
                         Some(&freshness),
                         "ok",
@@ -9765,7 +9766,7 @@ fn dispatch_semantic(
                         print_semantic_vector_hit(h, purposes.as_deref());
                     }
                     if let Some(expand) = &expand {
-                        println!("{}", expand.semantic_text_line(further_hits.len()));
+                        println!("{}", expand.semantic_text_line());
                     }
                 }
                 Ok(if hits.is_empty() { 1 } else { 0 })
@@ -10151,12 +10152,14 @@ fn semantic_vector_json(
     status: &str,
     hits: &[greppy_store::VectorSearchHit],
 ) -> Result<()> {
+    let retrieved = hits.len();
     semantic_vector_json_with_expand(
         store,
         project,
         cfg,
         graph_generation,
         total,
+        retrieved,
         candidate_limit,
         freshness,
         status,
@@ -10173,6 +10176,7 @@ fn semantic_vector_json_with_expand(
     cfg: &EmbeddingModelConfig,
     graph_generation: u64,
     total: i64,
+    retrieved: usize,
     candidate_limit: Option<i64>,
     freshness: Option<&serde_json::Value>,
     status: &str,
@@ -10186,6 +10190,8 @@ fn semantic_vector_json_with_expand(
         .map(|hit| semantic_vector_json_row(hit, vector_purpose_for_hit(purposes, hit), expand))
         .collect::<Vec<_>>();
     let shown = rows.len() as i64;
+    let (retrieved, omitted, unranked_candidates, truncated) =
+        semantic_vector_count_values(total, retrieved, rows.len());
     let mut v = serde_json::json!({
         "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
         "command": "semantic-search",
@@ -10208,10 +10214,13 @@ fn semantic_vector_json_with_expand(
         "incomplete_providers": incomplete_providers,
         "candidate_limit": candidate_limit,
         "candidate_limit_env": ENV_VECTOR_EXACT_CANDIDATE_LIMIT,
+        "candidate_total": total,
         "total_exact": total,
+        "retrieved": retrieved,
         "shown": shown,
-        "omitted": total.saturating_sub(shown),
-        "truncated": shown < total,
+        "omitted": omitted,
+        "unranked_candidates": unranked_candidates,
+        "truncated": truncated,
         "hits": rows,
     });
     if let Some(expand) = expand {
@@ -10224,6 +10233,23 @@ fn semantic_vector_json_with_expand(
             .map_err(|e| Error::Invalid(format!("serialize vector semantic JSON: {e}")))?
     );
     Ok(())
+}
+
+fn semantic_vector_count_values(
+    candidate_total: i64,
+    retrieved: usize,
+    shown: usize,
+) -> (i64, i64, i64, bool) {
+    let retrieved = i64::try_from(retrieved).unwrap_or(i64::MAX);
+    let shown = i64::try_from(shown).unwrap_or(i64::MAX);
+    let omitted = retrieved.saturating_sub(shown);
+    let unranked_candidates = candidate_total.saturating_sub(retrieved);
+    (
+        retrieved,
+        omitted,
+        unranked_candidates,
+        omitted > 0 || unranked_candidates > 0,
+    )
 }
 
 fn semantic_provider_incomplete_json(
@@ -14295,6 +14321,16 @@ mod tests {
             serde_json::json!(["Applies the configured rename/case rule to a struct field name."])
         );
         assert_eq!(row["expand_id"], "semantic-valid-id");
+    }
+
+    #[test]
+    fn semantic_vector_counts_distinguish_ranked_hits_from_candidates() {
+        let (retrieved, omitted, unranked_candidates, truncated) =
+            semantic_vector_count_values(7, 6, 3);
+        assert_eq!(retrieved, 6);
+        assert_eq!(omitted, 3);
+        assert_eq!(unranked_candidates, 1);
+        assert!(truncated);
     }
 
     #[test]
