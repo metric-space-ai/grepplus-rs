@@ -1666,6 +1666,7 @@ fn matmul_x8_batched_avxvnni_prepared<T: Sync>(
     matrix_rows: usize,
     kernel_x4: unsafe fn(&[T], &[BlockQ8Kx4]) -> [[f32; 8]; 4],
     kernel_x8: unsafe fn(&[T], [&[BlockQ8Kx4]; 2]) -> [[[f32; 8]; 4]; 2],
+    kernel_x16: unsafe fn(&[T], [&[BlockQ8Kx4]; 4]) -> [[[f32; 8]; 4]; 4],
 ) -> Vec<f32> {
     let lhs_rows = input.rows;
     let row_blocks = input.cols / QK_K;
@@ -1680,8 +1681,31 @@ fn matmul_x8_batched_avxvnni_prepared<T: Sync>(
             for (local_group, group_dst) in chunk.chunks_exact_mut(8 * lhs_rows).enumerate() {
                 let group = first_group + local_group;
                 let weights = &rhs[group * row_blocks..(group + 1) * row_blocks];
-                let tiled_groups = input.tiles_x4.len() & !1;
-                for input_tile in (0..tiled_groups).step_by(2) {
+                let tiled_x16 = input.tiles_x4.len() & !3;
+                for input_tile in (0..tiled_x16).step_by(4) {
+                    let values = unsafe {
+                        kernel_x16(
+                            weights,
+                            [
+                                &input.tiles_x4[input_tile],
+                                &input.tiles_x4[input_tile + 1],
+                                &input.tiles_x4[input_tile + 2],
+                                &input.tiles_x4[input_tile + 3],
+                            ],
+                        )
+                    };
+                    for tile in 0..4 {
+                        for input_lane in 0..4 {
+                            let input_row = (input_tile + tile) * 4 + input_lane;
+                            for output_lane in 0..8 {
+                                group_dst[output_lane * lhs_rows + input_row] =
+                                    values[tile][input_lane][output_lane];
+                            }
+                        }
+                    }
+                }
+                let tiled_x8 = tiled_x16 + ((input.tiles_x4.len() - tiled_x16) & !1);
+                for input_tile in (tiled_x16..tiled_x8).step_by(2) {
                     let values = unsafe {
                         kernel_x8(
                             weights,
@@ -1698,10 +1722,10 @@ fn matmul_x8_batched_avxvnni_prepared<T: Sync>(
                         }
                     }
                 }
-                for (tail_tile, xq) in input.tiles_x4[tiled_groups..].iter().enumerate() {
+                for (tail_tile, xq) in input.tiles_x4[tiled_x8..].iter().enumerate() {
                     let values = unsafe { kernel_x4(weights, xq) };
                     for input_lane in 0..4 {
-                        let input_row = (tiled_groups + tail_tile) * 4 + input_lane;
+                        let input_row = (tiled_x8 + tail_tile) * 4 + input_lane;
                         for output_lane in 0..8 {
                             group_dst[output_lane * lhs_rows + input_row] =
                                 values[input_lane][output_lane];
@@ -1735,6 +1759,7 @@ fn matmul_q4kx8_batched_avxvnni_prepared(
         matrix_rows,
         dot8x4_q4k_q8k_avxvnni,
         dot8x8_q4k_q8k_avxvnni,
+        dot8x16_q4k_q8k_avxvnni,
     )
 }
 
@@ -2032,6 +2057,7 @@ fn matmul_q5kx8_batched_avxvnni_prepared(
         matrix_rows,
         dot8x4_q5k_q8k_avxvnni,
         dot8x8_q5k_q8k_avxvnni,
+        dot8x16_q5k_q8k_avxvnni,
     )
 }
 
@@ -2302,6 +2328,7 @@ fn matmul_q6kx8_batched_avxvnni_prepared(
         matrix_rows,
         dot8x4_q6k_q8k_avxvnni,
         dot8x8_q6k_q8k_avxvnni,
+        dot8x16_q6k_q8k_avxvnni,
     )
 }
 

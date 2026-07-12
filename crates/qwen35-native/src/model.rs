@@ -613,7 +613,7 @@ mod cpu_perf_tests {
             "blk.0.ffn_down.weight",
         ] {
             let matrix = QuantMatrix::from_model_q4_x8(&model, name).expect("load quant matrix");
-            let rows = 5;
+            let rows = 17;
             let input = (0..rows * matrix.cols())
                 .map(|idx| ((idx * 37 % 257) as f32 - 128.0) / 97.0)
                 .collect::<Vec<_>>();
