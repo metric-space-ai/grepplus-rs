@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - name: Checkout exact candidate commit
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5a
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           lfs: true
 
