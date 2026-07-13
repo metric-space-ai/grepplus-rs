@@ -459,6 +459,7 @@ jobs:
           mkdir -p "$clean/bin" "$clean/store" "$clean/repo"
           tar -C "$clean/bin" -xzf "${{ matrix.asset }}"
           test ! -e "$clean/bin/grep"
+          test -s "$clean/bin/licenses/EMBEDDED-MODEL-TERMS.md"
           test -s "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt"
           test -s "$clean/bin/licenses/GEMMA-TERMS.html"
           test -s "$clean/bin/licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt"
@@ -477,6 +478,7 @@ jobs:
           $clean = Join-Path $env:RUNNER_TEMP 'greppy-package-smoke'
           New-Item -ItemType Directory -Force "$clean/bin","$clean/store","$clean/repo" | Out-Null
           Expand-Archive -Path "${{ matrix.asset }}" -DestinationPath "$clean/bin" -Force
+          if (-not (Test-Path "$clean/bin/licenses/EMBEDDED-MODEL-TERMS.md")) { throw 'missing embedded model terms' }
           if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-NOTICE.txt")) { throw 'missing EmbeddingGemma notice' }
           if (-not (Test-Path "$clean/bin/licenses/GEMMA-TERMS.html")) { throw 'missing Gemma terms' }
           if (-not (Test-Path "$clean/bin/licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt")) { throw 'missing EmbeddingGemma modification notice' }

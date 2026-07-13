@@ -1,10 +1,18 @@
 {
   "schema_version": "greppy.model-provenance.v1",
   "model_id": "embeddinggemma-300m-q4k-current",
-  "release_ready": false,
-  "release_blockers": [
-    "redistribution review has not been signed off"
-  ],
+  "release_ready": true,
+  "release_blockers": [],
+  "redistribution_review": {
+    "reviewed_at": "2026-07-13",
+    "approved_by": "greppy owner (metric-space-ai)",
+    "approved_at": "2026-07-13",
+    "terms_verified_current_at": "2026-07-13",
+    "gemma_terms_last_modified": "2026-04-01",
+    "prohibited_use_policy_last_modified": "2024-02-21",
+    "use_restriction_provision": "licenses/EMBEDDED-MODEL-TERMS.md",
+    "notes": "Gemma §3.1 conditions 2–4 satisfied by shipped GEMMA-TERMS.html, EMBEDDINGGEMMA-MODIFICATIONS.txt, EMBEDDINGGEMMA-NOTICE.txt; condition 1 satisfied by EMBEDDED-MODEL-TERMS.md (DECISION-1)."
+  },
   "base": {
     "repository": "google/embeddinggemma-300m",
     "revision": "57c266a740f537b4dc058e1b0cda161fd15afa75",

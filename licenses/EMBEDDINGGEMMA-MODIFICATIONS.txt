@@ -27,5 +27,6 @@ Current bundled GGUF SHA256:
 
 The producer did not publish its original shell command. The reconstruction
 above is therefore an independently verified recipe, not a claim about the
-producer's private build environment. Redistribution remains blocked until the
-separate legal review recorded in EMBEDDINGGEMMA-PROVENANCE.json is signed off.
+producer's private build environment. The redistribution review recorded in
+EMBEDDINGGEMMA-PROVENANCE.json was signed off on 2026-07-13; the binding use
+restrictions for this asset are stated in EMBEDDED-MODEL-TERMS.md.

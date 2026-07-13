@@ -304,5 +304,7 @@ the exact software artifact through [CITATION.cff](CITATION.cff).
 ## License
 
 Greppy source code is MIT-licensed; embedded model weights have separate terms.
+The binding terms for the embedded model files are in
+[`licenses/EMBEDDED-MODEL-TERMS.md`](licenses/EMBEDDED-MODEL-TERMS.md).
 See [LICENSE](LICENSE), [THIRD_PARTY.md](THIRD_PARTY.md), and the model notices
 under [`licenses/`](licenses/).

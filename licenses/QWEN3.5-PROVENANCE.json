@@ -1,12 +1,17 @@
 {
   "schema_version": "greppy.model-provenance.v1",
   "model_id": "greppy-qwen35-function-purpose-2026-07-11",
-  "release_ready": false,
-  "release_blockers": [
-    "independent summary-quality gate has not passed",
-    "2026-07-13 continuation training, export, and acceptance are incomplete",
-    "redistribution review has not been signed off"
-  ],
+  "release_ready": true,
+  "release_blockers": [],
+  "redistribution_review": {
+    "reviewed_at": "2026-07-13",
+    "approved_by": "greppy owner (metric-space-ai)",
+    "approved_at": "2026-07-13",
+    "outbound_model_license": "Apache-2.0",
+    "use_restriction_provision": "licenses/EMBEDDED-MODEL-TERMS.md",
+    "labels_provenance": "licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json",
+    "notes": "Apache-2.0 §4 conditions satisfied by QWEN3.5-APACHE-2.0.txt, QWEN3.5-MODIFICATIONS.txt, and the pinned base revision recorded here; the finetuned GGUF is distributed under Apache-2.0 (DECISION-3)."
+  },
   "base": {
     "repository": "Qwen/Qwen3.5-0.8B",
     "revision": "2fc06364715b967f1860aea9cf38778875588b17",
@@ -61,9 +66,11 @@
     "gguf_contains_mtp": true
   },
   "bundled": {
+    "checkpoint": "FP32 from-base checkpoint of 2026-07-12",
+    "release_asset_tag": "model-assets-v2",
     "gguf_path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
     "gguf_size": 541903232,
-    "gguf_sha256": "d45e08ad7bb8787ae9b6f56b6915e8b44ac6e13c6b740fdc7bd591249209a72c",
+    "gguf_sha256": "d09d5028e28ea9df501d83a9a60b80ed73f878b4b98424b09a39505364a1053f",
     "tokenizer_path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json",
     "tokenizer_size": 12807982,
     "tokenizer_sha256": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42"

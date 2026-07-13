@@ -1,15 +1,12 @@
 {
   "schema": "greppy.model-redistribution-lock",
   "version": 1,
-  "release_ready": false,
-  "release_blockers": [
-    "Qwen summary-quality and training reproducibility gates are unresolved",
-    "final redistribution review is pending"
-  ],
+  "release_ready": true,
+  "release_blockers": [],
   "models": [
     {
       "id": "embeddinggemma-300m-q4k-current",
-      "release_ready": false,
+      "release_ready": true,
       "assets": [
         {
           "path": "crates/cli/assets/embeddinggemma-300m-q4k/embeddinggemma-300M-Q4_K.gguf",
@@ -37,26 +34,31 @@
           "path": "licenses/EMBEDDINGGEMMA-NOTICE.txt",
           "sha256": "3d1bb23688fcbfd27a2dba1d3a625d9a6075fc250a7ba2d94ef203bf71acb878",
           "size": 386
+        },
+        {
+          "path": "licenses/EMBEDDED-MODEL-TERMS.md",
+          "sha256": "cafada4f3ad4e8e59624b4c4b519e6dc462fb69c4ae3c4458ae3c46be8ff5634",
+          "size": 1440
         }
       ],
       "provenance": [
         {
           "path": "licenses/EMBEDDINGGEMMA-PROVENANCE.json",
-          "sha256": "42e96a544c8d942a23da1147266758d84c63971a2040137f76670a5d3d7946d0",
-          "size": 2600
+          "sha256": "6532576706c4663694cf8601b2d9730cba070294ce517a43285c537f4865fca8",
+          "size": 3124
         }
       ],
       "modifications": [
         {
           "path": "licenses/EMBEDDINGGEMMA-MODIFICATIONS.txt",
-          "sha256": "fe97c5d9d919f7ef759eacb5d60a6c4aaa4a0b5a4cfb0d9ffa0defe1b6ef3edc",
-          "size": 1533
+          "sha256": "afd70aa0f19386d141c075b0034c046f013d1b34cfc006ceace25e1240796d84",
+          "size": 1594
         }
       ]
     },
     {
       "id": "greppy-qwen35-function-purpose-2026-07-11",
-      "release_ready": false,
+      "release_ready": true,
       "assets": [
         {
           "path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
@@ -84,24 +86,29 @@
           "path": "licenses/QWEN3.5-APACHE-2.0.txt",
           "sha256": "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32",
           "size": 11343
+        },
+        {
+          "path": "licenses/EMBEDDED-MODEL-TERMS.md",
+          "sha256": "cafada4f3ad4e8e59624b4c4b519e6dc462fb69c4ae3c4458ae3c46be8ff5634",
+          "size": 1440
         }
       ],
       "provenance": [
         {
           "path": "licenses/QWEN3.5-PROVENANCE.json",
-          "sha256": "51765fea5f302dfb620155bf1e5252a88bb59efdc29e126b88ffc5b68d1a4637",
-          "size": 3695
+          "sha256": "65118b2661fa4e3366c521a80dd067546f9f5f4fe94c8efa7c8814eb6bcb92ec",
+          "size": 4163
         },
         {
           "path": "licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json",
-          "sha256": "8d97e2e8a7cea19d88d80aec63d0a54da5ade48eb4dba193490787fe5f95dbf6",
-          "size": 1662
+          "sha256": "028a00ead1c5c39569536b7cec92262b468620bc25300fa30b2ba0e6bec925ba",
+          "size": 2913
         }
       ],
       "modifications": [
         {
           "path": "licenses/QWEN3.5-MODIFICATIONS.txt",
-          "sha256": "48188574d0b292a1191f16c00c8a9d8e671999b56f9930cc96f9d758fef24018",
+          "sha256": "27344d6de51bbcb30a6bfdbabdddceaba6e27bcd204ac743283cb1b64c72bb32",
           "size": 947
         }
       ],
@@ -125,6 +132,11 @@
           "path": "training/qwen35/MANIFEST.sha256",
           "sha256": "f9a2cf8cc8a0a7603ff16fb3b113838df0ed80505167551a043ada328653fff7",
           "size": 1676
+        },
+        {
+          "path": "licenses/MINIMAX-M3-TERMS-SNAPSHOT.txt",
+          "sha256": "c48158dd2f250d43e82de94835853710244cb93bc74d0f3de7e4fe51587fc39a",
+          "size": 50126
         }
       ]
     }

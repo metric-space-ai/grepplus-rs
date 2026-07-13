@@ -1,26 +1,41 @@
 {
   "schema_version": "greppy.training-data-manifest.v1",
   "model_id": "greppy-qwen35-function-purpose-2026-07-11",
-  "release_ready": false,
+  "release_ready": true,
   "source_dataset": {
     "repository": "Fsoft-AIC/the-vault-function",
     "revision": "505c679056e49a2a269b64777ee7c496d22e1440",
-    "declared_license": "MIT"
+    "declared_license": "MIT",
+    "per_row_upstream_licenses": "permissive upstream licenses with retained per-row provenance (repository, path, license, hexsha per row)"
   },
   "selection": {
     "description": "ordered function records transformed into prompt/completion SFT rows",
     "row_count": 55274,
-    "ordered_rows_sha256": "3e0badd041cf93e5d8e2d0e0b7e983f941562dd68ca94c7592884eae69946ff3"
+    "ordered_rows_sha256": "3e0badd041cf93e5d8e2d0e0b7e983f941562dd68ca94c7592884eae69946ff3",
+    "holdout": "5% of repositories, selected by hash"
   },
   "labels": {
     "generator": "MiniMax-M3",
+    "generator_access": "minimax-open-platform-api",
+    "generator_api_endpoint": "https://api.minimax.io/v1/text/chatcompletion_v2",
+    "generator_api_model": "MiniMax-M3",
+    "generator_account_entity": "metric-space-ai organization account (authenticated API key, flat-rate subscription)",
+    "generation_window": "2026-07-10 .. ongoing (weekly tranches; the 55274 rows in this manifest were generated 2026-07-10 .. 2026-07-11)",
+    "governing_terms": "MiniMax Open Platform Terms of Service, effective 2026-03-30 (Nanonoble Pte. Ltd.)",
+    "terms_snapshot": {
+      "path": "licenses/MINIMAX-M3-TERMS-SNAPSHOT.txt",
+      "sha256": "c48158dd2f250d43e82de94835853710244cb93bc74d0f3de7e4fe51587fc39a",
+      "size": 50126
+    },
+    "output_ownership_basis": "MiniMax Open Platform ToS: 'you retain your ownership rights in Client input and generated content'; labels were generated via the hosted API, not self-hosted weights, so the MiniMax Community License does not apply",
     "purpose": "short English function-purpose completions",
+    "teacher_prompt_version": "minimax-m3-brief-K-v1",
     "student_prompt_version": "qwen35-brief-v3",
     "student_prompt_template": "<|im_start|>user\nbrief:\n{source}<|im_end|>\n<|im_start|>assistant\n",
     "raw_labels_published": false
   },
   "review": {
-    "status": "audited_pending_release",
+    "status": "released",
     "evidence": {
       "package": "training/qwen35",
       "audit_summary": "training/qwen35/audit-summary-2026-07-13.json",
@@ -33,8 +48,8 @@
       "summary_quality_holdout_matches": 0,
       "aggregate_sha256": "fa10bae3a37e19cda295394155199ae85a5d8240131060f49e5284a14eae384c"
     },
-    "blockers": [
-      "complete generated-output redistribution review"
-    ]
+    "blockers": [],
+    "signed_off_by": "greppy owner (metric-space-ai)",
+    "signed_off_at": "2026-07-13"
   }
 }

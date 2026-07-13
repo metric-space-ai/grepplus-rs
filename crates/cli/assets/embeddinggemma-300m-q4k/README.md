@@ -24,8 +24,9 @@ digest are recorded in `licenses/EMBEDDINGGEMMA-PROVENANCE.json`.
 
 This reconstruction proves the packaged quantized artifact is reproducible; it
 does not claim knowledge of the producer's unpublished build environment. The
-asset remains blocked from a production release until the separate
-redistribution review is signed off.
+redistribution review for this asset is recorded in
+`licenses/EMBEDDINGGEMMA-PROVENANCE.json`; the binding use restrictions are
+stated in `licenses/EMBEDDED-MODEL-TERMS.md`.
 
 Verified asset digests:
 

@@ -6,6 +6,10 @@ archives must include this file and the complete `licenses/` directory.
 
 ## Embedded model assets
 
+The MIT license does not apply to the embedded model weight files. Their
+binding terms are collected in `licenses/EMBEDDED-MODEL-TERMS.md`, which is a
+condition of using and redistributing greppy binaries and archives.
+
 ### EmbeddingGemma-300M Q4_K
 
 - Purpose: code-query and source-span embeddings.
@@ -17,9 +21,12 @@ archives must include this file and the complete `licenses/` directory.
 - Notice: `licenses/EMBEDDINGGEMMA-NOTICE.txt`.
 
 The Gemma terms require a copy of the agreement and a specific Notice for
-redistribution. They are not replaced by Greppy's MIT license. Public release
-remains blocked until the redistribution review is signed off and the current
-official terms are compared with the packaged copies. The bundled Q4_K_M bytes
+redistribution. They are not replaced by Greppy's MIT license; the binding
+use-restriction provision is `licenses/EMBEDDED-MODEL-TERMS.md`. The packaged
+copies were compared with the current official terms on 2026-07-13 (Gemma
+Terms of Use last modified 2026-04-01; Prohibited Use Policy last modified
+2024-02-21), and the redistribution review is recorded in the provenance
+record. The bundled Q4_K_M bytes
 have been independently reproduced from the pinned public F32 GGUF; the exact
 source digest, llama.cpp revision, x86_64 command, and output digest are in the
 provenance record.
@@ -37,11 +44,16 @@ records and refuses to publish while their release lock remains unresolved.
   pinned llama.cpp; the bundled GGUF contains target and MTP weights.
 - Bundled files: `Qwen3.5-0.8B-MTP-Q4_K_M.gguf`, `tokenizer.json`.
 - License: Apache License 2.0; see `licenses/QWEN3.5-APACHE-2.0.txt`.
+  Qwen3.5-0.8B © 2026 Alibaba Cloud, licensed under Apache-2.0; the finetuned
+  GGUF is likewise distributed under Apache-2.0.
 
 This is a modified model, not an unchanged Unsloth artifact. See
 `licenses/QWEN3.5-MODIFICATIONS.txt`, `licenses/QWEN3.5-PROVENANCE.json`, and
-`licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json`. The current checkpoint remains
-blocked from release until the recorded quality and redistribution gates pass.
+`licenses/QWEN3.5-TRAINING-DATA-MANIFEST.json`. Release readiness for the
+shipped checkpoint is recorded in `licenses/MODEL-REDISTRIBUTION.lock.json`
+and the provenance records above. Greppy voluntarily honors training-data
+takedown and opt-out requests propagated through The Stack / The Vault by
+applying them on the next scheduled retraining cycle.
 
 Model outputs are non-authoritative navigation hints. Source spans, signatures,
 and graph evidence remain deterministic even when summary inference fails.

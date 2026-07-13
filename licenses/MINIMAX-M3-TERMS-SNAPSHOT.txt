@@ -1,0 +1,352 @@
+Title: Terms of Service - MiniMax
+URL: https://platform.minimax.io
+Source element: <main>
+---
+MiniMax Terms of Service
+
+Terms of Service
+
+Effective Date: March 30, 2026
+
+Welcome to the MiniMax Open Platform!
+
+These Terms of Service ("Terms" or "Agreement") apply to your use of the MiniMax Open Platform Service ("Service"), provided by Nanonoble Pte Ltd., the Service Provider ("we" or "us""). Please carefully review the entire content of this Agreement before accepting it. Provisions that limit or exempt liability are highlighted in bold for your attention---please read them carefully.
+
+By clicking to confirm this Agreement on the website or by actually using the Service, you confirm that: you possess the legal rights and capacity necessary to enter into a binding contract with us (if you are under 18, please read this Agreement with a guardian and obtain their consent before using the Service), and that you accept and agree to abide by this Agreement.
+
+If you do not agree with or cannot fully understand any content of this Agreement, please do not accept this Agreement or use the Service. Otherwise, your use of the Service indicates that you fully understand and agree to be bound by this Agreement.
+
+General Provisions
+
+The MINIMAX Open Platform Service refers to the data and AI products, services, documentation, software, and other offerings provided at https://www.minimax.io/platform (hereinafter the "MINIMAX Open Platform Website"). These online services, documentation, software, and other offerings will be provided to you in accordance with one or more orders, as specifically outlined in each order (subject to what is actually provided). You may select one or more specific services based on your needs and are required to comply with the respective service rules.
+
+The terms, rules, instructions, and standards (collectively, "Service Rules") governing specific services, including service content, service levels, technical specifications, operational documentation, pricing, privacy policy, data privacy and security agreements, service usage rules, and copyright policies, shall be governed by the effective content displayed on the MINIMAX Open Platform Website or other related pages at the time.
+
+The Service is solely provided as a neutral technical service and provides various technical products and services to you in accordance with this Agreement. You are solely responsible for the operation of your own websites, applications, software, platforms, and any related content. You agree to use our Service exclusively for your own products or projects. You warrant that you have obtained the required legal operating qualifications or government approvals as mandated by national regulations (and will maintain these during the effective period of this Agreement) and continuously comply with relevant audit, identification, assessment, information security obligations, and disclosure requirements concerning the use of our services under applicable laws. You bear full responsibility for compliance. If you breach any of your representations or warranties, including but not limited to lacking necessary licenses or approvals at the time of entering into this Agreement or failing to maintain required qualifications during the term, we may suspend services and request that you rectify the issue within a specified period. If you fail to comply within the designated period, we reserve the right to terminate this Agreement and suspend any services without any liability.
+
+You understand and agree that we may impose limitations on your use of the products and services, including the methods, scope, and functions, based on the type, characteristics, and specifications of the products and services you ordered. You shall thoroughly review our specific terms, purchase agreements/service orders, service rules, and other related documentation concerning the ordered products and services, and agree to comply with such usage restrictions. Furthermore, you agree that if your usage of services exceeds the purchased specifications, we reserve the right, based on reasonable commercial judgment, to restrict or suspend the provision of relevant services to you.
+
+Account
+
+You must have the necessary and appropriate legal rights and capacity, and submit information as requested to complete registration and obtain an MINIMAX Open Platform Service account (hereinafter referred to as the "Account").
+
+To ensure the security and independence of the Account and avoid adverse consequences such as unclear ownership, you should register or log in using identity information to which you hold legitimate rights. Failure to do so may prevent you from logging in and using the Service properly.
+
+You must complete and submit true, legal, and valid information in accordance with the MINIMAX Open Platform Service process (collectively, "Client Information"), including but not limited to name, contact person, email, phone number, contact address, and business registration documents. If there are any changes to the Client Information, you must promptly notify us in writing or update the information in accordance with MINIMAX Open Platform rules; otherwise, we reserve the right to suspend your access to the Service.
+
+This Agreement applies to all Accounts under your name. The Account will serve as the identifier for your use of the MINIMAX Open Platform Service. You must implement necessary and effective confidentiality and security measures to protect your username, password, and other information (including, but not limited to, managing usage permissions, setting a high-strength password, and updating it periodically). Failure to do so will result in consequences that you shall bear. Additionally, you are responsible for all actions taken under your Account, and any activities conducted through the Account are deemed to be performed by you, with all associated legal consequences borne by you.
+
+You are responsible for establishing and maintaining an internal management system to regulate the use and administration of the Account. To protect your rights, the Account should be used solely by you. If, for operational needs or other reasons, you authorize employees or other individuals to manage the Account, you must implement proper permission controls and ensure that, in the event of personnel changes, the Account is securely transferred and protected (e.g., by changing the password, updating login methods, and enabling account protection).
+
+To ensure the security of the Account and related business activities, you must complete real-name authentication in compliance with national regulations and MINIMAX Open Platform procedures. You agree to authorize us to verify the information or documents you submit through third-party services.
+
+Real-name authentication serves as the basis for determining account ownership and responsibility. In cases of ownership disputes or other conflicts regarding the Account, we may deem the Account as belonging to the entity identified in the real-name authentication. For accounts with ownership disputes, the we reserve the right to temporarily freeze the Account. You must exercise caution during authentication, paying due attention to ensure that the authenticated entity matches the actual user of the Account. Avoid any improper authentication practices, such as certifying a corporate Account under an individual's name or a personal Account under someone else's name.
+
+If you discover unauthorized use of your Account or password by others, or any other unauthorized activity, you must promptly notify us in an effective manner and provide necessary documentation (e.g., customer information, a description of the situation, supporting materials, and requests) to facilitate identity and incident verification. Upon receiving valid notice from you and verifying your identity, we will handle the issue in accordance with applicable laws, regulations, and service rules. Any liabilities or consequences resulting from our handling under this provision shall be borne by you.
+
+If the information you provided is defective, preventing us from verifying your identity or determining your request, and thus causing delays in processing, you shall bear any resulting losses. Additionally, you understand that we require a reasonable timeframe to address your requests, and we assume no liability for losses you incur prior to the implementation of measures or for losses occurring after the measures due to causes beyond our control.
+
+If your affiliated companies use the products and services provided under these terms, such affiliated companies shall be considered as clients of ours and must comply with these terms. You hereby commit and guarantee to bear responsibility to us for any failure by such affiliated companies to fully comply with or for any breach of these terms.
+
+AI Output
+
+The Service may include features that use artificial intelligence, machine learning, or similar technologies to generate responses, content, recommendations, or other output (“AI Output”). The Service operates based on machine learning models trained on various datasets and may produce AI Output that is false, inaccurate, incomplete, or out of date.
+
+You further acknowledge and agree that:
+
+No Guarantee of Accuracy. AI Output is generated based on patterns in data and is not guaranteed to be accurate, complete, reliable, current, or error-free.
+
+No Professional Advice. AI Output is provided for informational purposes only and does not constitute legal, medical, financial, or other professional advice, and is not a substitute for advice from a qualified professional.
+
+Contextual Limitations. The Service may not understand context, nuance, or intent with the same level of judgment as a human.
+
+Customer Responsibility. You are solely responsible for all use of any AI Output by you and your end users, including reviewing, evaluating, and verifying such AI Output before using it or relying on it, and before making any decisions or taking any actions that may affect you, your end users, or any third parties.
+
+Service
+
+You may select and purchase services based on your needs. Before purchasing, you must carefully review the service rules corresponding to the chosen service and decide whether to proceed with the purchase or use based on your requirements, as well as sign any necessary agreements.
+
+You must complete payment promptly after submitting an order. Some services may have time limitations, inventory restrictions, or other activity limitations. If, after submitting the order, payment is not completed in a timely manner or if quantities become insufficient or reach their limit during the payment period, you may be unable to access the relevant services.
+
+The settlement method for services shall be as agreed upon, and most services will incur ongoing charges once activated. Even if you do not add new service items or resources or perform new actions, charges will continue due to the resource usage by these services. Therefore, you must ensure timely renewals or disable services as needed.
+
+Discounts are provided under specific conditions, such as for particular product configurations or for using products over a specified term or quantity (e.g., annual discounts). If you ultimately do not meet the specified conditions, you will not be eligible for the corresponding discount (including, but not limited to, discounts, vouchers, or other discounted services). In such cases, the fees will be settled at the original price listed on the official website at the time of purchase. Multiple discounts cannot be combined, and you are required to keep this information confidential.
+
+You acknowledge and agree that we may, at its discretion, adjust prices and billing during the service period; the latest information posted on the relevant product and service pages shall prevail. Any prepaid or postpaid products and services ordered after the effective date of the pricing adjustment notice on our website will be charged according to the adjusted billing terms. If you do not agree to the aforementioned billing adjustments, you should immediately cease using the products and services. If you continue to use the relevant products and services, it will be deemed that you understand and agree to pay the applicable fees in accordance with the latest pricing and billing methods published.
+
+We will provide technical support or other services as explicitly agreed upon in a written agreement or order. You acknowledge and agree that technical support or additional services may require you to bear extra costs and expenses.
+
+We will implement basic security protection measures for its systems and equipment as required by laws and regulations. If your security requirements exceed these basic protection standards, you are responsible for configuring and using the services in a manner that meets your security requirements. This may include, but is not limited to, purchasing higher-level security protection services or configuring additional security software, systems, or other measures based on your needs.
+
+You are responsible for implementing necessary and effective security measures and providing technical support for your own computer information systems and equipment. If you fail to take these measures, resulting in damage to your rights and interests, you shall bear the consequences.
+
+We offer limited service availability guarantees within the scope outlined in the service rules. If your availability requirements exceed those specified in the service rules, you must proactively configure your own systems for high availability. If custom design or development is required, it will be subject to separate agreement by both parties.
+
+To provide MINIMAX Open Platform services, we may need to access and use your equipment. For example, access may be required for software installation or service deployment. You agree to allow us to use or access your equipment for the purpose of delivering the services under this Agreement, acknowledging that failure to provide such access may prevent us from delivering the service (or certain service features). You also agree that we may need to access or use personal information within your equipment (as defined by applicable law) in the course of service delivery, and such personal information will be processed in accordance with applicable laws, regulations.
+
+To provide you with enhanced services, we reserve the right to perform regular or ad hoc inspections, maintenance, upgrades, and optimizations (collectively, "Routine Maintenance") on the service platform, related equipment, systems, and software. If such Routine Maintenance results in temporary interruption or suspension of the MINIMAX Open Platform Service within a reasonable timeframe, we shall not be liable to you for any resulting inconvenience. However, we will notify you of any Routine Maintenance at least 12 hours in advance. In cases of non-routine maintenance due to force majeure, errors by base operators, or similar reasons, we will promptly inform you.
+
+To ensure the security and stability of the Service, we may undertake major adjustments, such as equipment replacements, which may lead to temporary interruptions or suspensions of the MINIMAX Open Platform Service within a reasonable timeframe. We shall not be liable to you for any inconvenience caused. However, we will provide at least 10 days' notice, and you are required to cooperate. If you fail to cooperate with the adjustments or if we are unable to reach you with the contact information you provided in your account, any resulting consequences shall be borne by you.
+
+If you discover that any application (hereinafter referred to as "Application," including its use by end users) created with or operating on the MINIMAX Open Platform Service or any of your user content violates this Agreement, you must immediately suspend the Application, delete the content, and restrict end-user access as appropriate. If you do not take these actions within 24 hours after receiving any notice of violation from us, we may suspend or disable the Application and your account until the violation is resolved.
+
+If we determine that a violation may: (a) disrupt the MINIMAX Open Platform Service; (b) interfere with third-party use of the MINIMAX Open Platform Service; (c) compromise the network or servers used to provide the MINIMAX Open Platform Service; or (d) allow unauthorized third-party access to the MINIMAX Open Platform Service, we may immediately suspend your account, the offending Application, or end-user accounts to the minimum extent necessary to prevent or correct the violation without prior notice to you.
+
+If the specific service you purchased includes a storage function, upon expiration or termination of the service, we will retain any data or information you stored in the service for a specified period as outlined in the service rules. You are responsible for any fees incurred during the retention period (if applicable) and must settle these fees in a timely manner and complete the transfer of all data. Upon the expiration of the retention period, your stored information will be deleted.
+
+If we make any changes to the service that materially reduce the functionality of the MINIMAX Open Platform Service, we will use commercially reasonable efforts to notify you within a reasonable period before the change becomes effective, provided that you have subscribed to receive notifications of such changes. If service interruptions or changes are necessary to address urgent issues or threats to the security or integrity of the MINIMAX Open Platform Service, comply with or respond to litigation, address intellectual property concerns, or meet legal or governmental requirements, we may implement these changes without a notification obligation.
+
+We may periodically provide updates to the MINIMAX Open Platform Service. Given the timeliness, complexity, and efficiency requirements of network services and regulatory or policy adjustments, we may adjust the relevant service rules for the MINIMAX Open Platform Service at any time and publish these adjustments via one or more channels, including website announcements, email notifications, SMS, system messages, or internal messages. These adjustments become effective immediately upon publication (unless otherwise specified) and do not require further consent from you.
+
+You must ensure compliance with the laws, regulations, and policies of the country where you reside, as well as ensure that your qualifications, capabilities, and use comply with local legal and regulatory requirements.
+
+User Rights and Obligations
+
+The services provided by us are based on deep synthesis technology. If you offer services based on these technologies, you must enhance data management, implement necessary measures to protect data security, and fulfill assessment obligations. You are required to adopt technical measures to add non-intrusive identifiers, maintain log information according to applicable laws and regulations, and place a prominent mark in reasonable positions or areas within generated or edited content to inform the public of the use of deep synthesis technology. You must also fulfill filing, modification, and deregistration requirements according to applicable local laws, if any.
+
+You may use the MINIMAX Open Platform Service as specified in this Agreement and to receive technical support and after-sales service from us as stipulated in this Agreement or applicable service orders.
+
+When using the services on the MINIMAX Open Platform, you must comply with relevant laws, regulations, and service rules, ensuring that you possess the necessary qualifications and capacities required by laws and regulations in the jurisdiction where the services are used. You are prohibited from engaging in, or facilitating, any of the following actions or any other illegal activities:
+
+Opposing the basic social principles required by applicable law.
+
+Endangering national security, leaking state secrets, subverting state power, or undermining national unity of any country or jurisdiction.
+
+Harming national interests of any country or jurisdiction.
+
+Inciting racial discrimination or hate crimes.
+
+Undermining freedom of religion or inciting discrimination based on religious beliefs.
+
+Creating or disseminating false information that may mislead or harm the public or any person.
+
+Creating or disseminating obscene, pornographic, violent, murderous, terroristic, or criminal incitement content.
+
+Insulting or slandering others, infringing upon the lawful rights and interests of others.
+
+Including any other prohibited content by applicable laws or regulations.
+
+When using the services on the MINIMAX Open Platform, you must maintain internet safety and security, refrain from infringing on any party's lawful rights, and avoid taking part in the following activities:
+
+Engaging in fraud, false or misleading conduct, or infringing upon the intellectual property rights or any other lawful rights of others, including but not limited to activities like "private servers" and "plug-ins."
+
+Publishing or spreading spam (SPAM) or information harmful to national security, such as content related to feudal superstitions, obscenity, pornography, or other illegal or inappropriate materials.
+
+Violating the operational rules of networks, devices, or services connected to the MINIMAX Open Platform, or engaging in illegal or unauthorized access, theft, interference, or monitoring.
+
+Engaging in any behavior that compromises or attempts to compromise network security, including but not limited to malicious scanning, illegal system intrusions, unauthorized data acquisition, or distributing viruses, trojans, or phishing attacks.
+
+Engaging in any behavior that alters or attempts to alter the system configuration provided by the MINIMAX Open Platform, compromises system security, disrupts the operation of the MINIMAX Open Platform, or interferes with others' use of the MINIMAX Open Platform, including producing, releasing, or spreading tools and methods to do so.
+
+Engaging in business activities such as "DNS resolution," "security services," "domain proxy," "reverse proxy," or other services that lead to frequent attacks on your system (including, but not limited to, DDoS attacks) without timely correction or failure to mitigate impacts as required by us, thereby affecting our platform or others.
+
+Engaging in any other actions that disrupt internet order and security.
+
+You must promptly and fully pay all fees in accordance with the service rules. If you fail to make timely and complete payments, we may refuse service activation or, without further notice, suspend or terminate the MINIMAX Open Platform Service provided to you. We may also take one or more of the following measures:
+
+Require you to pay a late fee up to 1% of the outstanding amount for each day payment is overdue, in addition to the original amount owed, until all payments are settled.
+
+If payment is overdue by more than 15 days, we may terminate this Agreement without further notice.
+
+If you are overdue in payment but have a prepaid service or an unspent cash balance in your account, we may, without further notice, to directly apply the prepaid amount or cash balance toward the outstanding fees and late fees.
+
+Delete some or all information and data stored or generated by you through the use of the MINIMAX Open Platform Service.
+
+You are solely responsible for your applications and content, ensuring that they comply with this Agreement (including the service rules). We reserve the right to review all applications to ensure your compliance with this Agreement. You acknowledge and agree that you are responsible for all use of the service by end-users, access by end-users to applications and your content, and activities under your account, and you must ensure that each end-user complies with applicable terms under this Agreement.
+
+You, as well as any affiliates, employees, service providers, and any third parties controlled, managed, supervised by, or otherwise under your control, may not:
+
+(a) Copy, modify, create derivative works of, reverse engineer, decompile, translate, disassemble, or otherwise attempt to extract any or all source code from our services (unless expressly permitted by applicable law, in which case you must contact us to obtain the necessary information before attempting reverse engineering);
+
+(b) Use the services for operating nuclear facilities, air traffic control, or life-support systems where use or failure of the services could lead to death, personal injury, or environmental harm;
+
+(c) Independently sublicense, resell, or distribute any or all services outside of any integrated applications; or
+
+(d) Access services in a manner that circumvents fees or otherwise evades usage restrictions.
+
+If you select the United States as the service region, you and any affiliates, employees, service providers, or any third parties under your control may not:
+
+(a) Process or store any content subject to the International Traffic in Arms Regulations (ITAR) issued by the U.S. Department of State; or
+
+(b) Process or store any Client Data subject to the Health Insurance Portability and Accountability Act of 1996 (HIPAA) and its amendments, or any regulations issued under HIPAA.
+
+Contact Information
+
+This website is operated by Nanonoble Pte. Ltd.
+
+With a registered address at 152 Beach Road, #14-02 Gateway East, Singapore (189721).
+
+All feedback, comments, requests for technical support, and other communications relating to the Services should be directed to:
+contact.nanonoble@minimax.io
+
+Service Provider Rights and Obligations
+
+We shall provide the MINIMAX Open Platform Service and after-sales support to you as outlined in this Agreement.
+
+We are responsible only for the operation and maintenance of the MINIMAX Open Platform Service itself. You must ensure the security and stability of your own network and equipment. In the event of the following situations, you must promptly resolve these issues to avoid impacting the MINIMAX Open Platform Service:
+
+Problems with your internal network, including but not limited to network overload.
+
+Malfunctions with your own equipment or any third-party equipment you are using.
+
+Network disruptions caused by the disconnection of equipment or other actions you undertake.
+
+Any other failures or network interruptions caused by you.
+
+If we independently discover or are informed by relevant authorities, rights holders, or other parties that you, your applications, end-users of your applications, or your content may be in violation of applicable laws, regulations, or this Agreement, we may independently assess and, at our sole discretion, take one or more of the following actions:
+
+Request that you immediately delete or modify the relevant content.
+
+Restrict or suspend the provision of all or part of the MINIMAX Open Platform Service to you (including but not limited to directly taking certain services offline and reclaiming relevant resources, or imposing operational restrictions/account freezing measures on your account).
+
+Terminate the MINIMAX Open Platform Service provided to you and terminate this Agreement (including but not limited to taking all services offline and reclaiming relevant resources).
+
+If we terminate the service or this Agreement in accordance with this Agreement, any prepaid fees will be retained by us as liquidated damages.
+
+We reserve the right to pursue other legal remedies against you as permitted by law.
+
+If we take corresponding measures under this Agreement (including but not limited to service suspension, fee deduction, or Agreement termination), such actions shall not constitute a breach of contract by us. Any resulting losses to you (including but not limited to business interruption or data deletion) shall be solely your responsibility. You are responsible for any and all liabilities and consequences arising from your breach of this Agreement. In the event that such a breach causes losses to us or any third party, you shall fully indemnify and compensate us and any affected third parties for those losses.
+
+To reasonably protect the interests of you, your users, and rights holders, we may establish specific procedures for handling infringement and complaints, which you must comply with. If we receive a complaint or report from a third party about you, we are authorized to disclose your relevant information to the third party (such as your entity information and any counter-notice or evidence submitted in response to the complaint). We may also request you to negotiate with the complainant (including, but not limited to, establishing a tri-party email group with you, us, and the complainant for direct communication and evidence exchange). Similarly, if you file a complaint or report against another MINIMAX Open Platform customer, we may disclose your information to the other party and require you to negotiate with them to promptly resolve the complaint or dispute and protect the legal rights of all parties. You must cooperate in this process; otherwise, your continued use of the MINIMAX Open Platform Service may be affected, and any resulting losses to you or others will be solely your responsibility.
+
+We may assign part or all of its rights and obligations under this Agreement to a third party with written notice to you. To effectuate this clause, both parties agree to execute any reasonably necessary documents and take all reasonable actions required.
+
+If third-party complaints or claims arise due to your breach of this Agreement, you shall handle them independently and bear all related responsibilities. Should we incur any compensation liability to a third party or face penalties from relevant government authorities, you shall fully indemnify us for all resulting losses, including reasonable expenses incurred in handling such matters.
+
+Client Data
+
+You guarantee that all data you store or upload to the MINIMAX Open Platform Service, including all processing instructions provided to us (such as collection, storage, use, processing, transmission, provision, disclosure, and deletion) ("Client Data") submitted to or processed via the MINIMAX Open Platform Service in any manner (e.g., analysis, distribution) has been lawfully collected, obtained, or generated. You further guarantee that you have not and will not, in any way, violate data protection laws or regulations, infringe upon the legal rights of any individual or entity, or use Client Data for any unlawful purposes. You also ensure compliance with all applicable laws and regulations in protecting the personal data of your end-users, including issuing legally effective privacy notices to end-users. You confirm that you have obtained and retained any required consent from end-users for accessing, monitoring, using, disclosing, and authorizing us to process Client Data. "Client Data" refers to any data, information, media, or other content submitted by you or your end-users to the MINIMAX Open Platform Service, excluding any data provided to us or our affiliates as part of your account.
+
+If Client Data includes personal information, you guarantee that you have obtained the consent of data subjects and have the right to transmit their personal information to us for data processing. If we improperly collect or process such data due to your failure to obtain adequate, complete authorization from the data subjects, we may, based on our reasonable judgment, to take immediate actions, including but not limited to deleting relevant information and data, suspending services, or freezing or canceling your account, without liability.
+
+You are responsible for independently managing your data on the MINIMAX Open Platform Service, including uploading, analyzing, deleting, and modifying data (subject to the service rules applicable to the specific services you use). You must exercise caution when deleting or modifying data and bear any consequences resulting from such actions; we do not assume responsibility for restoring such data.
+
+We may access and process Client Data to (a) provide the MiniMax Open Platform Service to Client, (b) perform routine maintenance, troubleshooting, and technical support activities, and (c) comply with applicable laws and regulations.
+
+You are responsible for backing up your data according to your needs. We will only provide data backup services as required by applicable laws and regulations or as specified in the service rules, and its liability is limited to the scope of statutory or agreed-upon data backup services.
+
+You shall bear all consequences and liabilities arising from any non-compliance with laws or regulations related to the generation, collection, processing, or use of your data. We reserve the right to terminate all or part of the MINIMAX Open Platform Service to you at any time as a result of such non-compliance. Any losses, liabilities, or expenses incurred by you as a result shall be your sole responsibility.
+
+Intellectual Property (Non-Transfer) and Indemnity Obligations
+
+Each party retains all rights to its respective trademarks, copyrights, and other intellectual property or industrial rights (as defined to the fullest extent permitted by law). Ownership of these rights will not transfer to the other party or become jointly owned as a result of entering into or performing this Agreement.
+
+You guarantee that any content (referred to as "Client Content") you provide, publish, upload, or process while using the products and services, as well as the actions themselves, including but not limited to software, technology, programs, webpages, text, images, audio, video, electronic documents, and other data, are owned by you or that you have obtained legal authorization from the rights holders. You further guarantee that Client Content will not contain any material that violates applicable laws or infringes on third-party rights and will not use our services to infringe on the lawful rights of others. You will defend and indemnify us, our employees, affiliates, agents and representatives from any third-party claims related to these matters, holding us harmless.
+
+As between you and us, and to the extent permitted by applicable laws, you retain your ownership rights in Client input and generated content. We may use the input and generated content to provide, maintain, develop, and improve our Services, comply with applicable law, enforce our terms and policies, and keep our Services safe.
+
+For any third-party claims, lawsuits, or proceedings ("Claims") brought against you alleging that your or your end-users' use of the MINIMAX Open Platform Service under this Agreement infringes or misappropriates third-party patents or copyrights, we will defend you or may, at its discretion, settle the Claim. We have sole control over handling or settling any such Claims and agrees to pay any final judgment amount awarded against you or any amount agreed upon in settlement, within the limitations of liability defined in this Agreement, provided that you:
+
+(a) promptly notify us in writing of the Claim;
+
+(b) grant us sole control over handling or settling the Claim;
+
+(c) provide all information and assistance reasonably requested by us in relation to the Claim at our expense;
+
+(d) fully pay all fees;
+
+(e) use the products and services within the scope and rules defined in this Agreement.
+
+For any intellectual property infringement claims related to the services, this section sets forth our entire liability and your sole remedy.
+
+We have no obligation to indemnify you for Claims arising from: (a) your breach of this Agreement; (b) Client Data; (c) alleged infringement due to combining software or services with any products, services, data, software, hardware, or business processes not provided by us; (d) using unsupported or outdated versions of our services; (e) modifications to software or services by any party other than us or our affiliates; or (f) your or your end-users' continued use of the MINIMAX Open Platform Service after receiving a notice from us to cease such use.
+
+For any Claims against us, our affiliates, and each of their respective licensors, employees, officers, and directors alleging that: (a) any of your application, product, service, or Client Data infringes third-party intellectual property rights; (b) you or your end-users have used the services in violation of this Agreement (including service rules), which may include but is not limited to (i) violating applicable data protection laws, (ii) violating any laws or regulations, or (iii) infringing on any third-party rights; or (c) you or your end-users have used products, services, data, software, or hardware not provided by us or our affiliates, you agree to defend and indemnify us from all losses arising from such Claims. This includes the final judgment amount awarded against us or our affiliates and any expenses (including reasonable attorneys' fees), fines, or losses incurred, provided that we and our affiliates have the right to participate in the defense or settlement negotiations with counsel of their choice. Any settlement requiring us and our affiliates, employees, or agents to admit liability, pay money, or take or refrain from any action must have the prior written consent of us and our affiliates (such consent not to be unreasonably withheld, conditioned, or delayed).
+
+Except with express permission from us, you may not copy, imitate, modify, translate, adapt, lease, sell, sublicense, distribute over the internet, publish, or transfer any part of our products and services, any access keys, technical documents, API lists, system usage, applications, developer tools, or other technical tools provided for service delivery. You are also prohibited from reverse engineering, reverse assembling, decompiling, or attempting to discover or decode the source code, algorithms, or object code of the products and services.
+
+For clarity, your purchase of products and services does not include any explicit or implicit transfer of intellectual property rights or patent licenses, nor does it grant you a license or authorization to display or use, independently or in combination, any trademarks, service marks, trade names, domain names, website names, or other distinctive branding features owned by us or our affiliates.
+
+Invoice and Tax
+
+Updating Your Invoice Information The name, address, and VAT or Tax ID displayed on your invoice are based on the details in your Stripe payment information. To update this information for future invoices, you can modify your payment details directly through yourStripe account during checkout.
+
+Changes Apply to Future Invoices Only: Changes made to your payment details will only affect invoices issued after the update. Historical invoices cannot be modified due to tax compliance requirements.
+
+Verify Details at Checkout: Ensure all payment information entered during checkout is accurate and matches the details you want reflected on your invoice. This step is critical to avoid discrepancies in billing records.
+
+Tax / VAT Charges When purchasing a subscription or credits, sales tax or VAT may apply based on your billing location. Our payment processor automatically calculates applicable taxes during checkout using your billing information. The total amount, including taxes, is displayed before you complete your payment. Key Details:
+
+Automated Process: Taxes are automatically calculated based on your billing details. Our team cannot adjust tax amounts.
+
+Tax Exemptions: If your organization qualifies for tax exemption, tick "I'm purchasing as a business" during checkout (if taxes apply). This will prompt fields to enter your tax ID, like an EIN in the United States or a VAT number in applicable countries. This information will appear automatically on future invoices.
+
+Policy Changes: Tax policies may change over time. Past tax-free purchases do not guarantee future transactions will remain tax-free.
+
+Confidential Information
+
+For the purposes of this Agreement, each party may provide or disclose certain confidential information to the other. The party disclosing confidential information is referred to as the "Disclosing Party," while the party receiving confidential information is referred to as the "Receiving Party."
+
+"Confidential Information" refers to non-public information, data, materials, and insights related to the Disclosing Party's business, operations, technology, and rights. This includes, but is not limited to, business plans, commercial materials, technical knowledge and information, ideas, concepts, proposals, provided items or vendor information, user information, personnel information, business strategies, service pricing and discounts, financial condition, and negotiation progress.
+
+Any information that the Receiving Party acquires from the Disclosing Party, which is marked as or reasonably recognized as the Disclosing Party's Confidential Information, must be kept confidential by the Receiving Party. Without the Disclosing Party's written consent, the Receiving Party shall not disclose such information to any third party or use it for any purpose other than those specified in this Agreement. The Receiving Party shall treat the Disclosing Party's Confidential Information with at least the same degree of care as it uses to protect its own confidential information (and no less than a reasonable degree of care).
+
+Notwithstanding the above, information shall not be considered Confidential Information if it:
+
+Was lawfully known to the Receiving Party prior to disclosure by the Disclosing Party;
+
+Is or becomes publicly known through no breach of this Agreement by the Receiving Party;
+
+Is lawfully obtained from a third party with the right to disclose it without confidentiality obligations;
+
+Is independently developed by the Receiving Party without the use of or reference to the Disclosing Party's Confidential Information.
+
+If the Receiving Party is required by law, regulation, or regulatory authority to disclose the Disclosing Party's Confidential Information, such disclosure shall not be deemed a breach of this Agreement. However, the Receiving Party shall promptly notify the Disclosing Party within the limits of the law and shall endeavor to assist the Disclosing Party in effectively limiting the scope of disclosure to protect the Disclosing Party's rights.
+
+The confidentiality obligations of both parties shall remain in effect during the term of this Agreement and thereafter, until the information no longer holds confidential value.
+
+In the event of a confidentiality breach, both parties shall cooperate to take all reasonable measures to prevent or mitigate any potential damage. If the Receiving Party's breach of confidentiality obligations causes losses to the Disclosing Party, the Receiving Party shall compensate the Disclosing Party for the direct economic losses incurred.
+
+Our use or disclosure of Confidential Information for the purpose of improving algorithms or enhancing services does not constitute a breach of confidentiality obligations.
+
+Export Controls and Sanctions
+
+Your Status: Neither you, your affiliates, nor any of your or your affiliates' officers, directors, shareholders, agents, or employees are:
+
+Listed on any designated persons list by the United States (including, but not limited to, the U.S. Department of Treasury's Office of Foreign Assets Control's "Specially Designated Nationals List"), the United Nations Security Council, the United Kingdom (including the U.K. Treasury's "Consolidated List of Financial Sanctions Targets"), the European Union and its member states (including the "Consolidated List of Persons, Groups, and Entities Subject to EU Financial Sanctions"), or any other sanctions list issued by an authority with jurisdiction over you (collectively, "Restricted Persons");
+
+Established, operating, or residing in a comprehensively sanctioned country or region (as of the date of this Agreement, including Iran, Cuba, North Korea, Syria, the Crimea/Sevastopol region, and the so-called Donetsk People's Republic and Luhansk People's Republic ("Sanctioned Regions"));
+
+Controlled by or have more than 50% of ownership interest held by any one or more Restricted Persons.
+
+Sanctions Event: If you or your affiliates become a Restricted Person, are controlled by or have more than 50% ownership by a Restricted Person, or if performance of this Agreement is restricted or prohibited due to Trade Laws (as defined below), or if we reasonably believe that you or your affiliates are violating Trade Laws or engaging in activities that could cause us to violate Trade Laws ("Sanctions Event"), we may suspend its obligations under this Agreement or cease providing services, and may immediately terminate this Agreement and the services provided. We reserve the right to take additional remedial measures at our discretion.
+
+Trade Compliance: You agree to comply with all applicable export control and economic sanctions laws and regulations related to your use of the MINIMAX Open Platform Service, including but not limited to those imposed by the United Nations, Singapore, the United States, and the European Union (and its member states). These include, for example, the U.S. Export Administration Regulations ("EAR") and economic sanctions laws and regulations administered by the U.S. Department of Treasury's Office of Foreign Assets Control (collectively, "Trade Laws"). You agree not to engage in any activity related to the MINIMAX Open Platform Service that may cause us to violate any Trade Laws. You shall comply with applicable Trade Laws when using the MINIMAX Open Platform Service, including:
+
+(a) the transfer and processing of Client Data;
+
+(b) providing Client Data to end-users;
+
+(c) designating the service region for any of the above actions; and
+
+(d) transmitting, publishing, or uploading data, technical information, software, or other content via the MINIMAX Open Platform Service.
+
+If you violate these Trade Compliance terms, or if any of the following events occur, the we may suspend performance under this Agreement or cease providing services, and may immediately terminate this Agreement and any services provided:
+
+You, or a third party authorized by you to use the MINIMAX Open Platform Service, are listed on any export control restrictions list or subject to any sanctions or penalties under Trade Laws, causing us inability to perform, obstacles to performance, significantly increased performance costs, or increased risks of performance; or
+
+The performance of this Agreement is restricted, prohibited, or could result in a violation of Trade Laws due to controls on MINIMAX Open Platform Service, related software, or hardware products, making it unsuitable for us to continue providing services under this Agreement.
+
+Without limiting the foregoing, if either party violates any applicable trade compliance regulations, thereby making continued performance of this Agreement a violation of applicable trade compliance laws, the other party shall be entitled to cease performing its obligations under this Agreement, and the breaching party shall indemnify the other party for any and all losses incurred as a result of such violation.
+
+Limitation of Liability
+
+You understand and agree that while using the MINIMAX Open Platform Service, the following situations may result in service interruptions. In these cases, we shall work with relevant parties to promptly restore service, but will not be held liable for any losses incurred by you:
+
+Force majeure events, including but not limited to natural disasters, pandemic restrictions, government actions, legislative changes, strikes (excluding internal labor disputes of either party), and riots that are unforeseeable, unavoidable, and insurmountable;
+
+Issues caused by underlying operators or our external suppliers (such as cloud service providers), including but not limited to adjustments by telecommunications and cloud service providers, telecommunications or power line disruptions, or telecommunications/power infrastructure installation, modification, or maintenance;
+
+Network security incidents, such as computer viruses, malware, or hacker attacks;
+
+Use of the MINIMAX Open Platform Service through unauthorized means, improper operation by you, or malfunctions in your software, systems, hardware, or communication lines;
+
+Other situations beyond our control or reasonable foresight.
+
+Neither party shall be held liable for any delays or breaches of this Agreement caused by force majeure, issues from underlying operators, network security incidents, or any events beyond reasonable control (except for your payment obligations under this Agreement). However, the affected party must notify the other party as soon as possible. If such events prevent performance under this Agreement for more than 30 days, either party may terminate the Agreement by providing 15 days' written notice to the other party. Termination due to this clause will not incur liability for either party.
+
+You acknowledge and agree that the our services or software are provided as-is based on the current state of technology and conditions. We will make every effort to ensure continuity and security of the service or software but cannot guarantee it to be flawless. Thus, any defects present due to limitations in the state of industry technology shall not constitute a breach by us, nor shall the we bear any liability. Both parties shall cooperate amicably to resolve any issues. To the maximum extent permitted by law, our services and software are provided on an "as-is" and "as-available" basis. We and our licensors make no representations, warranties, or guarantees of any kind, express, implied, or statutory, including but not limited to:
+
+That the service will be uninterrupted, secure, error-free, virus
+
+[truncated to 50000 chars]
