@@ -1,0 +1,32 @@
+name: Feature request
+description: Propose a bounded product or platform capability.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Agent workflow problem
+      description: Describe the repeated tool/source work this would eliminate.
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: Proposed observable contract
+      description: Include CLI/JSON behavior, failure mode, and evidence boundary.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: Acceptance evidence
+      description: State the tests or benchmark that should decide the change.
+    validations:
+      required: true

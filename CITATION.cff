@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If Greppy supports your research, cite this software and the exact release artifact used."
+title: "Greppy: Evidence-Bounded Code Navigation for Coding Agents"
+type: software
+authors:
+  - name: "Metric Space AI"
+repository-code: "https://github.com/metric-space-ai/greppy"
+url: "https://github.com/metric-space-ai/greppy"
+license: MIT
+abstract: >-
+  Greppy is a local code-navigation CLI for coding agents. It combines
+  byte-exact real-grep passthrough, freshness-checked symbol-graph evidence,
+  semantic retrieval, prepared source expansion, and non-authoritative local
+  function-purpose hints in one native Rust binary.
+keywords:
+  - code navigation
+  - code search
+  - coding agents
+  - software engineering
+  - semantic search

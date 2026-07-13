@@ -291,6 +291,10 @@ pin a release or commit and upgrade through verified release artifacts. See
 [SUPPORT.md](SUPPORT.md), [SECURITY.md](SECURITY.md), and
 [CHANGELOG.md](CHANGELOG.md).
 
+Contributions follow [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[Code of Conduct](CODE_OF_CONDUCT.md). Research and benchmark users can cite
+the exact software artifact through [CITATION.cff](CITATION.cff).
+
 ## License
 
 Greppy source code is MIT-licensed; embedded model weights have separate terms.

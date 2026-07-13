@@ -1,0 +1,58 @@
+name: Bug report
+description: Report a reproducible Greppy defect or output-contract regression.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Do not disclose vulnerabilities here. Use the repository's private
+        vulnerability-reporting flow for security issues.
+  - type: input
+    id: version
+    attributes:
+      label: Version and checksum
+      description: Include `greppy --version` and the release archive SHA-256.
+    validations:
+      required: true
+  - type: textarea
+    id: platform
+    attributes:
+      label: Platform
+      description: OS, architecture, CPU, GPU, and driver version when relevant.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and exit code
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Redacted doctor output
+      description: Paste `greppy doctor --json` after removing private paths.
+      render: json
+  - type: checkboxes
+    id: reproduction
+    attributes:
+      label: Reproduction contract
+      options:
+        - label: I can reproduce this on a clean worktree at a pinned commit.
+          required: true
+        - label: I removed secrets, private source, and identifying paths.
+          required: true
