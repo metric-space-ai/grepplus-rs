@@ -1,7 +1,7 @@
 name: release
 
-# Build ready-to-run binaries for macOS (arm64 + x86_64), Linux (x86_64) and
-# Windows (x86_64), sign them, and attach them to a GitHub Release.
+# Build ready-to-run binaries for macOS Apple Silicon, Linux x86_64, and
+# Windows x86_64, sign them, and attach them to a GitHub Release.
 #
 # Triggers:
 #   * push a tag `v*`   -> builds and publishes a Release with the assets
@@ -28,6 +28,7 @@ jobs:
   build:
     name: build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +40,7 @@ jobs:
             os: macos-latest
             asset: greppy-macos-arm64.tar.gz
             features: metal
+            footprint_devices: 'cpu metal'
           # Pinned to 22.04: ubuntu-latest (24.04) links glibc 2.39, which
           # excludes every 22.04-LTS host (v0.1.0/v0.1.1 assets shipped with
           # that requirement — a real-world "GLIBC_2.39 not found" failure).
@@ -47,6 +49,7 @@ jobs:
             os: ubuntu-22.04
             asset: greppy-linux-x86_64.tar.gz
             features: cuda
+            footprint_devices: 'cpu'
             cuda_sub_packages: '["nvcc", "cudart"]'
             cuda_non_cuda_sub_packages: '["libcublas", "libcublas-dev"]'
           # v0.2.0 certifies Windows CPU inference and named-pipe daemons.
@@ -55,6 +58,7 @@ jobs:
             os: windows-latest
             asset: greppy-windows-x86_64.zip
             features: cpu
+            footprint_devices: 'cpu'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,7 +76,8 @@ jobs:
           fi
 
       - name: Install Rust (pinned by rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@stable
+        # dtolnay/rust-toolchain v1, pinned to an immutable source revision.
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
 
       # CUDA toolkit (nvcc + cuBLAS headers/import libs) so build.rs can
       # compile the vendored ggml-cuda kernels into the shared backend. No GPU
@@ -184,6 +189,43 @@ jobs:
           xcrun stapler validate target/release/greppy
           spctl --assess --type execute --verbose=4 target/release/greppy
 
+      - name: Measure runtime footprint (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          repo="$RUNNER_TEMP/greppy-footprint-serde"
+          git clone --quiet --filter=blob:none https://github.com/serde-rs/serde.git "$repo"
+          git -C "$repo" checkout --quiet --detach 1023d077510b4aef36a41ef56fdb7798568a2654
+          for device in ${{ matrix.footprint_devices }}; do
+            python3 bench/runtime_footprint.py \
+              --greppy "$PWD/target/release/greppy" \
+              --repo "$repo" \
+              --semantic-query 'apply a rename case rule to a struct field' \
+              --brief-symbol apply_to_field \
+              --device "$device" \
+              --warm-repeats 3 \
+              --output "runtime-footprint-${{ matrix.name }}-$device.json"
+          done
+
+      - name: Measure runtime footprint (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $repo = Join-Path $env:RUNNER_TEMP 'greppy-footprint-serde'
+          git clone --quiet --filter=blob:none https://github.com/serde-rs/serde.git $repo
+          git -C $repo checkout --quiet --detach 1023d077510b4aef36a41ef56fdb7798568a2654
+          foreach ($device in '${{ matrix.footprint_devices }}'.Split(' ')) {
+            python bench/runtime_footprint.py `
+              --greppy "$PWD/target/release/greppy.exe" `
+              --repo $repo `
+              --semantic-query 'apply a rename case rule to a struct field' `
+              --brief-symbol apply_to_field `
+              --device $device `
+              --warm-repeats 3 `
+              --output "runtime-footprint-${{ matrix.name }}-$device.json"
+            if ($LASTEXITCODE -ne 0) { throw "runtime footprint failed for $device" }
+          }
+
       - name: Package (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -272,6 +314,11 @@ jobs:
         with:
           subject-path: ${{ matrix.asset }}.spdx.json
 
+      - name: Attest runtime footprint evidence
+        uses: actions/attest@v4
+        with:
+          subject-path: runtime-footprint-*.json
+
       - name: Upload packaged artifact
         uses: actions/upload-artifact@v4
         with:
@@ -280,6 +327,7 @@ jobs:
             ${{ matrix.asset }}
             ${{ matrix.asset }}.sha256
             ${{ matrix.asset }}.spdx.json
+            runtime-footprint-*.json
 
   verify-packages:
     name: clean package (${{ matrix.name }})
@@ -320,6 +368,10 @@ jobs:
           bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
           if [ "${{ runner.os }}" = Linux ]; then
             ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
+            test -s package/runtime-footprint-linux-x86_64-cpu.json
+          else
+            test -s package/runtime-footprint-macos-arm64-cpu.json
+            test -s package/runtime-footprint-macos-arm64-metal.json
           fi
           test -s "package/${{ matrix.asset }}.spdx.json"
 
@@ -338,6 +390,7 @@ jobs:
             $signature = Get-AuthenticodeSignature "$PWD/unpack/greppy.exe"
             if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
           }
+          if (-not (Test-Path 'package/runtime-footprint-windows-x86_64-cpu.json')) { throw 'missing runtime footprint evidence' }
           & unpack/release_package_smoke.ps1 -Binary "$PWD/unpack/greppy.exe" -Work "$PWD/smoke"
 
   publish:
@@ -404,17 +457,21 @@ jobs:
       - name: Generate aggregate release checksums
         shell: bash
         run: |
-          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' \) -print0 \
+          find release-assets -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.spdx.json' -o -name 'runtime-footprint-*.json' \) -print0 \
             | sort -z \
             | xargs -0 shasum -a 256 \
             | sed 's#  release-assets/[^/]*/#  #' > release-assets/SHA256SUMS
-          test "$(wc -l < release-assets/SHA256SUMS)" -eq 8
+          test "$(wc -l < release-assets/SHA256SUMS)" -eq 12
           cat release-assets/SHA256SUMS
       - name: Attest aggregate checksums
         uses: actions/attest@v4
         with:
           subject-path: release-assets/SHA256SUMS
       - name: Attach verified packages to release
+        # Manual tag dispatches exercise every preceding release gate but can
+        # never publish. Only the repository's tag-push event may create or
+        # replace release assets.
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -422,9 +479,6 @@ jobs:
             release-assets/**/*.zip
             release-assets/**/*.sha256
             release-assets/**/*.spdx.json
-            release-assets/agent-benchmark/greppy-agent-benchmark.tar.gz
-            release-assets/agent-benchmark/greppy-agent-benchmark.tar.gz.sha256
-            release-assets/coding-benchmark/greppy-coding-benchmark.tar.gz
-            release-assets/coding-benchmark/greppy-coding-benchmark.tar.gz.sha256
+            release-assets/**/runtime-footprint-*.json
             release-assets/SHA256SUMS
           fail_on_unmatched_files: true

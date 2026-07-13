@@ -332,6 +332,13 @@ class RuntimeFootprintTests(unittest.TestCase):
             runtime_footprint._argv_sha256(["a", "bc"]),
         )
 
+    def test_unverified_windows_pid_is_never_signalled(self) -> None:
+        with mock.patch.object(runtime_footprint.os, "name", "nt"), mock.patch.object(
+            runtime_footprint, "_pid_executable", return_value=None
+        ), mock.patch.object(runtime_footprint.os, "kill") as kill:
+            self.assertFalse(runtime_footprint._terminate_pid(4242, self.binary))
+        kill.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

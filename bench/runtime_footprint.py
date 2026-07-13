@@ -642,6 +642,10 @@ def _terminate_pid(pid: int, expected_executable: Path) -> bool:
     except OSError:
         return False
     if actual is None:
+        # Unlike POSIX, os.kill(pid, 0) terminates the process on Windows.
+        # An unverified Windows PID must never be touched.
+        if os.name == "nt":
+            return False
         try:
             os.kill(pid, 0)
         except (OSError, ProcessLookupError):
