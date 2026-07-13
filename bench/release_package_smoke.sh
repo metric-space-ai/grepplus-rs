@@ -10,6 +10,9 @@
 set -euo pipefail
 
 BIN="${1:?usage: release_package_smoke.sh /path/to/greppy [work-dir]}"
+# Sections cd into fixture dirs; a relative binary path would break there.
+case "$BIN" in /*) ;; *) BIN="$(cd "$(dirname "$BIN")" && pwd)/$(basename "$BIN")" ;; esac
+[ -x "$BIN" ] || { echo "not executable: $BIN" >&2; exit 64; }
 WORK="${2:-$(mktemp -d "${TMPDIR:-/tmp}/greppy-release-smoke-XXXXXX")}"
 mkdir -p "$WORK/repo/src" "$WORK/repo/.git" "$WORK/store"
 
@@ -421,25 +424,11 @@ jq -e '.managed_bytes == 0 and (.entries | length) == 0' "$WORK/cache-status-cle
 [ -z "$(find "$GREPPY_STORE_DIR" -name 'graph.db' 2>/dev/null)" ] \
   || fail "cache clear --all left workspace databases behind"
 
-# KNOWN BUG (expected-fail, 2026-07-13): `cache clear --all --yes` is
-# documented to remove "every verified workspace and model entry"
-# (crates/core/src/cache.rs clear_cache), but the model blobs the release
-# binary extracts from its embedded assets survive every clear/gc pass:
-# write_embedded_asset_marker (crates/cli/src/lib.rs) writes the *.sha256
-# sidecar as a JSON document ({"version":1,"sha256":…}), while
-# model_entry_has_marker (crates/core/src/cache.rs) recognises only a
-# bare-hex digest equal to the directory name. The extracted models are
-# therefore classified "unmanaged" (~800 MB) and never reclaimed. This block
-# asserts the CURRENT buggy behaviour so the release gate stays green; once
-# the marker formats agree it fails loudly and must be replaced by
-#   [ -z "$(find "$GREPPY_STORE_DIR" -name '*.gguf')" ]
-if [ -n "$(find "$GREPPY_STORE_DIR" -name '*.gguf' 2>/dev/null)" ]; then
-  jq -e '.unmanaged_bytes > 0 and (.unmanaged | length) > 0' "$WORK/cache-status-cleared.json" >/dev/null \
-    || fail "model blobs survived cache clear but status does not report them as unmanaged"
-  printf 'KNOWN BUG (expected-fail): cache clear --all left extracted model blobs behind as unmanaged bytes\n'
-else
-  fail "KNOWN-BUG marker outdated: cache clear --all now removes extracted model blobs — delete the expected-fail block and assert their removal"
-fi
+# Extracted embedded models are managed entries (model_entry_has_marker
+# accepts the CLI's JSON extraction marker since the 2026-07-13 fix) and must
+# be reclaimed by `cache clear --all --yes` like any other model entry.
+[ -z "$(find "$GREPPY_STORE_DIR" -name '*.gguf' 2>/dev/null)" ] \
+  || fail "cache clear --all left extracted model blobs behind"
 
 # --- simulated install + residue-free removal --------------------------------
 # Install the packaged binary into a temp prefix (exactly what the tarball

@@ -862,10 +862,52 @@ fn model_entry_has_marker(dir: &Path, digest: &str) -> bool {
                 .to_str()
                 .is_some_and(|n| n.ends_with(".sha256"))
                 && fs::read_to_string(entry.path())
-                    .map(|s| s.trim() == digest)
+                    .map(|s| marker_digest_matches(&s, digest))
                     .unwrap_or(false)
         })
     })
+}
+
+/// Both marker formats count as "managed": the bare-hex sidecar, and the
+/// CLI's JSON extraction marker (`write_embedded_asset_marker` in
+/// crates/cli - serde_json::to_vec, canonical, no whitespace). Without the
+/// JSON form, extracted embedded models (~827 MB) were classified unmanaged
+/// and survived both `cache gc` and `cache clear --all --yes`.
+/// A CLI test pins the `"sha256":"..."` byte shape this match relies on.
+fn marker_digest_matches(raw: &str, digest: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed == digest {
+        return true;
+    }
+    trimmed.starts_with('{') && trimmed.contains(&format!("\"sha256\":\"{digest}\""))
+}
+
+#[cfg(test)]
+mod marker_format_tests {
+    use super::marker_digest_matches;
+
+    const D: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+    #[test]
+    fn bare_hex_marker_matches() {
+        assert!(marker_digest_matches(&format!("{D}\n"), D));
+    }
+
+    #[test]
+    fn cli_json_extraction_marker_matches() {
+        let json = format!(
+            "{{\"version\":1,\"sha256\":\"{D}\",\"length\":42,\"metadata_fingerprint\":\"x\"}}"
+        );
+        assert!(marker_digest_matches(&json, D));
+    }
+
+    #[test]
+    fn wrong_digest_rejected_in_both_formats() {
+        let other = "2".repeat(64);
+        assert!(!marker_digest_matches(&other, D));
+        let json = format!("{{\"version\":1,\"sha256\":\"{other}\"}}");
+        assert!(!marker_digest_matches(&json, D));
+    }
 }
 
 fn path_size_no_symlink(path: &Path) -> u64 {
