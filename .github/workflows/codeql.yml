@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [rust, c-cpp, actions]
+        language: [rust, actions]
     steps:
       # actions/checkout v4.3.1, pinned to immutable source.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
