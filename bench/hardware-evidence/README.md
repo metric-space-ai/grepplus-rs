@@ -17,7 +17,7 @@ the harness has a scrub gate that refuses to emit otherwise).
 | --- | --- | --- |
 | `*-macos-aarch64-metal.json` | metal | The shipped Metal backend selects and runs end to end (index → semantic-search → brief → expand) on Apple Silicon. `platform.apple_silicon_generation` + the note in `measurements.notes` say whether the Metal 4 **tensor-ops** matmul path (M5-class GPU) or the simdgroup fallback was exercised. |
 | `*-linux-x86_64-cpu.json` | cpu | The Linux binary's CPU backend runs end to end; `backend.cpu_capabilities` records which SIMD tiers the product's own probe engaged (avx2 / avx-vnni / avx512f). |
-| `*-linux-x86_64-cuda.json` | cuda | **Pending hardware — see below.** The CUDA backend runs end to end on a real NVIDIA GPU *without any CUDA toolkit installed*: the harness strips `nvcc` from `PATH`, unsets `LD_LIBRARY_PATH`, and asserts the backend library the binary materializes needs no `cudart`/`cublas`/`nvrtc` — only the driver's `libcuda.so.1`. It also records the VRAM peak (nvidia-smi polling). |
+| `*-linux-x86_64-cuda.json` | cuda | The CUDA backend runs end to end on a real NVIDIA GPU (RTX A4500) *without any CUDA toolkit installed*: the harness strips `nvcc` from `PATH`, unsets `LD_LIBRARY_PATH`, and asserts the backend library the binary materializes needs no `cudart`/`cublas`/`nvrtc` — only the driver's `libcuda.so.1`. It also records the VRAM peak (nvidia-smi polling). |
 | any artifact with `backend.baseline_x86_required: true` | cpu | **Pending hardware — see below.** The binary runs correctly on an x86-64 CPU that *lacks* AVX-VNNI/AVX-512, i.e. the SIMD fallback paths carry the full contract-check suite. |
 
 Every artifact additionally locks in, on that hardware:
@@ -68,7 +68,7 @@ bench/hardware_evidence.sh target/release/greppy --backend cpu \
   --out bench/hardware-evidence/$(date -u +%F)-linux-x86_64-cpu.json
 ```
 
-### Linux / CUDA — pending hardware (run after host reboot)
+### Linux / CUDA
 
 Building needs a CUDA toolkit (`nvcc`); **running does not** — the harness
 proves that by hiding the toolkit from the product. Pin the run to one GPU
@@ -83,12 +83,10 @@ bench/hardware_evidence.sh target/release/greppy --backend cuda \
   --out bench/hardware-evidence/$(date -u +%F)-linux-x86_64-cuda.json
 ```
 
-Status 2026-07-13: the CUDA workstation (RTX A4500) currently has one
-hardware-failed GPU that poisons driver initialization for every device
-(`cuInit` fails, zero devices enumerate — recorded via the product's own
-probe: `available: false`). The CUDA binary is already built and staged on
-that box; execute the command above after the pending host reboot. Until
-then the CUDA leg is **pending hardware**.
+Status 2026-07-13: collected (`2026-07-13-linux-x86_64-cuda.json`, single
+RTX A4500, all contract checks pass). Earlier the same day the box had a
+hardware-failed GPU that poisoned `cuInit` for every device; a host reboot
+restored all three GPUs and the evidence run above was executed as staged.
 
 ### Old x86 (no AVX-VNNI / AVX-512) — pending hardware
 
