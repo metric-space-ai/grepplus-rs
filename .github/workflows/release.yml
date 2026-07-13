@@ -317,7 +317,12 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           if (-not $env:CERTIFICATE_PFX -or -not $env:CERTIFICATE_PASSWORD) {
-            throw 'Windows signing credentials are required for tag builds'
+            # Owner decision 2026-07-13: only macOS is signed for now; Windows
+            # certificates are not provisioned. Skip LOUDLY instead of failing
+            # the whole release matrix - the release notes must state that the
+            # Windows binary is unsigned until a certificate exists.
+            Write-Host '::warning title=Windows binary UNSIGNED::No Windows signing certificate provisioned (macOS-only signing). Shipping unsigned Windows binary.'
+            exit 0
           }
           $cert = Join-Path $env:RUNNER_TEMP 'greppy-signing.pfx'
           [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:CERTIFICATE_PFX))
@@ -605,6 +610,8 @@ jobs:
       - name: Verify clean Windows host
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          HAVE_WINDOWS_CERT_SECRETS: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 != '' && '1' || '' }}
         run: |
           New-Item -ItemType Directory -Force unpack,store,repo | Out-Null
           $line = (Get-Content "package/${{ matrix.asset }}.sha256" -Raw).Trim()
@@ -614,8 +621,15 @@ jobs:
           Expand-Archive -Path "package/${{ matrix.asset }}" -DestinationPath unpack -Force
           if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
           if ($env:GITHUB_REF -like 'refs/tags/*') {
-            $signature = Get-AuthenticodeSignature "$PWD/unpack/greppy.exe"
-            if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
+            if (-not $env:HAVE_WINDOWS_CERT_SECRETS) {
+              # Consistent with the signing step: no Windows certificate is
+              # provisioned (macOS-only signing per owner) - the binary is
+              # deliberately unsigned; warn instead of failing the tag.
+              Write-Host '::warning title=Windows binary UNSIGNED::Skipping Authenticode verification - no Windows signing certificate provisioned.'
+            } else {
+              $signature = Get-AuthenticodeSignature "$PWD/unpack/greppy.exe"
+              if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
+            }
           }
           if (-not (Test-Path 'package/runtime-footprint-windows-x86_64-cpu.json')) { throw 'missing runtime footprint evidence' }
           python unpack/release_artifacts.py verify-spdx `
