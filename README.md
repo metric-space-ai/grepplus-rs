@@ -146,13 +146,26 @@ Greppy is designed to replace exploratory search-and-open loops with one
 structured query plus directly attached evidence. That benefit is a release
 gate, not a marketing assumption.
 
-The checked-in benchmark contains 115 pinned tasks across six real repositories
-and deterministic synthetic controls. It records per-task correctness, tool
-calls, source opens, input/output tokens, context volume, and wall time for the
-same agent with Greppy and with an uncoached shell-search baseline.
+Two complementary, pre-registered suites are checked in:
 
-`v0.2.0` may claim an efficiency win only when the published, mechanically
-graded run proves all of the following:
+- [`bench/agent_efficiency/`](bench/agent_efficiency/) contains 115 pinned
+  navigation tasks across six real repositories plus deterministic controls.
+  It measures whether Greppy preserves answer correctness while reducing search,
+  source-reading, and context cost.
+- [`bench/agent_coding/`](bench/agent_coding/) contains 30 paired edit-and-test
+  tasks across Flask, Hugo, Gson, Zod, Serde, and Tokio. Each task starts from an
+  exact commit, proves that its independent test passes before mutation and
+  fails after mutation, then runs isolated Greppy and ordinary-exploration arms.
+  Setup is outside measured agent time; the post-agent test determines
+  correctness.
+
+Both suites record per-task correctness, tool calls, source opens, input/output
+tokens, context or prompt volume, and wall time for the same agent and model.
+Task banks, prompts, binaries, runtime versions, setup commands, and repository
+commits are hashed into their manifests.
+
+`v0.2.0` may claim an efficiency win only when both published, mechanically
+graded runs for the exact release commit prove all of the following:
 
 - no statistically significant correctness regression;
 - at least 20% fewer tool calls and source-open calls on structural tasks;
@@ -161,9 +174,8 @@ graded run proves all of the following:
   binary hash, per-task rows, grading, aggregate, and forensics are published;
 - raw agent traces remain private and are not release artifacts.
 
-The reproducible harness and pre-registered contract are in
-[`bench/agent_efficiency/`](bench/agent_efficiency/). Historical charts are not
-treated as `v0.2.0` evidence until a current run passes those gates.
+Historical charts and illustrative recordings are not treated as `v0.2.0`
+evidence until current navigation and coding-outcome runs pass those gates.
 
 ---
 

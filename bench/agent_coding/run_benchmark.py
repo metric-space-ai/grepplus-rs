@@ -33,7 +33,7 @@ TASK_SCHEMA_VERSION = "greppy.agent-coding-tasks.v1"
 RESULT_SCHEMA_VERSION = "greppy.agent-coding-results.v1"
 MANIFEST_SCHEMA_VERSION = "greppy.agent-coding-manifest.v1"
 GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v1"
-HARNESS_VERSION = "1"
+HARNESS_VERSION = "2"
 DEFAULT_MODEL = "MiniMax-M3"
 DEFAULT_PROVIDER = "minimax"
 RAW_ROOT = HERE / "raw_traces"
@@ -70,6 +70,14 @@ GREPPY_POLICY_TEMPLATE = (
 
 class HarnessError(RuntimeError):
     """Expected benchmark setup or execution failure."""
+
+
+class SetupCommandError(HarnessError):
+    """A setup command failed after its redacted evidence was captured."""
+
+    def __init__(self, summary: dict[str, Any]) -> None:
+        super().__init__("setup command failed")
+        self.summary = summary
 
 
 @dataclass(frozen=True)
@@ -215,7 +223,15 @@ def validate_task_document(document: Any) -> list[dict[str, Any]]:
         prefix = f"tasks[{index}]"
         if not isinstance(task, dict):
             raise HarnessError(f"{prefix} must be an object")
-        required = {"id", "repository", "mutation_patch", "user_task", "test_command", "timeout_seconds"}
+        required = {
+            "id",
+            "repository",
+            "setup_commands",
+            "mutation_patch",
+            "user_task",
+            "test_command",
+            "timeout_seconds",
+        }
         if set(task) != required:
             raise HarnessError(f"{prefix} must contain exactly {sorted(required)}")
         task_id = task["id"]
@@ -240,6 +256,18 @@ def validate_task_document(document: Any) -> list[dict[str, Any]]:
         for field in ("mutation_patch", "user_task"):
             if not isinstance(task[field], str) or not task[field].strip():
                 raise HarnessError(f"{prefix}.{field} must be a non-empty string")
+        setup_commands = task["setup_commands"]
+        if not isinstance(setup_commands, list):
+            raise HarnessError(f"{prefix}.setup_commands must be an array of argv arrays")
+        for command_index, setup_command in enumerate(setup_commands):
+            if (
+                not isinstance(setup_command, list)
+                or not setup_command
+                or any(not isinstance(part, str) or not part for part in setup_command)
+            ):
+                raise HarnessError(
+                    f"{prefix}.setup_commands[{command_index}] must be a non-empty argv array"
+                )
         command = task["test_command"]
         if not isinstance(command, list) or not command or any(not isinstance(part, str) or not part for part in command):
             raise HarnessError(f"{prefix}.test_command must be a non-empty argv array")
@@ -292,6 +320,24 @@ def executable_version(executable: pathlib.Path) -> str | None:
         if cleaned:
             return cleaned[:200]
     return None
+
+
+def greppy_source_identity() -> dict[str, Any]:
+    commit = run_checked(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        timeout_seconds=30,
+        operation="read Greppy source commit",
+    ).stdout.decode("ascii", errors="strict").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise HarnessError("Greppy source commit is not a full Git object ID")
+    status = run_checked(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        cwd=REPO_ROOT,
+        timeout_seconds=30,
+        operation="read Greppy tracked worktree status",
+    ).stdout
+    return {"git_commit": commit, "tracked_worktree_dirty": bool(status.strip())}
 
 
 def verify_provider_registration(pi_bin: pathlib.Path) -> None:
@@ -536,6 +582,69 @@ def process_summary(result: ProcessResult, output: bytes) -> dict[str, Any]:
     }
 
 
+def setup_summary(commands: list[dict[str, Any]], success: bool) -> dict[str, Any]:
+    core = {
+        "success": success,
+        "command_count": len(commands),
+        "wall_seconds": round(sum(float(command["wall_seconds"]) for command in commands), 3),
+        "excluded_from_agent_wall": True,
+        "commands": commands,
+    }
+    return {**core, "summary_sha256": sha256_bytes(canonical_json_bytes(core))}
+
+
+def run_setup_commands(
+    *,
+    task: dict[str, Any],
+    worktree: pathlib.Path,
+    store_dir: pathlib.Path,
+    raw_dir: pathlib.Path,
+    secrets: Sequence[str],
+) -> dict[str, Any]:
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    store_dir.mkdir(parents=True, exist_ok=True)
+    env = environment_without_provider_key()
+    env["GREPPY_STORE_DIR"] = str(store_dir)
+    commands: list[dict[str, Any]] = []
+    for index, argv in enumerate(task["setup_commands"]):
+        started = time.monotonic()
+        spawn_error = False
+        try:
+            result = run_process(
+                argv,
+                cwd=worktree,
+                timeout_seconds=task["timeout_seconds"],
+                env=env,
+            )
+        except OSError:
+            spawn_error = True
+            result = ProcessResult(
+                returncode=None,
+                stdout=b"",
+                stderr=b"setup process could not start\n",
+                wall_seconds=time.monotonic() - started,
+                timed_out=False,
+            )
+        output = redact(result.stdout + result.stderr, secrets)
+        atomic_write_bytes(raw_dir / f"setup-{index:02d}.log", output)
+        status = {
+            "return_code": result.returncode,
+            "timed_out": result.timed_out,
+            "spawn_error": spawn_error,
+        }
+        command = {
+            "index": index,
+            "argv_sha256": sha256_bytes(canonical_json_bytes(argv)),
+            **process_summary(result, output),
+            "spawn_error": spawn_error,
+            "status_sha256": sha256_bytes(canonical_json_bytes(status)),
+        }
+        commands.append(command)
+        if spawn_error or result.timed_out or result.returncode != 0:
+            raise SetupCommandError(setup_summary(commands, False))
+    return setup_summary(commands, True)
+
+
 def run_mutation_preflight(
     task: dict[str, Any],
     backing: pathlib.Path,
@@ -546,17 +655,63 @@ def run_mutation_preflight(
     worktree_path = task_tmp / "preflight-worktree"
     preflight_store = task_tmp / "preflight-greppy-store"
     with temporary_worktree(backing, task["repository"]["commit"], worktree_path, task["timeout_seconds"]) as worktree:
-        apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
-        mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        try:
+            setup = run_setup_commands(
+                task=task,
+                worktree=worktree,
+                store_dir=preflight_store,
+                raw_dir=raw_dir / "setup",
+                secrets=secrets,
+            )
+        except SetupCommandError as error:
+            return {
+                "valid": False,
+                "failure_kind": "setup_failed",
+                "setup": error.summary,
+                "clean_test": None,
+                "mutated_test": None,
+            }
+
         test_env = environment_without_provider_key()
         test_env["GREPPY_STORE_DIR"] = str(preflight_store)
-        result = run_process(task["test_command"], cwd=worktree, timeout_seconds=task["timeout_seconds"], env=test_env)
-        output = redact(result.stdout + result.stderr, secrets)
-        atomic_write_bytes(raw_dir / "preflight-test.log", output)
-    summary = process_summary(result, output)
-    summary["mutation_diff_sha256"] = sha256_bytes(mutation_diff)
-    summary["valid"] = not result.timed_out and result.returncode not in (None, 0)
-    return summary
+        clean_result = run_process(
+            task["test_command"],
+            cwd=worktree,
+            timeout_seconds=task["timeout_seconds"],
+            env=test_env,
+        )
+        clean_output = redact(clean_result.stdout + clean_result.stderr, secrets)
+        atomic_write_bytes(raw_dir / "preflight-clean-test.log", clean_output)
+        clean_summary = process_summary(clean_result, clean_output)
+        if clean_result.timed_out or clean_result.returncode != 0:
+            return {
+                "valid": False,
+                "failure_kind": "clean_source_test_failed",
+                "setup": setup,
+                "clean_test": clean_summary,
+                "mutated_test": None,
+            }
+
+        apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
+        mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
+        mutated_result = run_process(
+            task["test_command"],
+            cwd=worktree,
+            timeout_seconds=task["timeout_seconds"],
+            env=test_env,
+        )
+        mutated_output = redact(mutated_result.stdout + mutated_result.stderr, secrets)
+        atomic_write_bytes(raw_dir / "preflight-mutated-test.log", mutated_output)
+    mutated_summary = process_summary(mutated_result, mutated_output)
+    valid = not mutated_result.timed_out and mutated_result.returncode not in (None, 0)
+    return {
+        "valid": valid,
+        "failure_kind": None if valid else "mutation_test_did_not_fail",
+        "setup": setup,
+        "clean_test": clean_summary,
+        "mutated_test": mutated_summary,
+        "mutation_diff_sha256": sha256_bytes(mutation_diff),
+    }
 
 
 def run_arm(
@@ -581,6 +736,13 @@ def run_arm(
     raw_dir.mkdir(parents=True, exist_ok=True)
 
     with temporary_worktree(backing, task["repository"]["commit"], worktree_path, task["timeout_seconds"]) as worktree:
+        setup = run_setup_commands(
+            task=task,
+            worktree=worktree,
+            store_dir=store_dir,
+            raw_dir=raw_dir / "setup",
+            secrets=secrets,
+        )
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
         mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
         mutation_hash = sha256_bytes(mutation_diff)
@@ -649,6 +811,7 @@ def run_arm(
             "valid": agent_result_is_valid(agent),
             "correctness": not test_result.timed_out and test_result.returncode == 0,
             "agent": agent,
+            "setup": setup,
             "test": process_summary(test_result, test_output),
             "warmup": warmup,
             "mutation_diff_sha256": mutation_hash,
@@ -766,6 +929,7 @@ def task_manifest_entry(task: dict[str, Any]) -> dict[str, Any]:
         "repository": task["repository"],
         "mutation_patch_sha256": sha256_text(task["mutation_patch"]),
         "user_task_sha256": sha256_text(task["user_task"]),
+        "setup_commands_sha256": sha256_bytes(canonical_json_bytes(task["setup_commands"])),
         "test_command_sha256": sha256_bytes(canonical_json_bytes(task["test_command"])),
         "timeout_seconds": task["timeout_seconds"],
         "shared_user_prompt_sha256": sha256_text(shared_user_prompt(task)),
@@ -800,7 +964,7 @@ def save_checkpoint(
 
 
 def sanitized_failure_row(task_id: str, arm: str, error: Exception) -> dict[str, Any]:
-    return {
+    row = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "task_id": task_id,
         "arm": arm,
@@ -810,6 +974,9 @@ def sanitized_failure_row(task_id: str, arm: str, error: Exception) -> dict[str,
         "worktree_cleaned": True,
         "completed_at": utc_now(),
     }
+    if isinstance(error, SetupCommandError):
+        row["setup"] = error.summary
+    return row
 
 
 def build_base_manifest(
@@ -848,6 +1015,7 @@ def build_base_manifest(
                 "version": executable_version(greppy_bin),
             },
         },
+        "greppy_source": greppy_source_identity(),
         "platform": {
             "operating_system": platform.system(),
             "os_release": platform.release(),
@@ -875,6 +1043,14 @@ def build_base_manifest(
             "pi_config_per_arm": True,
             "worktree_cleanup_in_finally": True,
         },
+        "setup_contract": {
+            "required_task_field": True,
+            "direct_argv_without_shell": True,
+            "runs_in_each_fresh_preflight_and_arm_worktree": True,
+            "runs_before_mutation": True,
+            "provider_key_removed": True,
+            "excluded_from_agent_wall": True,
+        },
         "warm_greppy_outside_measurement": warm_greppy,
         "gate_preregistration": {
             "correctness": "one-sided exact McNemar; reject regression at p < 0.05",
@@ -894,11 +1070,13 @@ RESUME_IDENTITY_FIELDS = (
     "tools",
     "provider_extension",
     "executables",
+    "greppy_source",
     "platform",
     "task_file",
     "tasks",
     "prompt_contract",
     "isolation",
+    "setup_contract",
     "warm_greppy_outside_measurement",
     "gate_preregistration",
 )
@@ -1018,9 +1196,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             try:
                 backing = clone_pinned_repository(task, task_tmp)
                 preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task["id"], secrets)
-                if not preflight["valid"]:
-                    raise HarnessError("mutation preflight must fail the test without timing out")
                 base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
+                if not preflight["valid"]:
+                    raise HarnessError(
+                        "mutation preflight requires setup success, a clean-source test pass, "
+                        "and a mutated-source test failure without timeout"
+                    )
                 for arm in deterministic_arm_order(task["id"]):
                     if (task["id"], arm) in completed:
                         continue

@@ -1,0 +1,110 @@
+name: coding outcome benchmark release gate
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  benchmark:
+    name: paired edit and test outcomes
+    runs-on: macos-latest
+    timeout-minutes: 360
+    steps:
+      - name: Checkout exact candidate commit
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install pinned benchmark runtimes
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25.9.0'
+
+      - name: Install pinned Pi Code and pnpm
+        run: |
+          npm install --global \
+            @earendil-works/pi-coding-agent@0.80.2 \
+            pnpm@10.12.1
+          test "$(pi --version)" = "0.80.2"
+          test "$(pnpm --version)" = "10.12.1"
+
+      - name: Install pinned Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13.13'
+
+      - name: Install pinned Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21.0.11'
+
+      - name: Install pinned Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.2'
+
+      - name: Verify public task and harness contract
+        run: |
+          python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
+          python3 bench/agent_coding/run_benchmark.py \
+            --tasks bench/agent_coding/tasks_v1.json \
+            --validate-only
+
+      - name: Verify bundled inference assets
+        run: |
+          git lfs pull --include='crates/cli/assets/embeddinggemma-300m-q4k/*,crates/cli/assets/qwen35-0.8b-mtp-q4km/*'
+          python3 tools/verify_model_redistribution.py
+
+      - name: Build candidate binary with Metal
+        run: cargo build --release --bin greppy --features metal
+
+      - name: Run pre-registered coding outcome gate
+        env:
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          GREPPY_BENCH_BIN: ${{ github.workspace }}/target/release/greppy
+          RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
+        run: |
+          test -n "$MINIMAX_API_KEY"
+          python3 bench/agent_coding/run_benchmark.py \
+            --tasks bench/agent_coding/tasks_v1.json \
+            --greppy-bin "$GREPPY_BENCH_BIN" \
+            --warm-greppy \
+            --output-dir "$RUN_DIR" \
+            --run-id "github-$GITHUB_SHA"
+
+      - name: Package publishable evidence without raw traces
+        env:
+          RUN_DIR: ${{ runner.temp }}/greppy-coding-benchmark
+        run: |
+          mkdir -p publish
+          test -s "$RUN_DIR/MANIFEST.json"
+          test -s "$RUN_DIR/results.json"
+          test "$(jq -r .gate.passed "$RUN_DIR/MANIFEST.json")" = true
+          test "$(jq -r .greppy_source.git_commit "$RUN_DIR/MANIFEST.json")" = "$GITHUB_SHA"
+          test "$(jq -r .greppy_source.tracked_worktree_dirty "$RUN_DIR/MANIFEST.json")" = false
+          cp "$RUN_DIR/MANIFEST.json" "$RUN_DIR/results.json" publish/
+          tar -C publish -czf greppy-coding-benchmark.tar.gz .
+          shasum -a 256 greppy-coding-benchmark.tar.gz > greppy-coding-benchmark.tar.gz.sha256
+
+      - name: Attest coding benchmark evidence
+        uses: actions/attest@v4
+        with:
+          subject-path: greppy-coding-benchmark.tar.gz
+
+      - name: Upload coding benchmark evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: greppy-coding-benchmark-${{ github.sha }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            greppy-coding-benchmark.tar.gz
+            greppy-coding-benchmark.tar.gz.sha256

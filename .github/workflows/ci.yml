@@ -129,7 +129,11 @@ jobs:
         run: python3 -m unittest bench/agent_efficiency/test_grade_answers.py
 
       - name: paired coding benchmark harness
-        run: python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
+        run: |
+          python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
+          python3 bench/agent_coding/run_benchmark.py \
+            --tasks bench/agent_coding/tasks_v1.json \
+            --validate-only
 
       - name: model redistribution verifier tests
         run: python3 -m unittest tools/test_verify_model_redistribution.py

@@ -25,7 +25,17 @@ jobs:
           lfs: true
 
       - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.95.0
+
+      - name: Install pinned Pi Code runner
+        uses: actions/setup-node@v4
+        with:
+          node-version: '25.9.0'
+
+      - name: Verify pinned Pi Code runner
+        run: |
+          npm install --global @earendil-works/pi-coding-agent@0.80.2
+          test "$(pi --version)" = "0.80.2"
 
       - name: Verify task-bank shape
         run: |

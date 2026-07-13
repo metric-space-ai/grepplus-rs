@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import run_benchmark as bench
 
@@ -93,6 +96,165 @@ class WorktreeTests(GitFixture):
         self.assertFalse(worktree_path.exists())
         listing = git(self.root, "--git-dir", str(self.backing), "worktree", "list", "--porcelain")
         self.assertNotIn(str(worktree_path), listing)
+
+
+class SetupLifecycleTests(GitFixture):
+    PATCH = """diff --git a/value.txt b/value.txt
+--- a/value.txt
++++ b/value.txt
+@@ -1 +1 @@
+-old
++new
+"""
+
+    @staticmethod
+    def value_test_command() -> list[str]:
+        return [
+            sys.executable,
+            "-c",
+            "import pathlib,sys; sys.exit(0 if pathlib.Path('value.txt').read_text() == 'old\\n' else 1)",
+        ]
+
+    def task(self, *, setup_commands: list[list[str]] | None = None) -> dict[str, object]:
+        return {
+            "id": "setup-lifecycle",
+            "repository": {"url": str(self.source), "commit": self.commit},
+            "setup_commands": setup_commands if setup_commands is not None else [],
+            "mutation_patch": self.PATCH,
+            "user_task": "Restore the old value.",
+            "test_command": self.value_test_command(),
+            "timeout_seconds": 10,
+        }
+
+    def test_setup_nonzero_is_redacted_recorded_and_fails(self) -> None:
+        secret = "setup-output-secret"
+        task = self.task(
+            setup_commands=[
+                [
+                    sys.executable,
+                    "-c",
+                    "import os,sys; print(os.getenv('MINIMAX_API_KEY', 'api-missing')); "
+                    "print(os.getenv('BENCH_OUTPUT_SECRET', 'output-missing')); sys.exit(7)",
+                ]
+            ]
+        )
+        raw_dir = self.root / "raw-setup-failure"
+        with mock.patch.dict(
+            os.environ,
+            {"MINIMAX_API_KEY": "provider-key-must-not-leak", "BENCH_OUTPUT_SECRET": secret},
+        ):
+            with self.assertRaises(bench.SetupCommandError) as raised:
+                bench.run_setup_commands(
+                    task=task,
+                    worktree=self.source,
+                    store_dir=self.root / "failure-store",
+                    raw_dir=raw_dir,
+                    secrets=["provider-key-must-not-leak", secret],
+                )
+        summary = raised.exception.summary
+        self.assertFalse(summary["success"])
+        self.assertRegex(summary["summary_sha256"], r"^[0-9a-f]{64}$")
+        self.assertEqual(summary["commands"][0]["return_code"], 7)
+        self.assertRegex(summary["commands"][0]["status_sha256"], r"^[0-9a-f]{64}$")
+        self.assertRegex(summary["commands"][0]["output_sha256"], r"^[0-9a-f]{64}$")
+        output = (raw_dir / "setup-00.log").read_text(encoding="utf-8")
+        self.assertIn("api-missing", output)
+        self.assertIn("<redacted>", output)
+        self.assertNotIn(secret, output)
+        self.assertNotIn("provider-key-must-not-leak", output)
+        failure_row = bench.sanitized_failure_row("sample", "explorer", raised.exception)
+        self.assertEqual(failure_row["setup"], summary)
+
+    def test_setup_timeout_is_recorded_and_fails(self) -> None:
+        task = self.task(setup_commands=[[sys.executable, "-c", "pass"]])
+        timed_out = bench.ProcessResult(None, b"partial", b"", 1.0, True)
+        with mock.patch.object(bench, "run_process", return_value=timed_out):
+            with self.assertRaises(bench.SetupCommandError) as raised:
+                bench.run_setup_commands(
+                    task=task,
+                    worktree=self.source,
+                    store_dir=self.root / "timeout-store",
+                    raw_dir=self.root / "raw-setup-timeout",
+                    secrets=[],
+                )
+        self.assertTrue(raised.exception.summary["commands"][0]["timed_out"])
+        self.assertIsNone(raised.exception.summary["commands"][0]["return_code"])
+
+    def test_preflight_requires_clean_pass_then_mutated_failure(self) -> None:
+        task = self.task(setup_commands=[[sys.executable, "-c", "import pathlib; assert pathlib.Path('value.txt').read_text() == 'old\\n'"]])
+        preflight = bench.run_mutation_preflight(
+            task,
+            self.backing,
+            self.root / "valid-preflight",
+            self.root / "raw-valid-preflight",
+            [],
+        )
+        self.assertTrue(preflight["valid"])
+        self.assertTrue(preflight["setup"]["success"])
+        self.assertEqual(preflight["clean_test"]["return_code"], 0)
+        self.assertNotEqual(preflight["mutated_test"]["return_code"], 0)
+        self.assertRegex(preflight["mutation_diff_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_preflight_rejects_clean_source_test_failure_before_mutation(self) -> None:
+        task = self.task()
+        task["test_command"] = [sys.executable, "-c", "raise SystemExit(4)"]
+        preflight = bench.run_mutation_preflight(
+            task,
+            self.backing,
+            self.root / "invalid-preflight",
+            self.root / "raw-invalid-preflight",
+            [],
+        )
+        self.assertFalse(preflight["valid"])
+        self.assertEqual(preflight["failure_kind"], "clean_source_test_failed")
+        self.assertEqual(preflight["clean_test"]["return_code"], 4)
+        self.assertIsNone(preflight["mutated_test"])
+        self.assertNotIn("mutation_diff_sha256", preflight)
+
+    def test_arm_setup_precedes_mutation_and_is_excluded_from_agent_wall(self) -> None:
+        setup = [
+            sys.executable,
+            "-c",
+            "import pathlib,time; assert pathlib.Path('value.txt').read_text() == 'old\\n'; time.sleep(0.2)",
+        ]
+        task = self.task(setup_commands=[setup])
+        preflight = bench.run_mutation_preflight(
+            task,
+            self.backing,
+            self.root / "timing-preflight",
+            self.root / "raw-timing-preflight",
+            [],
+        )
+        self.assertTrue(preflight["valid"])
+
+        agent_metrics = {
+            "wall_seconds": 0.01,
+            "success": True,
+            "turns": 1,
+            "reported_error": False,
+            "tool_calls": 0,
+            "source_opens": 0,
+            "input_tokens": 1,
+            "output_tokens": 1,
+        }
+        agent_process = bench.ProcessResult(0, b"", b"", 0.01, False)
+        with mock.patch.object(bench, "run_pi_agent", return_value=(agent_metrics, agent_process)):
+            row = bench.run_arm(
+                arm="explorer",
+                task=task,
+                backing=self.backing,
+                task_tmp=self.root / "timed-arm",
+                raw_dir=self.root / "raw-timed-arm",
+                pi_bin=pathlib.Path(sys.executable),
+                greppy_bin=pathlib.Path(sys.executable),
+                warm_greppy=False,
+                expected_mutation_hash=preflight["mutation_diff_sha256"],
+                secrets=["not-logged"],
+            )
+        self.assertTrue(row["setup"]["excluded_from_agent_wall"])
+        self.assertGreaterEqual(row["setup"]["wall_seconds"], 0.15)
+        self.assertEqual(row["agent"]["wall_seconds"], 0.01)
+        self.assertTrue(row["valid"])
 
 
 def result_row(
@@ -214,6 +376,7 @@ class ContractTests(unittest.TestCase):
             task = {
                 "id": "sample",
                 "repository": {"url": "https://example.invalid/repo.git", "commit": "a" * 40},
+                "setup_commands": [["python3", "-m", "pip", "install", "-e", "."]],
                 "mutation_patch": "diff --git a/a b/a\n",
                 "user_task": "Fix it.",
                 "test_command": ["true"],
@@ -233,6 +396,17 @@ class ContractTests(unittest.TestCase):
             )
             self.assertEqual(manifest["executables"]["pi"]["version"], "fake-tool 1.2.3")
             self.assertEqual(manifest["executables"]["greppy"]["version"], "fake-tool 1.2.3")
+            self.assertRegex(manifest["greppy_source"]["git_commit"], r"^[0-9a-f]{40}$")
+            self.assertIsInstance(manifest["greppy_source"]["tracked_worktree_dirty"], bool)
+            self.assertIn("greppy_source", bench.RESUME_IDENTITY_FIELDS)
+            self.assertTrue(manifest["platform"]["operating_system"])
+            self.assertTrue(manifest["platform"]["architecture"])
+            self.assertRegex(manifest["tasks"][0]["setup_commands_sha256"], r"^[0-9a-f]{64}$")
+            self.assertIn("setup_contract", bench.RESUME_IDENTITY_FIELDS)
+            changed_setup = json.loads(json.dumps(manifest))
+            changed_setup["tasks"][0]["setup_commands_sha256"] = "0" * 64
+            with self.assertRaisesRegex(bench.HarnessError, "tasks"):
+                bench.validate_resume_identity(manifest, changed_setup)
 
     def test_resume_rejects_changed_identity_and_duplicate_rows(self) -> None:
         current = {field: {"value": field} for field in bench.RESUME_IDENTITY_FIELDS}
@@ -252,8 +426,6 @@ class ContractTests(unittest.TestCase):
             bench.validate_resume_rows([row, dict(row)], ["sample"])
         with self.assertRaisesRegex(bench.HarnessError, "selected task set"):
             bench.validate_resume_rows([{**row, "task_id": "other"}], ["sample"])
-            self.assertTrue(manifest["platform"]["operating_system"])
-            self.assertTrue(manifest["platform"]["architecture"])
 
     def test_schema_and_runtime_validator_agree_on_minimal_task(self) -> None:
         schema = json.loads((bench.HERE / "task.schema.json").read_text(encoding="utf-8"))
@@ -264,6 +436,7 @@ class ContractTests(unittest.TestCase):
                 {
                     "id": "sample",
                     "repository": {"url": "/tmp/repo", "commit": "a" * 40},
+                    "setup_commands": [],
                     "mutation_patch": "diff --git a/a b/a\n",
                     "user_task": "Fix the regression.",
                     "test_command": ["python3", "-m", "unittest"],
@@ -272,6 +445,26 @@ class ContractTests(unittest.TestCase):
             ],
         }
         self.assertEqual(bench.validate_task_document(document)[0]["id"], "sample")
+        setup_schema = schema["$defs"]["task"]["properties"]["setup_commands"]
+        self.assertEqual(setup_schema["items"]["type"], "array")
+        self.assertEqual(setup_schema["items"]["minItems"], 1)
+
+    def test_setup_commands_reject_shell_strings_and_empty_argv(self) -> None:
+        task = {
+            "id": "sample",
+            "repository": {"url": "/tmp/repo", "commit": "a" * 40},
+            "setup_commands": ["python3 -m pip install -e ."],
+            "mutation_patch": "diff --git a/a b/a\n",
+            "user_task": "Fix the regression.",
+            "test_command": ["python3", "-m", "unittest"],
+            "timeout_seconds": 60,
+        }
+        document = {"schema_version": bench.TASK_SCHEMA_VERSION, "tasks": [task]}
+        with self.assertRaisesRegex(bench.HarnessError, "non-empty argv array"):
+            bench.validate_task_document(document)
+        task["setup_commands"] = [[]]
+        with self.assertRaisesRegex(bench.HarnessError, "non-empty argv array"):
+            bench.validate_task_document(document)
 
     def test_secret_redaction_and_metric_parsing(self) -> None:
         secret = "sk-never-log-this"

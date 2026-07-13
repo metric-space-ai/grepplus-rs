@@ -27,6 +27,7 @@
       "required": [
         "id",
         "repository",
+        "setup_commands",
         "mutation_patch",
         "user_task",
         "test_command",
@@ -62,6 +63,18 @@
           "minLength": 1,
           "description": "A git-apply-compatible patch that makes the independent test fail."
         },
+        "setup_commands": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "description": "Ordered setup argv arrays executed directly, without a shell, before mutation in every fresh worktree."
+        },
         "user_task": {
           "type": "string",
           "minLength": 1
@@ -79,7 +92,7 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 7200,
-          "description": "Per clone, agent, warmup, test, and Git operation timeout."
+          "description": "Per clone, setup command, agent, warmup, test, and Git operation timeout."
         }
       }
     }
