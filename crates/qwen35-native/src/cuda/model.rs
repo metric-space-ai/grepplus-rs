@@ -30,7 +30,7 @@ use greppy_embed_native::cuda::ffi::gp_mmvq_quantize;
 
 use crate::inventory::Qwen35Inventory;
 use crate::sampler::{sample_token, GenerationParams, SamplerRng};
-use crate::{Error, Result};
+use crate::{Error, MtpGenerationOutput, MtpRunOptions, Result};
 
 pub struct CudaQwen35Model {
     dev: CudaDevice,
@@ -196,9 +196,39 @@ impl CudaQwen35Model {
             return Ok(String::new());
         }
         if self.inventory.has_mtp() {
-            return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
+            let output =
+                self.generate_with_mtp(prompt, prompt_ids, params, MtpRunOptions::production())?;
+            return tokenizer
+                .decode(&output.token_ids, true)
+                .map_err(|error| Error::Tokenizer(error.to_string()));
         }
         self.generate_target_only(tokenizer, prompt, prompt_ids, params)
+    }
+
+    pub(crate) fn diagnostic_target_prefill(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<std::time::Duration> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidRequest("empty diagnostic prefill".into()));
+        }
+        let mut state = self.new_forward_state(token_ids.len())?;
+        let mut final_chunk_hidden = Vec::new();
+        let started = std::time::Instant::now();
+        for tokens in token_ids.chunks(CUDA_PREFILL_BATCH_ROWS) {
+            final_chunk_hidden = self.prefill_tokens_hidden(tokens, &mut state)?;
+        }
+        let final_rows = token_ids.len().min(CUDA_PREFILL_BATCH_ROWS);
+        let _ = self.target_from_prefilled_hidden(&final_chunk_hidden, final_rows)?;
+        Ok(started.elapsed())
+    }
+
+    pub(crate) fn diagnostic_generate_mtp(
+        &self,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<MtpGenerationOutput> {
+        self.generate_with_mtp("", prompt_ids, params, MtpRunOptions::diagnostic())
     }
 
     #[cfg(test)]
@@ -265,31 +295,26 @@ impl CudaQwen35Model {
 
     fn generate_with_mtp(
         &self,
-        tokenizer: &Tokenizer,
         prompt: &str,
         prompt_ids: &[u32],
         params: GenerationParams,
-    ) -> Result<String> {
+        options: MtpRunOptions,
+    ) -> Result<MtpGenerationOutput> {
         let max_context = prompt_ids
             .len()
             .saturating_add(params.max_tokens)
             .saturating_add(1)
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
-        let mut perf = crate::MtpPerfTimer::new();
+        let mut perf = crate::MtpPerfTimer::new(options.capture_telemetry);
         let mut target_state = self.new_forward_state(max_context)?;
         let mut target_workspace = self.new_forward_workspace(max_context)?;
         let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
         perf.begin_target_prefill();
-        for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(CUDA_PREFILL_BATCH_ROWS) {
+        for tokens in prompt_ids.chunks(CUDA_PREFILL_BATCH_ROWS) {
             prompt_hidden.extend(self.prefill_tokens_hidden(tokens, &mut target_state)?);
         }
-        let mut target = self.forward_token_logits_hidden_graph(
-            *prompt_ids.last().expect("checked non-empty above"),
-            &mut target_state,
-            &mut target_workspace,
-        )?;
-        prompt_hidden.extend_from_slice(&target.hidden);
+        let mut target = self.target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())?;
         perf.finish_target_prefill();
 
         let zero_hidden = vec![0.0f32; hidden_size];
@@ -310,10 +335,18 @@ impl CudaQwen35Model {
         let mut generated = Vec::with_capacity(params.max_tokens);
         let mut rng = SamplerRng::new(prompt_seed(prompt));
         let Some(first) = sample_token(&mut target.logits, &generated, params, &mut rng) else {
-            return Ok(String::new());
+            let telemetry = perf.finish("cuda", prompt_ids.len(), 0, 0, 0, 0, false);
+            return Ok(MtpGenerationOutput {
+                token_ids: generated,
+                telemetry,
+            });
         };
-        if first == self.eos_token_id {
-            return Ok(String::new());
+        if options.stop_on_eos && first == self.eos_token_id {
+            let telemetry = perf.finish("cuda", prompt_ids.len(), 0, 0, 0, 0, false);
+            return Ok(MtpGenerationOutput {
+                token_ids: generated,
+                telemetry,
+            });
         }
         generated.push(first);
         let mtp_debug = std::env::var_os("GREPPY_QWEN35_MTP_DEBUG").is_some();
@@ -338,7 +371,7 @@ impl CudaQwen35Model {
                 let Some(token) = sample_token(&mut logits, &generated, params, &mut rng) else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -357,7 +390,7 @@ impl CudaQwen35Model {
                 else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -390,7 +423,7 @@ impl CudaQwen35Model {
                     break;
                 };
                 draft_tokens.push(token);
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 draft_history.push(token);
@@ -410,7 +443,7 @@ impl CudaQwen35Model {
                 else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -447,7 +480,7 @@ impl CudaQwen35Model {
                     finished = true;
                     break;
                 };
-                if target_token == self.eos_token_id {
+                if options.stop_on_eos && target_token == self.eos_token_id {
                     finished = true;
                     break;
                 }
@@ -489,7 +522,7 @@ impl CudaQwen35Model {
                 else {
                     break;
                 };
-                if target_token == self.eos_token_id {
+                if options.stop_on_eos && target_token == self.eos_token_id {
                     break;
                 }
                 generated.push(target_token);
@@ -538,7 +571,7 @@ impl CudaQwen35Model {
                 "qwen35-mtp-debug backend=cuda cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
             );
         }
-        perf.report(
+        let telemetry = perf.finish(
             "cuda",
             prompt_ids.len(),
             generated.len(),
@@ -547,9 +580,10 @@ impl CudaQwen35Model {
             accepted_total,
             mtp_fallback,
         );
-        tokenizer
-            .decode(&generated, true)
-            .map_err(|error| Error::Tokenizer(error.to_string()))
+        Ok(MtpGenerationOutput {
+            token_ids: generated,
+            telemetry,
+        })
     }
 
     pub fn new_forward_state(&self, max_context: usize) -> Result<CudaForwardState> {
@@ -712,10 +746,11 @@ impl CudaQwen35Model {
         ws: &mut CudaForwardWorkspace,
     ) -> Result<Vec<f32>> {
         self.prepare_decode_graph_mode(state, CudaDecodeGraphMode::Logits);
-        if state.decode_graph.is_none() && !state.graph_unavailable {
-            if self.capture_logits_graph(token, state, ws).is_err() {
-                state.graph_unavailable = true;
-            }
+        if state.decode_graph.is_none()
+            && !state.graph_unavailable
+            && self.capture_logits_graph(token, state, ws).is_err()
+        {
+            state.graph_unavailable = true;
         }
         if state.graph_unavailable {
             self.forward_token_logits_device(token, state, ws)?;
@@ -764,6 +799,38 @@ impl CudaQwen35Model {
         let logits = self.forward_token_logits(token, state, ws)?;
         let mut hidden = vec![0.0f32; self.inventory.hidden_size];
         self.dev.copy_d2h(&mut hidden, &ws.hidden)?;
+        Ok(CudaTargetForwardOutput { hidden, logits })
+    }
+
+    fn target_from_prefilled_hidden(
+        &self,
+        hidden_rows: &[f32],
+        rows: usize,
+    ) -> Result<CudaTargetForwardOutput> {
+        let hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
+        let src = self.upload_pod(&hidden)?;
+        let normed = self.new_f32(self.inventory.hidden_size)?;
+        let logits_device = self.new_f32(self.inventory.vocab_size)?;
+        let q8_scratch = self.new_bytes(q8_1_scratch_bytes(self.inventory.hidden_size, 1))?;
+        self.rms_norm_device(
+            "output_norm.weight",
+            src.as_f32(),
+            normed.as_f32(),
+            1,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        self.matvec_device_to(
+            "token_embd.weight",
+            normed.as_f32(),
+            self.inventory.hidden_size,
+            logits_device.as_f32(),
+            self.inventory.vocab_size,
+            &q8_scratch,
+        )?;
+        self.dev.sync()?;
+        let mut logits = vec![0.0f32; self.inventory.vocab_size];
+        self.dev.copy_d2h(&mut logits, &logits_device)?;
         Ok(CudaTargetForwardOutput { hidden, logits })
     }
 
@@ -1198,10 +1265,11 @@ impl CudaQwen35Model {
             )));
         }
         self.prepare_decode_graph_mode(state, CudaDecodeGraphMode::Greedy);
-        if state.decode_graph.is_none() && !state.graph_unavailable {
-            if self.capture_greedy_graph(token, state, ws).is_err() {
-                state.graph_unavailable = true;
-            }
+        if state.decode_graph.is_none()
+            && !state.graph_unavailable
+            && self.capture_greedy_graph(token, state, ws).is_err()
+        {
+            state.graph_unavailable = true;
         }
         if state.graph_unavailable {
             self.forward_token_logits_device(token, state, ws)?;
@@ -1672,14 +1740,14 @@ impl CudaQwen35Model {
         dim: usize,
         qwen_scale: bool,
     ) -> Result<Vec<f32>> {
-        if dim == 0 || input.len() % dim != 0 {
+        if dim == 0 || !input.len().is_multiple_of(dim) {
             return Err(Error::InvalidRequest(format!(
                 "{tensor_name} RMSNorm input len {} is not divisible by dim {dim}",
                 input.len()
             )));
         }
         let weight = self.weights.require(tensor_name)?;
-        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != [dim] {
             return Err(Error::Gguf(format!(
                 "{tensor_name} RMSNorm weight shape {:?} dtype {}, expected F32 [{dim}]",
                 weight.shape, weight.dtype
@@ -1732,7 +1800,7 @@ impl CudaQwen35Model {
             )));
         }
         let weight = self.weights.require(tensor_name)?;
-        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[values.len(), kernel] {
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != [values.len(), kernel] {
             return Err(Error::Gguf(format!(
                 "{tensor_name} conv weight shape {:?} dtype {}, expected F32 [{}, {kernel}]",
                 weight.shape,
@@ -1920,13 +1988,13 @@ impl CudaQwen35Model {
         let prefix = format!("blk.{layer}");
         let a_log = self.weights.require(&format!("{prefix}.ssm_a"))?;
         let dt_bias = self.weights.require(&format!("{prefix}.ssm_dt.bias"))?;
-        if a_log.dtype != GgmlDType::F32 || a_log.shape.as_slice() != &[heads] {
+        if a_log.dtype != GgmlDType::F32 || a_log.shape.as_slice() != [heads] {
             return Err(Error::Gguf(format!(
                 "{prefix}.ssm_a shape {:?} dtype {}, expected F32 [{heads}]",
                 a_log.shape, a_log.dtype
             )));
         }
-        if dt_bias.dtype != GgmlDType::F32 || dt_bias.shape.as_slice() != &[heads] {
+        if dt_bias.dtype != GgmlDType::F32 || dt_bias.shape.as_slice() != [heads] {
             return Err(Error::Gguf(format!(
                 "{prefix}.ssm_dt.bias shape {:?} dtype {}, expected F32 [{heads}]",
                 dt_bias.shape, dt_bias.dtype
@@ -2376,7 +2444,7 @@ impl CudaQwen35Model {
         qwen_scale: bool,
     ) -> Result<()> {
         let weight = self.weights.require(tensor_name)?;
-        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != [dim] {
             return Err(Error::Gguf(format!(
                 "{tensor_name} RMSNorm weight shape {:?} dtype {}, expected F32 [{dim}]",
                 weight.shape, weight.dtype
@@ -2417,7 +2485,7 @@ impl CudaQwen35Model {
         q8_scratch: &DeviceBuffer,
     ) -> Result<()> {
         let weight = self.weights.require(tensor_name)?;
-        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != [dim] {
             return Err(Error::Gguf(format!(
                 "{tensor_name} RMSNorm-Q8 weight shape {:?} dtype {}, expected F32 [{dim}]",
                 weight.shape, weight.dtype
@@ -2461,6 +2529,7 @@ impl CudaQwen35Model {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_rms_norm_device(
         &self,
         tensor_name: &str,
@@ -2472,7 +2541,7 @@ impl CudaQwen35Model {
         dim: usize,
     ) -> Result<()> {
         let weight = self.weights.require(tensor_name)?;
-        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != [dim] {
             return Err(Error::Gguf(format!(
                 "{tensor_name} add_rms_norm weight shape {:?} dtype {}, expected F32 [{dim}]",
                 weight.shape, weight.dtype
@@ -2507,7 +2576,7 @@ impl CudaQwen35Model {
         q8_scratch: &DeviceBuffer,
     ) -> Result<()> {
         let weight = self.weights.require(tensor_name)?;
-        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != &[dim] {
+        if weight.dtype != GgmlDType::F32 || weight.shape.as_slice() != [dim] {
             return Err(Error::Gguf(format!(
                 "{tensor_name} add_rms_norm-Q8 weight shape {:?} dtype {}, expected F32 [{dim}]",
                 weight.shape, weight.dtype
@@ -2645,7 +2714,7 @@ impl CudaQwen35Model {
             .weights
             .require(&format!("{prefix}.ssm_conv1d.weight"))?;
         if conv_weight.dtype != GgmlDType::F32
-            || conv_weight.shape.as_slice() != &[inner * 3, CONV_KERNEL]
+            || conv_weight.shape.as_slice() != [inner * 3, CONV_KERNEL]
         {
             return Err(Error::Gguf(format!(
                 "{prefix}.ssm_conv1d.weight shape {:?} dtype {}, expected F32 [{}, {}]",
@@ -2710,13 +2779,13 @@ impl CudaQwen35Model {
         )?;
         let a_log = self.weights.require(&format!("{prefix}.ssm_a"))?;
         let dt_bias = self.weights.require(&format!("{prefix}.ssm_dt.bias"))?;
-        if a_log.dtype != GgmlDType::F32 || a_log.shape.as_slice() != &[heads] {
+        if a_log.dtype != GgmlDType::F32 || a_log.shape.as_slice() != [heads] {
             return Err(Error::Gguf(format!(
                 "{prefix}.ssm_a shape {:?} dtype {}, expected F32 [{heads}]",
                 a_log.shape, a_log.dtype
             )));
         }
-        if dt_bias.dtype != GgmlDType::F32 || dt_bias.shape.as_slice() != &[heads] {
+        if dt_bias.dtype != GgmlDType::F32 || dt_bias.shape.as_slice() != [heads] {
             return Err(Error::Gguf(format!(
                 "{prefix}.ssm_dt.bias shape {:?} dtype {}, expected F32 [{heads}]",
                 dt_bias.shape, dt_bias.dtype
@@ -4727,20 +4796,12 @@ mod tests {
         let mut target_state = cuda
             .new_forward_state(max_context)
             .expect("CUDA MTP target state");
-        let mut prompt_hidden = cuda
-            .prefill_tokens_hidden(&ids[..ids.len() - 1], &mut target_state)
+        let prompt_hidden = cuda
+            .prefill_tokens_hidden(&ids, &mut target_state)
             .expect("CUDA MTP target prompt hidden");
-        let mut target_workspace = cuda
-            .new_forward_workspace(max_context)
-            .expect("CUDA MTP target workspace");
         let target = cuda
-            .forward_token_logits_hidden(
-                *ids.last().expect("non-empty CUDA MTP prompt"),
-                &mut target_state,
-                &mut target_workspace,
-            )
-            .expect("CUDA MTP target final row");
-        prompt_hidden.extend_from_slice(&target.hidden);
+            .target_from_prefilled_hidden(&prompt_hidden, ids.len())
+            .expect("CUDA MTP target projection");
         let first = greedy_argmax(&target.logits);
         assert_eq!(first, 10296, "unexpected CUDA MTP target token");
 
@@ -4856,17 +4917,17 @@ mod tests {
     ) {
         assert_eq!(state.len(), values.len() * kernel);
         assert_eq!(weights.len(), values.len() * kernel);
-        for channel in 0..values.len() {
+        for (channel, value) in values.iter_mut().enumerate() {
             let base = channel * kernel;
             for i in 0..kernel - 1 {
                 state[base + i] = state[base + i + 1];
             }
-            state[base + kernel - 1] = values[channel];
+            state[base + kernel - 1] = *value;
             let mut acc = 0.0f32;
             for i in 0..kernel {
                 acc += state[base + i] * weights[base + i];
             }
-            values[channel] = silu(acc);
+            *value = silu(acc);
         }
     }
 

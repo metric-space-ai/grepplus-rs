@@ -703,20 +703,21 @@ impl RmsNorm {
         }
         let mut out = vec![0.0f32; xs.len()];
         let rows = xs.len() / dim;
+        let use_f64 = std::env::var_os("EMBED_NATIVE_RMS_F64").is_some();
         if rows <= 32 {
             for (dst, src) in out.chunks_mut(dim).zip(xs.chunks(dim)) {
-                self.forward_row(src, dst, dim);
+                self.forward_row(src, dst, dim, use_f64);
             }
         } else {
             out.par_chunks_mut(dim)
                 .zip(xs.par_chunks(dim))
-                .for_each(|(dst, src)| self.forward_row(src, dst, dim));
+                .for_each(|(dst, src)| self.forward_row(src, dst, dim, use_f64));
         }
         Ok(out)
     }
 
-    fn forward_row(&self, src: &[f32], dst: &mut [f32], dim: usize) {
-        let denom = if std::env::var_os("EMBED_NATIVE_RMS_F64").is_some() {
+    fn forward_row(&self, src: &[f32], dst: &mut [f32], dim: usize, use_f64: bool) {
+        let denom = if use_f64 {
             (src.iter()
                 .map(|&v| f64::from(v) * f64::from(v))
                 .sum::<f64>()

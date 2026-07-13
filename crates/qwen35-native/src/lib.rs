@@ -35,6 +35,32 @@ pub use sampler::{
 };
 
 pub const MODEL_ID: &str = "greppy/qwen35-0.8b-function-purpose-mtp-q4km-2026-07-11";
+pub const DIAGNOSTIC_TARGET_PREFILL_TOKENS: usize = 512;
+pub const DIAGNOSTIC_MAX_OUTPUT_TOKENS: usize = 128;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticTargetPrefill {
+    pub input_tokens: usize,
+    pub elapsed: std::time::Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticMtpStats {
+    pub used: bool,
+    pub cycles: usize,
+    pub drafted_tokens: usize,
+    pub accepted_tokens: usize,
+    pub fallback: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiagnosticMtpGeneration {
+    pub output_token_ids: Vec<u32>,
+    pub target_prefill: std::time::Duration,
+    pub mtp_prefill: std::time::Duration,
+    pub decode: std::time::Duration,
+    pub mtp: DiagnosticMtpStats,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -53,6 +79,8 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub(crate) struct MtpPerfTimer {
+    enabled: bool,
+    report_enabled: bool,
     generation_started: Option<std::time::Instant>,
     stage_started: Option<std::time::Instant>,
     decode_started: Option<std::time::Instant>,
@@ -64,6 +92,33 @@ pub(crate) struct MtpPerfTimer {
     target_verify: std::time::Duration,
     target_replay: std::time::Duration,
     mtp_commit: std::time::Duration,
+}
+
+pub(crate) struct MtpGenerationOutput {
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) telemetry: Option<DiagnosticMtpGeneration>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MtpRunOptions {
+    pub(crate) capture_telemetry: bool,
+    pub(crate) stop_on_eos: bool,
+}
+
+impl MtpRunOptions {
+    pub(crate) const fn production() -> Self {
+        Self {
+            capture_telemetry: false,
+            stop_on_eos: true,
+        }
+    }
+
+    pub(crate) const fn diagnostic() -> Self {
+        Self {
+            capture_telemetry: true,
+            stop_on_eos: false,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -83,11 +138,12 @@ pub(crate) fn mtp_should_fallback(drafted: usize, accepted: usize) -> bool {
 }
 
 impl MtpPerfTimer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(capture_telemetry: bool) -> Self {
+        let report_enabled = std::env::var_os("GREPPY_QWEN35_MTP_PERF").is_some();
         Self {
-            generation_started: std::env::var_os("GREPPY_QWEN35_MTP_PERF")
-                .is_some()
-                .then(std::time::Instant::now),
+            enabled: capture_telemetry || report_enabled,
+            report_enabled,
+            generation_started: (capture_telemetry || report_enabled).then(std::time::Instant::now),
             stage_started: None,
             decode_started: None,
             target_prefill: std::time::Duration::ZERO,
@@ -102,7 +158,7 @@ impl MtpPerfTimer {
     }
 
     pub(crate) fn begin_target_prefill(&mut self) {
-        if self.generation_started.is_some() {
+        if self.enabled {
             self.stage_started = Some(std::time::Instant::now());
         }
     }
@@ -114,7 +170,7 @@ impl MtpPerfTimer {
     }
 
     pub(crate) fn begin_mtp_prefill(&mut self) {
-        if self.generation_started.is_some() {
+        if self.enabled {
             self.stage_started = Some(std::time::Instant::now());
         }
     }
@@ -127,7 +183,7 @@ impl MtpPerfTimer {
     }
 
     pub(crate) fn begin_stage(&self) -> Option<std::time::Instant> {
-        self.generation_started.map(|_| std::time::Instant::now())
+        self.enabled.then(std::time::Instant::now)
     }
 
     pub(crate) fn finish_stage(
@@ -150,7 +206,7 @@ impl MtpPerfTimer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn report(
+    pub(crate) fn finish(
         &self,
         backend: &str,
         input_tokens: usize,
@@ -159,31 +215,47 @@ impl MtpPerfTimer {
         drafted: usize,
         accepted: usize,
         fallback: bool,
-    ) {
+    ) -> Option<DiagnosticMtpGeneration> {
         let (Some(generation_started), Some(decode_started)) =
             (self.generation_started, self.decode_started)
         else {
-            return;
+            return None;
         };
         let input_s = (self.target_prefill + self.mtp_prefill).as_secs_f64();
-        let output_s = decode_started.elapsed().as_secs_f64();
+        let decode = decode_started.elapsed();
+        let output_s = decode.as_secs_f64();
         let count_f64 =
             |count: usize| f64::from(u32::try_from(count).expect("MTP performance count fits u32"));
         let input_tps = count_f64(input_tokens) / input_s.max(1.0e-9);
         let output_tps = count_f64(output_tokens) / output_s.max(1.0e-9);
         let acceptance = count_f64(accepted) / count_f64(drafted.max(1));
-        eprintln!(
-            "qwen35_mtp_perf backend={backend} input_tokens={input_tokens} target_prefill_s={:.6} mtp_prefill_s={:.6} input_s={input_s:.6} input_tok_s={input_tps:.2} output_tokens={output_tokens} output_s={output_s:.6} output_tok_s={output_tps:.2} cycles={cycles} drafted={drafted} accepted={accepted} acceptance={acceptance:.4} fallback={fallback} mtp_state_copy_s={:.6} draft_s={:.6} target_state_copy_s={:.6} target_verify_s={:.6} target_replay_s={:.6} mtp_commit_s={:.6} generation_s={:.6}",
-            self.target_prefill.as_secs_f64(),
-            self.mtp_prefill.as_secs_f64(),
-            self.mtp_state_copy.as_secs_f64(),
-            self.draft.as_secs_f64(),
-            self.target_state_copy.as_secs_f64(),
-            self.target_verify.as_secs_f64(),
-            self.target_replay.as_secs_f64(),
-            self.mtp_commit.as_secs_f64(),
-            generation_started.elapsed().as_secs_f64(),
-        );
+        if self.report_enabled {
+            eprintln!(
+                "qwen35_mtp_perf backend={backend} input_tokens={input_tokens} target_prefill_s={:.6} mtp_prefill_s={:.6} input_s={input_s:.6} input_tok_s={input_tps:.2} output_tokens={output_tokens} output_s={output_s:.6} output_tok_s={output_tps:.2} cycles={cycles} drafted={drafted} accepted={accepted} acceptance={acceptance:.4} fallback={fallback} mtp_state_copy_s={:.6} draft_s={:.6} target_state_copy_s={:.6} target_verify_s={:.6} target_replay_s={:.6} mtp_commit_s={:.6} generation_s={:.6}",
+                self.target_prefill.as_secs_f64(),
+                self.mtp_prefill.as_secs_f64(),
+                self.mtp_state_copy.as_secs_f64(),
+                self.draft.as_secs_f64(),
+                self.target_state_copy.as_secs_f64(),
+                self.target_verify.as_secs_f64(),
+                self.target_replay.as_secs_f64(),
+                self.mtp_commit.as_secs_f64(),
+                generation_started.elapsed().as_secs_f64(),
+            );
+        }
+        Some(DiagnosticMtpGeneration {
+            output_token_ids: Vec::new(),
+            target_prefill: self.target_prefill,
+            mtp_prefill: self.mtp_prefill,
+            decode,
+            mtp: DiagnosticMtpStats {
+                used: true,
+                cycles,
+                drafted_tokens: drafted,
+                accepted_tokens: accepted,
+                fallback,
+            },
+        })
     }
 }
 
@@ -202,5 +274,22 @@ mod mtp_tests {
         assert!(super::mtp_should_fallback(4, 2));
         assert!(super::mtp_should_fallback(4, 3));
         assert!(!super::mtp_should_fallback(4, 4));
+    }
+
+    #[test]
+    fn diagnostic_timer_returns_typed_mtp_metadata() {
+        let mut timer = super::MtpPerfTimer::new(true);
+        timer.begin_target_prefill();
+        timer.finish_target_prefill();
+        timer.begin_mtp_prefill();
+        timer.finish_input();
+        let telemetry = timer
+            .finish("test", 3, 2, 1, 2, 1, true)
+            .expect("diagnostic timer must return telemetry");
+        assert!(telemetry.mtp.used);
+        assert_eq!(telemetry.mtp.cycles, 1);
+        assert_eq!(telemetry.mtp.drafted_tokens, 2);
+        assert_eq!(telemetry.mtp.accepted_tokens, 1);
+        assert!(telemetry.mtp.fallback);
     }
 }

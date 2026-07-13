@@ -472,7 +472,7 @@ fn maybe_load_tensor_library(
 ) -> Option<Retained<ProtocolObject<dyn MTLLibrary>>> {
     let force_simdgroup = env_truthy("EMBED_NATIVE_METAL_FORCE_SIMDGROUP")
         || env_truthy("EMBED_NATIVE_METAL_FORCE_FALLBACK");
-    if !(supports_metal4 && !force_simdgroup) {
+    if !supports_metal4 || force_simdgroup {
         return None;
     }
 
@@ -831,6 +831,13 @@ pub fn global_device() -> Option<&'static Device> {
     GLOBAL_DEVICE.get_or_init(Device::default_system).as_ref()
 }
 
+// Tiny dead-code link to silence unused warnings in documentation builds.
+#[allow(dead_code)]
+fn _type_size_check() {
+    let _: Option<unsafe extern "C" fn() -> *mut c_void> = None;
+    let _ = CStr::from_bytes_with_nul(b"\0").ok();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,15 +859,4 @@ mod tests {
         };
         assert!(device.build_info().contains(expected));
     }
-}
-
-// ─── Tiny dead-code link to silence unused-warning ──────────────────
-
-#[allow(dead_code)]
-fn _type_size_check() {
-    // If the crate compiles this module at all, the Metal bindings
-    // are wired up correctly. Keep a dead reference to the FFI entry
-    // points so rust-analyzer / cargo doc both see them as live.
-    let _: Option<unsafe extern "C" fn() -> *mut c_void> = None;
-    let _ = CStr::from_bytes_with_nul(b"\0").ok();
 }

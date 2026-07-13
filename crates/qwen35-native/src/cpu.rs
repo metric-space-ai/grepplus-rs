@@ -18,7 +18,7 @@ use crate::simd_math::{
     exp_sum_shifted_in_place, mul_sigmoid_in_place, mul_silu_in_place, silu_in_place,
     swiglu_in_place,
 };
-use crate::{Error, Result};
+use crate::{Error, MtpGenerationOutput, MtpRunOptions, Result};
 
 const RMS_EPS: f32 = 1.0e-6;
 const ROPE_THETA: f32 = 10_000_000.0;
@@ -241,6 +241,35 @@ impl CpuQwen35Model {
             .install(|| self.generate_on_performance_cores(tokenizer, prompt, params))
     }
 
+    pub(crate) fn diagnostic_target_prefill(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<std::time::Duration> {
+        self.performance_pool.install(|| {
+            if token_ids.is_empty() {
+                return Err(Error::InvalidRequest("empty diagnostic prefill".into()));
+            }
+            let mut state = self.new_state(token_ids.len());
+            let mut final_chunk_hidden = Vec::new();
+            let started = std::time::Instant::now();
+            for tokens in token_ids.chunks(512) {
+                final_chunk_hidden = self.prefill_tokens_hidden(tokens, &mut state)?;
+            }
+            let final_rows = token_ids.len().min(512);
+            let _ = self.target_from_prefilled_hidden(&final_chunk_hidden, final_rows)?;
+            Ok(started.elapsed())
+        })
+    }
+
+    pub(crate) fn diagnostic_generate_mtp(
+        &self,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<MtpGenerationOutput> {
+        self.performance_pool
+            .install(|| self.generate_with_mtp("", prompt_ids, params, MtpRunOptions::diagnostic()))
+    }
+
     #[cfg(test)]
     pub(crate) fn generate_target_only_for_test(
         &self,
@@ -274,7 +303,11 @@ impl CpuQwen35Model {
             return Ok(String::new());
         }
         if self.mtp.is_some() {
-            return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
+            let output =
+                self.generate_with_mtp(prompt, prompt_ids, params, MtpRunOptions::production())?;
+            return tokenizer
+                .decode(&output.token_ids, true)
+                .map_err(|error| Error::Tokenizer(error.to_string()));
         }
         self.generate_without_mtp(tokenizer, prompt, prompt_ids, params)
     }
@@ -317,11 +350,11 @@ impl CpuQwen35Model {
 
     fn generate_with_mtp(
         &self,
-        tokenizer: &Tokenizer,
         prompt: &str,
         prompt_ids: &[u32],
         params: GenerationParams,
-    ) -> Result<String> {
+        options: MtpRunOptions,
+    ) -> Result<MtpGenerationOutput> {
         let max_context = prompt_ids
             .len()
             .saturating_add(params.max_tokens)
@@ -329,19 +362,15 @@ impl CpuQwen35Model {
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
         let vocab_size = self.inventory.vocab_size;
-        let mut perf = crate::MtpPerfTimer::new();
+        let mut perf = crate::MtpPerfTimer::new(options.capture_telemetry);
         let mut target_state = self.new_state(max_context);
         let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
         perf.begin_target_prefill();
-        for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(512) {
+        for tokens in prompt_ids.chunks(512) {
             let hidden = self.prefill_tokens_hidden(tokens, &mut target_state)?;
             prompt_hidden.extend(hidden);
         }
-        let mut target = self.forward_token_logits_hidden(
-            *prompt_ids.last().expect("checked non-empty above"),
-            &mut target_state,
-        )?;
-        prompt_hidden.extend_from_slice(&target.hidden);
+        let mut target = self.target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())?;
         perf.finish_target_prefill();
 
         let zero_hidden = vec![0.0f32; hidden_size];
@@ -362,10 +391,18 @@ impl CpuQwen35Model {
         let mut generated = Vec::with_capacity(params.max_tokens);
         let mut rng = SamplerRng::new(prompt_seed(prompt));
         let Some(first) = sample_token(&mut target.logits, &generated, params, &mut rng) else {
-            return Ok(String::new());
+            let telemetry = perf.finish("cpu", prompt_ids.len(), 0, 0, 0, 0, false);
+            return Ok(MtpGenerationOutput {
+                token_ids: generated,
+                telemetry,
+            });
         };
-        if first == self.eos_token_id {
-            return Ok(String::new());
+        if options.stop_on_eos && first == self.eos_token_id {
+            let telemetry = perf.finish("cpu", prompt_ids.len(), 0, 0, 0, 0, false);
+            return Ok(MtpGenerationOutput {
+                token_ids: generated,
+                telemetry,
+            });
         }
         generated.push(first);
         let mtp_debug = std::env::var_os("GREPPY_QWEN35_MTP_DEBUG").is_some();
@@ -390,7 +427,7 @@ impl CpuQwen35Model {
                 let Some(token) = sample_token(&mut logits, &generated, params, &mut rng) else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -405,7 +442,7 @@ impl CpuQwen35Model {
                 else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -438,7 +475,7 @@ impl CpuQwen35Model {
                     break;
                 };
                 draft_tokens.push(token);
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 draft_history.push(token);
@@ -454,7 +491,7 @@ impl CpuQwen35Model {
                 else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -486,7 +523,7 @@ impl CpuQwen35Model {
             else {
                 break;
             };
-            if first_target == self.eos_token_id {
+            if options.stop_on_eos && first_target == self.eos_token_id {
                 break;
             }
             if mtp_debug {
@@ -515,7 +552,7 @@ impl CpuQwen35Model {
                         perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
                         break;
                     };
-                    if target_token == self.eos_token_id {
+                    if options.stop_on_eos && target_token == self.eos_token_id {
                         finished = true;
                     } else {
                         generated.push(target_token);
@@ -532,7 +569,7 @@ impl CpuQwen35Model {
                         perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
                         break;
                     };
-                    if second_target == self.eos_token_id {
+                    if options.stop_on_eos && second_target == self.eos_token_id {
                         finished = true;
                     } else {
                         if mtp_debug {
@@ -560,7 +597,7 @@ impl CpuQwen35Model {
                                     perf.finish_stage(crate::MtpPerfStage::TargetVerify, stage);
                                     break;
                                 };
-                                if target_token == self.eos_token_id {
+                                if options.stop_on_eos && target_token == self.eos_token_id {
                                     finished = true;
                                 } else {
                                     generated.push(target_token);
@@ -623,7 +660,7 @@ impl CpuQwen35Model {
                 "qwen35-mtp-debug cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
             );
         }
-        perf.report(
+        let telemetry = perf.finish(
             "cpu",
             prompt_ids.len(),
             generated.len(),
@@ -632,9 +669,10 @@ impl CpuQwen35Model {
             accepted_total,
             mtp_fallback,
         );
-        tokenizer
-            .decode(&generated, true)
-            .map_err(|e| Error::Tokenizer(e.to_string()))
+        Ok(MtpGenerationOutput {
+            token_ids: generated,
+            telemetry,
+        })
     }
 
     pub(crate) fn new_state(&self, max_context: usize) -> ForwardState {
@@ -846,6 +884,18 @@ impl CpuQwen35Model {
         state: &mut ForwardState,
     ) -> Result<TargetForwardOutput> {
         let hidden = self.forward_token_hidden(token, state)?;
+        let mut output_hidden = hidden.clone();
+        rms_norm_qwen(&mut output_hidden, &self.output_norm);
+        let logits = self.token_embd.matmul(&output_hidden, 1)?;
+        Ok(TargetForwardOutput { hidden, logits })
+    }
+
+    pub(crate) fn target_from_prefilled_hidden(
+        &self,
+        hidden_rows: &[f32],
+        rows: usize,
+    ) -> Result<TargetForwardOutput> {
+        let hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
         let mut output_hidden = hidden.clone();
         rms_norm_qwen(&mut output_hidden, &self.output_norm);
         let logits = self.token_embd.matmul(&output_hidden, 1)?;

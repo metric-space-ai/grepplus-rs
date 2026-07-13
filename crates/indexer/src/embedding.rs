@@ -26,6 +26,7 @@ const MAX_DERIVED_DEF_LINES: usize = 400;
 const DEFAULT_EMBED_BATCH: usize = 16;
 const EMBED_BATCH_ENV: &str = "GREPPY_EMBED_BATCH";
 const EMBED_SCHEDULE_BATCHES: usize = 16;
+const MAX_BATCH_PADDING_FRACTION_DENOMINATOR: usize = 8;
 
 fn embed_batch_size() -> usize {
     parse_embed_batch_size(std::env::var(EMBED_BATCH_ENV).ok().as_deref())
@@ -157,6 +158,87 @@ pub struct EmbeddingIndexReport {
     pub stale_rows_pruned: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EmbeddingIndexProgress {
+    pub completed_documents: usize,
+    pub total_documents: usize,
+}
+
+/// Count definitions that can contribute one or more embedding documents.
+/// This cheap count is used before model load for an initial conservative ETA
+/// and for deciding whether foreground indexing should defer a large job.
+pub fn count_embedding_candidate_nodes(store: &Store, project: &str) -> Result<usize> {
+    const LABELS: &[&str] = &[
+        "Function",
+        "Method",
+        "Class",
+        "Interface",
+        "Type",
+        "Enum",
+        "Struct",
+        "Trait",
+        "TypeAlias",
+    ];
+    LABELS.iter().try_fold(0usize, |total, label| {
+        let count = store.count_nodes_by_label(project, label)?;
+        let count = usize::try_from(count)
+            .map_err(|_| Error::Store(format!("negative embedding node count for {label}")))?;
+        Ok(total.saturating_add(count))
+    })
+}
+
+/// Count the exact embedding documents for one graph generation without
+/// running inference. Long definitions can yield multiple documents, so a
+/// node count is not precise enough for progress and ETA reporting.
+pub fn count_code_embedding_documents_for_project(
+    store: &Store,
+    root: &Path,
+    project: &str,
+    provider: &dyn CodeEmbeddingProvider,
+    options: EmbeddingIndexOptions,
+) -> Result<usize> {
+    let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut offset = 0usize;
+    let mut total = 0usize;
+
+    loop {
+        let nodes = store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?;
+        if nodes.is_empty() {
+            break;
+        }
+        offset += nodes.len();
+
+        for node in nodes {
+            if !is_embedding_candidate_label(&node.label) {
+                continue;
+            }
+            let source = match cached_file_source(&mut file_cache, root, &node.file_path) {
+                Ok(Some(source)) => source,
+                Ok(None) | Err(_) => continue,
+            };
+            const MAX_EMBED_LINE_BYTES: usize = 2048;
+            if span_has_overlong_line(source, node.start_line, node.end_line, MAX_EMBED_LINE_BYTES)
+            {
+                continue;
+            }
+            let title = format!(
+                "{}:{}-{} {}",
+                node.file_path, node.start_line, node.end_line, node.qualified_name
+            );
+            let chunks = embedding_chunks(
+                source,
+                node.start_line,
+                node.end_line,
+                &title,
+                provider,
+                options.max_span_bytes,
+            )?;
+            total = total.saturating_add(chunks.len());
+        }
+    }
+    Ok(total)
+}
+
 /// Index vectors for all embeddable symbol nodes in `project`.
 pub fn index_code_embeddings_for_project(
     store: &mut Store,
@@ -164,6 +246,30 @@ pub fn index_code_embeddings_for_project(
     project: &str,
     provider: &mut dyn CodeEmbeddingProvider,
     options: EmbeddingIndexOptions,
+) -> Result<EmbeddingIndexReport> {
+    let mut ignore_progress = |_: EmbeddingIndexProgress| {};
+    index_code_embeddings_for_project_with_progress(
+        store,
+        root,
+        project,
+        provider,
+        options,
+        0,
+        &mut ignore_progress,
+    )
+}
+
+/// Index vectors while reporting completed inference documents. Callers that
+/// expose progress should obtain `total_documents` from
+/// [`count_code_embedding_documents_for_project`] first.
+pub fn index_code_embeddings_for_project_with_progress(
+    store: &mut Store,
+    root: &Path,
+    project: &str,
+    provider: &mut dyn CodeEmbeddingProvider,
+    options: EmbeddingIndexOptions,
+    total_documents: usize,
+    progress: &mut dyn FnMut(EmbeddingIndexProgress),
 ) -> Result<EmbeddingIndexReport> {
     let mut report = EmbeddingIndexReport::default();
     let mut file_cache: HashMap<String, Option<String>> = HashMap::new();
@@ -176,6 +282,10 @@ pub fn index_code_embeddings_for_project(
     // so the exact upsert fields are preserved on flush.
     let mut pending: Vec<PendingDoc> = Vec::with_capacity(schedule_window);
     let mut embedding_batch_failed = false;
+    progress(EmbeddingIndexProgress {
+        completed_documents: 0,
+        total_documents,
+    });
 
     loop {
         let nodes = store.list_nodes(project, "", "", offset, NODE_PAGE_SIZE)?;
@@ -257,6 +367,10 @@ pub fn index_code_embeddings_for_project(
                     })?;
                     report.nodes_embedded += 1;
                     report.nodes_reused += 1;
+                    progress(EmbeddingIndexProgress {
+                        completed_documents: report.nodes_embedded,
+                        total_documents,
+                    });
                     continue;
                 }
                 pending.push(PendingDoc {
@@ -275,6 +389,10 @@ pub fn index_code_embeddings_for_project(
                     )?;
                     report.nodes_embedded += flush.written;
                     embedding_batch_failed |= flush.failed;
+                    progress(EmbeddingIndexProgress {
+                        completed_documents: report.nodes_embedded,
+                        total_documents,
+                    });
                 }
             }
         }
@@ -290,6 +408,10 @@ pub fn index_code_embeddings_for_project(
         )?;
         report.nodes_embedded += flush.written;
         embedding_batch_failed |= flush.failed;
+        progress(EmbeddingIndexProgress {
+            completed_documents: report.nodes_embedded,
+            total_documents,
+        });
     }
 
     if embedding_batch_failed {
@@ -348,9 +470,13 @@ fn flush_embedding_batch(
     }
 
     pending.sort_by_key(|doc| doc.prompt_token_len);
+    let prompt_lengths = pending
+        .iter()
+        .map(|doc| doc.prompt_token_len)
+        .collect::<Vec<_>>();
+    let planned_batches = plan_adaptive_batches(&prompt_lengths, batch_size);
     let mut report = FlushEmbeddingBatchReport::default();
-    while !pending.is_empty() {
-        let batch_len = pending.len().min(batch_size);
+    for batch_len in planned_batches {
         let mut batch_docs = pending.drain(..batch_len).collect::<Vec<_>>();
         let bucket_report =
             flush_length_sorted_batch(store, provider, graph_generation, &mut batch_docs)?;
@@ -358,6 +484,45 @@ fn flush_embedding_batch(
         report.failed |= bucket_report.failed;
     }
     Ok(report)
+}
+
+/// Plan full batches where nearby lengths are cheap, but split a batch before
+/// padding adds more than 12.5% linear work or spans exceed a 1.5x length
+/// ratio. The latter also bounds the padded quadratic attention work.
+fn plan_adaptive_batches(sorted_lengths: &[usize], max_batch_size: usize) -> Vec<usize> {
+    let max_batch_size = max_batch_size.max(1);
+    let mut batches = Vec::new();
+    let mut start = 0usize;
+    while start < sorted_lengths.len() {
+        let mut end = start
+            .saturating_add(max_batch_size)
+            .min(sorted_lengths.len());
+        while end > start + 1 {
+            let shortest = sorted_lengths[start].max(1);
+            let longest = sorted_lengths[end - 1].max(1);
+            let actual_tokens = sorted_lengths[start..end]
+                .iter()
+                .try_fold(0usize, |sum, &length| sum.checked_add(length.max(1)));
+            let padded_tokens = longest.checked_mul(end - start);
+            let allowed_padding = actual_tokens.and_then(|actual| {
+                actual.checked_add(actual / MAX_BATCH_PADDING_FRACTION_DENOMINATOR)
+            });
+            let allowed_ratio = shortest
+                .checked_add(shortest / 2)
+                .is_some_and(|limit| longest <= limit);
+            if padded_tokens
+                .zip(allowed_padding)
+                .is_some_and(|(padded, allowed)| padded <= allowed)
+                && allowed_ratio
+            {
+                break;
+            }
+            end -= 1;
+        }
+        batches.push(end - start);
+        start = end;
+    }
+    batches
 }
 
 fn flush_length_sorted_batch(
@@ -1276,15 +1441,37 @@ mod tests {
         let mut store = store_with_project(&root);
         insert_node(&mut store, "p.huge", "huge", "Function", "src/lib.rs", 1, 1);
         let mut provider = TokenBudgetProvider::new(34);
-        let report = index_code_embeddings_for_project(
+        let options = EmbeddingIndexOptions::for_generation(9);
+        let total =
+            count_code_embedding_documents_for_project(&store, &root, "p", &provider, options)
+                .unwrap();
+        assert_eq!(total, chunks.len());
+        let mut progress = Vec::new();
+        let report = index_code_embeddings_for_project_with_progress(
             &mut store,
             &root,
             "p",
             &mut provider,
-            EmbeddingIndexOptions::for_generation(9),
+            options,
+            total,
+            &mut |value| progress.push(value),
         )
         .unwrap();
         assert_eq!(report.nodes_embedded, chunks.len());
+        assert_eq!(
+            progress.first(),
+            Some(&EmbeddingIndexProgress {
+                completed_documents: 0,
+                total_documents: chunks.len(),
+            })
+        );
+        assert_eq!(
+            progress.last(),
+            Some(&EmbeddingIndexProgress {
+                completed_documents: chunks.len(),
+                total_documents: chunks.len(),
+            })
+        );
         assert_eq!(
             store
                 .count_vector_embeddings(
@@ -1930,6 +2117,43 @@ pub fn next_definition() {
                 .unwrap();
             assert_eq!(hits[0].embedding.qualified_name, format!("p.varied_{i}"));
         }
+    }
+
+    #[test]
+    fn adaptive_batch_plan_bounds_padding_and_keeps_uniform_batches_full() {
+        let uniform = vec![128usize; DEFAULT_EMBED_BATCH * 2];
+        assert_eq!(
+            plan_adaptive_batches(&uniform, DEFAULT_EMBED_BATCH),
+            [16, 16]
+        );
+
+        let varied = [23usize, 29, 41, 80, 84, 91, 233, 240, 250, 480, 866];
+        let plan = plan_adaptive_batches(&varied, DEFAULT_EMBED_BATCH);
+        assert_eq!(plan.iter().sum::<usize>(), varied.len());
+        assert!(plan.len() > 1, "varied lengths were not split: {plan:?}");
+
+        let mut start = 0usize;
+        for batch_len in plan {
+            let batch = &varied[start..start + batch_len];
+            let actual = batch.iter().sum::<usize>();
+            let padded = batch.last().unwrap() * batch.len();
+            assert!(
+                padded <= actual + actual / MAX_BATCH_PADDING_FRACTION_DENOMINATOR,
+                "batch exceeds padding bound: {batch:?}"
+            );
+            assert!(
+                batch.last().unwrap() <= &(batch[0] + batch[0] / 2),
+                "batch exceeds length-ratio bound: {batch:?}"
+            );
+            start += batch_len;
+        }
+    }
+
+    #[test]
+    fn adaptive_batch_plan_honors_single_document_override() {
+        let lengths = [8usize, 8, 8, 8];
+        assert_eq!(plan_adaptive_batches(&lengths, 1), [1, 1, 1, 1]);
+        assert!(plan_adaptive_batches(&[], DEFAULT_EMBED_BATCH).is_empty());
     }
 
     /// The `GREPPY_EMBED_BATCH` override is honored and clamps to >= 1.

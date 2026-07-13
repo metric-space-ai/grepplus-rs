@@ -564,6 +564,96 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
 }
 
 #[test]
+fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() {
+    let (repo, store) = make_repo("semantic-index-progress", "semantic_progress_marker");
+    let (code, out, err) = run(&["index", "."], &repo, &store);
+    assert_eq!(code, 0, "index failed; stdout={out} stderr={err}");
+
+    let (code, out, err) = run(
+        &["semantic-search", "--json", "find semantic progress marker"],
+        &repo,
+        &store,
+    );
+    assert_eq!(
+        code, 75,
+        "an incomplete semantic generation must be retryable; stdout={out} stderr={err}"
+    );
+    assert!(err.is_empty(), "JSON status must stay on stdout: {err:?}");
+    let value: serde_json::Value = serde_json::from_str(&out).expect("semantic progress JSON");
+    assert_eq!(value["status"], "indexing");
+    assert_eq!(value["retryable"], true);
+    assert!(value["retry_after_seconds"].as_u64().is_some());
+    assert!(value["hits"].as_array().unwrap().is_empty());
+    assert!(
+        value["embedding_index"]["backend"].as_str().is_some(),
+        "selected CPU/GPU backend must be visible: {value:?}"
+    );
+    assert!(
+        value["embedding_index"]["eta_seconds"].as_u64().is_some(),
+        "the agent needs a completion estimate: {value:?}"
+    );
+
+    let job_path = find_graph_db(&store)
+        .expect("active graph")
+        .parent()
+        .unwrap()
+        .join("index.job");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while job_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        !job_path.exists(),
+        "fixture background index did not finish"
+    );
+
+    let db = find_graph_db(&store).expect("active graph after background index");
+    let graph = rusqlite::Connection::open(&db).expect("open graph for partial vector fixture");
+    let generation = graph
+        .query_row(
+            "SELECT graph_generation FROM workspace_state LIMIT 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap();
+    let model_id = value["model_id"].as_str().unwrap();
+    let mut vector = Vec::new();
+    vector.extend_from_slice(&1.0f32.to_le_bytes());
+    vector.extend_from_slice(&0.0f32.to_le_bytes());
+    graph
+        .execute(
+            "INSERT INTO vector_embeddings
+             (project, model_id, prompt_version, task, node_id, chunk_idx,
+              qualified_name, file_path, start_line, end_line, content_sha256,
+              graph_generation, dim, vector_norm, vector, created_at, vector_i8, i8_scale)
+             VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5, 'lib.rs', 1, 1, ?6,
+                     ?7, 2, 1.0, ?8, 'test', NULL, NULL)",
+            rusqlite::params![
+                "repo",
+                model_id,
+                greppy_embed_native::PROMPT_VERSION,
+                greppy_search::EMBEDDINGGEMMA_CODE_RETRIEVAL_PROFILE,
+                "repo.partial_semantic_progress_marker",
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                generation,
+                vector,
+            ],
+        )
+        .unwrap();
+    drop(graph);
+
+    let (code, out, err) = run(
+        &["semantic-search", "--json", "find semantic progress marker"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 75, "partial vectors must remain hidden; stderr={err}");
+    let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(value["status"], "indexing");
+    assert!(value["hits"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn provider_policy_require_complete_blocks_plus_vectors_before_model_config() {
     let (repo, store) = make_repo("provider-policy-plus-vector", "provider_policy_plus_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);

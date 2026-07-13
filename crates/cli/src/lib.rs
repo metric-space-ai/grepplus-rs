@@ -58,6 +58,10 @@ const ENV_PROVIDER_POLICY: &str = "GREPPY_PROVIDER_POLICY";
 const ENV_DISCOVER_INCLUDE: &str = "GREPPY_DISCOVER_INCLUDE";
 const ENV_DISCOVER_EXCLUDE: &str = "GREPPY_DISCOVER_EXCLUDE";
 const ENV_EXPAND_TTL_SECS: &str = "GREPPY_EXPAND_TTL_SECS";
+const ENV_LAZY_EMBED_MIN_SPANS: &str = "GREPPY_LAZY_EMBED_MIN_SPANS";
+const BACKGROUND_JOB_SCHEMA_VERSION: &str = "greppy.background-job.v2";
+const DEFAULT_LAZY_EMBED_CPU_SPANS: usize = 1_000;
+const DEFAULT_LAZY_EMBED_GPU_SPANS: usize = 5_000;
 #[cfg(debug_assertions)]
 const ENV_TEST_INDEX_FAILPOINT: &str = "GREPPY_TEST_INDEX_FAILPOINT";
 #[cfg(debug_assertions)]
@@ -3996,6 +4000,8 @@ fn try_auto_reindex_inline(root: Option<&str>) -> bool {
         &project,
         embedding_cfg.as_ref(),
         &options,
+        false,
+        None,
     )
     .map(|snapshot| snapshot.index.is_clean())
     .unwrap_or(false)
@@ -4076,7 +4082,7 @@ fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Re
     std::fs::create_dir_all(parent)
         .map_err(|error| Error::io(format!("create {}", parent.display()), error))?;
     let temp = parent.join(format!(
-        ".index.job.{}.{}.tmp",
+        ".background.job.{}.{}.tmp",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4085,9 +4091,14 @@ fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Re
     ));
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| Error::Invalid(format!("serialize background job: {error}")))?;
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&temp)
         .map_err(|error| Error::io(format!("create {}", temp.display()), error))?;
     file.write_all(&bytes)
@@ -4095,17 +4106,62 @@ fn write_background_job(path: &std::path::Path, value: &serde_json::Value) -> Re
     file.sync_all()
         .map_err(|error| Error::io(format!("sync {}", temp.display()), error))?;
     drop(file);
-    std::fs::rename(&temp, path)
+    replace_background_job_file(&temp, path)
         .map_err(|error| Error::io(format!("publish {}", path.display()), error))?;
     sync_parent_dir(path)?;
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn replace_background_job_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_background_job_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 struct BackgroundJobGuard {
     path: Option<std::path::PathBuf>,
     cause: String,
+    kind: String,
     started_at_unix_secs: u64,
     target_generation: u64,
+    backend: Option<String>,
+    device: Option<String>,
+    completed_documents: usize,
+    total_documents: usize,
+    eta_seconds: Option<u64>,
+    rate_milli_documents_per_second: Option<u64>,
+    embedding_started: Option<std::time::Instant>,
+    last_progress_write: Option<std::time::Instant>,
     complete: bool,
 }
 
@@ -4120,17 +4176,19 @@ impl BackgroundJobGuard {
             for _ in 0..100 {
                 if read_background_job(path)
                     .and_then(|job| job.get("pid").and_then(serde_json::Value::as_u64))
-                    == Some(std::process::id() as u64)
+                    == Some(u64::from(std::process::id()))
                 {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
         }
+        let published = path.as_deref().and_then(read_background_job);
         Self {
             path,
             cause: std::env::var("GREPPY_BACKGROUND_CAUSE")
                 .unwrap_or_else(|_| "background-refresh".into()),
+            kind: std::env::var("GREPPY_BACKGROUND_KIND").unwrap_or_else(|_| "index".into()),
             started_at_unix_secs: std::env::var("GREPPY_BACKGROUND_STARTED_AT")
                 .ok()
                 .and_then(|value| value.parse().ok())
@@ -4139,8 +4197,117 @@ impl BackgroundJobGuard {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0),
+            backend: published
+                .as_ref()
+                .and_then(|job| job.get("backend"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            device: published
+                .as_ref()
+                .and_then(|job| job.get("device"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToOwned::to_owned),
+            completed_documents: 0,
+            total_documents: published
+                .as_ref()
+                .and_then(|job| job.get("total_spans"))
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(0),
+            eta_seconds: published
+                .as_ref()
+                .and_then(|job| job.get("eta_seconds"))
+                .and_then(serde_json::Value::as_u64),
+            rate_milli_documents_per_second: None,
+            embedding_started: None,
+            last_progress_write: None,
             complete: false,
         }
+    }
+
+    fn is_background(&self) -> bool {
+        self.path.is_some()
+    }
+
+    fn embedding_loading(&mut self) {
+        self.write_state("loading_model", None);
+    }
+
+    fn embedding_started(&mut self, backend: &str, total_documents: usize) {
+        self.backend = Some(backend.to_string());
+        self.completed_documents = 0;
+        self.total_documents = total_documents;
+        let now = std::time::Instant::now();
+        self.embedding_started = Some(now);
+        self.rate_milli_documents_per_second = None;
+        self.eta_seconds = initial_embedding_eta_seconds(total_documents, backend);
+        self.write_state("embedding", None);
+        self.last_progress_write = Some(now);
+    }
+
+    fn embedding_progress(&mut self, progress: greppy_indexer::EmbeddingIndexProgress) {
+        self.completed_documents = progress.completed_documents;
+        self.total_documents = progress.total_documents;
+        if let Some(started) = self.embedding_started {
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis())
+                .unwrap_or(u64::MAX)
+                .max(1);
+            self.eta_seconds = observed_embedding_eta_seconds(
+                self.completed_documents,
+                self.total_documents,
+                elapsed_ms,
+            )
+            .or(self.eta_seconds);
+            self.rate_milli_documents_per_second =
+                observed_embedding_rate_milli(self.completed_documents, elapsed_ms);
+        }
+        let now = std::time::Instant::now();
+        let finished = self.total_documents > 0 && self.completed_documents >= self.total_documents;
+        let publish = finished
+            || self.last_progress_write.is_none_or(|last| {
+                now.duration_since(last) >= std::time::Duration::from_millis(500)
+            });
+        if publish {
+            self.write_state("embedding", None);
+            self.last_progress_write = Some(now);
+        }
+    }
+
+    fn write_state(&self, state: &str, last_error: Option<&str>) {
+        let Some(path) = &self.path else { return };
+        let now = unix_now_secs_cli();
+        let eta_unix_secs = self.eta_seconds.map(|eta| now.saturating_add(eta));
+        let eta_minutes = self.eta_seconds.map(|eta| eta.saturating_add(59) / 60);
+        let progress_milli_percent = if self.total_documents == 0 {
+            0
+        } else {
+            self.completed_documents
+                .min(self.total_documents)
+                .saturating_mul(100_000)
+                .checked_div(self.total_documents)
+                .unwrap_or(0)
+        };
+        let value = serde_json::json!({
+            "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+            "kind": self.kind,
+            "pid": std::process::id(),
+            "started_at_unix_secs": self.started_at_unix_secs,
+            "updated_at_unix_secs": now,
+            "cause": self.cause,
+            "target_generation": self.target_generation,
+            "state": state,
+            "backend": self.backend,
+            "device": self.device,
+            "completed_spans": self.completed_documents,
+            "total_spans": self.total_documents,
+            "progress_milli_percent": progress_milli_percent,
+            "rate_milli_spans_per_second": self.rate_milli_documents_per_second,
+            "eta_seconds": self.eta_seconds,
+            "eta_minutes": eta_minutes,
+            "eta_unix_secs": eta_unix_secs,
+            "last_error": last_error,
+        });
+        let _ = write_background_job(path, &value);
     }
 
     fn complete(&mut self) {
@@ -4152,16 +4319,7 @@ impl BackgroundJobGuard {
     }
 
     fn fail(&mut self, error: &Error) {
-        let Some(path) = &self.path else { return };
-        let value = serde_json::json!({
-            "pid": std::process::id(),
-            "started_at_unix_secs": self.started_at_unix_secs,
-            "cause": self.cause,
-            "target_generation": self.target_generation,
-            "state": "failed",
-            "last_error": error.to_string(),
-        });
-        let _ = write_background_job(path, &value);
+        self.write_state("failed", Some(&error.to_string()));
         self.complete = true;
     }
 }
@@ -4171,17 +4329,52 @@ impl Drop for BackgroundJobGuard {
         if self.complete {
             return;
         }
-        let Some(path) = &self.path else { return };
-        let value = serde_json::json!({
-            "pid": std::process::id(),
-            "started_at_unix_secs": self.started_at_unix_secs,
-            "cause": self.cause,
-            "target_generation": self.target_generation,
-            "state": "failed",
-            "last_error": "background index exited before successful publication",
-        });
-        let _ = write_background_job(path, &value);
+        self.write_state(
+            "failed",
+            Some("background index exited before successful publication"),
+        );
     }
+}
+
+fn initial_embedding_rate(backend: &str) -> u64 {
+    match backend {
+        "cuda" => 12,
+        "metal" => 8,
+        _ => 1,
+    }
+}
+
+fn initial_embedding_eta_seconds(total_documents: usize, backend: &str) -> Option<u64> {
+    let total = u64::try_from(total_documents).ok()?;
+    let rate = initial_embedding_rate(backend).max(1);
+    Some(total.saturating_add(rate - 1) / rate)
+}
+
+fn observed_embedding_eta_seconds(
+    completed_documents: usize,
+    total_documents: usize,
+    elapsed_ms: u64,
+) -> Option<u64> {
+    let completed = u64::try_from(completed_documents).ok()?;
+    let total = u64::try_from(total_documents).ok()?;
+    if completed == 0 {
+        return None;
+    }
+    let remaining = total.saturating_sub(completed);
+    let numerator = u128::from(remaining).saturating_mul(u128::from(elapsed_ms));
+    let denominator = u128::from(completed).saturating_mul(1_000);
+    let rounded = numerator.saturating_add(denominator.saturating_sub(1)) / denominator.max(1);
+    u64::try_from(rounded).ok()
+}
+
+fn observed_embedding_rate_milli(completed_documents: usize, elapsed_ms: u64) -> Option<u64> {
+    let completed = u64::try_from(completed_documents).ok()?;
+    if completed == 0 {
+        return None;
+    }
+    completed
+        .saturating_mul(1_000_000)
+        .checked_div(elapsed_ms.max(1))
 }
 
 fn unix_now_secs_cli() -> u64 {
@@ -4191,10 +4384,52 @@ fn unix_now_secs_cli() -> u64 {
         .unwrap_or(0)
 }
 
-/// Start at most one detached index refresh for a worktree. A spawn lock
-/// closes the cross-process race and the atomically published job record is
-/// the public status surface.
-fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
+fn embedding_backend_plan(cfg: &EmbeddingModelConfig) -> (String, Option<String>) {
+    let EmbeddingModelSource::Gguf { gguf, .. } = &cfg.source;
+    let model_bytes = std::fs::metadata(gguf)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let required = greppy_embed_native::estimated_gpu_memory(
+        greppy_embed_native::InferenceModelKind::EmbeddingGemma,
+        model_bytes,
+    );
+    let selector = inference_device_identity(&cfg.device);
+    let policy = greppy_embed_native::InferencePolicy::from_selector(Some(&selector), false);
+    let registry = policy.ok().map(|policy| {
+        greppy_embed_native::InferenceBackendRegistry::probe_policy(&policy, required)
+    });
+    let backend = registry
+        .as_ref()
+        .and_then(|registry| registry.selected_backend)
+        .map(greppy_embed_native::BackendKind::as_str)
+        .unwrap_or_else(|| cfg.device.as_str())
+        .to_string();
+    let device = registry
+        .and_then(|registry| registry.selected_device_id)
+        .or_else(|| (selector != "auto").then_some(selector));
+    (backend, device)
+}
+
+fn current_embedding_candidate_count(root: &std::path::Path) -> usize {
+    let project = workspace_locator::project_identity(root);
+    greppy_store::Store::open_with(
+        &workspace_locator::store_path(root),
+        greppy_store::OpenOptions::read_only(),
+    )
+    .ok()
+    .and_then(|store| greppy_indexer::count_embedding_candidate_nodes(&store, &project).ok())
+    .unwrap_or(0)
+}
+
+/// Start at most one detached refresh for a worktree. A spawn lock closes the
+/// cross-process race and the atomically published job record is the public
+/// progress surface used by semantic-search.
+fn spawn_background_job(
+    root: Option<&str>,
+    cause: &str,
+    kind: &str,
+    embedding_cfg: Option<&EmbeddingModelConfig>,
+) -> bool {
     let Ok(root) = resolve_root(root) else {
         return false;
     };
@@ -4214,7 +4449,8 @@ fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
         if job
             .get("pid")
             .and_then(serde_json::Value::as_u64)
-            .is_some_and(|pid| process_is_alive(pid as u32))
+            .and_then(|pid| u32::try_from(pid).ok())
+            .is_some_and(process_is_alive)
         {
             return true;
         }
@@ -4237,6 +4473,14 @@ fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
         return false;
     };
     let started_at = unix_now_secs_cli();
+    let (backend, device, total_spans, eta_seconds) = if let Some(cfg) = embedding_cfg {
+        let (backend, device) = embedding_backend_plan(cfg);
+        let total = current_embedding_candidate_count(&root);
+        let eta = initial_embedding_eta_seconds(total, &backend);
+        (Some(backend), device, total, eta)
+    } else {
+        (None, None, 0, None)
+    };
     let mut command = std::process::Command::new(exe);
     command
         .arg("index")
@@ -4245,6 +4489,7 @@ fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
         .arg(&root)
         .env("GREPPY_BACKGROUND_JOB", &job_path)
         .env("GREPPY_BACKGROUND_CAUSE", cause)
+        .env("GREPPY_BACKGROUND_KIND", kind)
         .env("GREPPY_BACKGROUND_STARTED_AT", started_at.to_string())
         .env(
             "GREPPY_BACKGROUND_TARGET_GENERATION",
@@ -4253,26 +4498,187 @@ fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    if let Some(cfg) = embedding_cfg {
+        command.env(ENV_DEVICE, inference_device_identity(&cfg.device));
+    }
     let Ok(child) = command.spawn() else {
         return false;
     };
+    let eta_unix_secs = eta_seconds.map(|eta| started_at.saturating_add(eta));
+    let eta_minutes = eta_seconds.map(|eta| eta.saturating_add(59) / 60);
     let value = serde_json::json!({
+        "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+        "kind": kind,
         "pid": child.id(),
         "started_at_unix_secs": started_at,
+        "updated_at_unix_secs": started_at,
         "cause": cause,
         "target_generation": target_generation,
-        "state": "refreshing",
+        "state": if kind == "embedding" { "starting" } else { "refreshing" },
+        "backend": backend,
+        "device": device,
+        "completed_spans": 0,
+        "total_spans": total_spans,
+        "progress_milli_percent": 0,
+        "rate_milli_spans_per_second": serde_json::Value::Null,
+        "eta_seconds": eta_seconds,
+        "eta_minutes": eta_minutes,
+        "eta_unix_secs": eta_unix_secs,
         "last_error": serde_json::Value::Null,
     });
     write_background_job(&job_path, &value).is_ok()
 }
 
-/// Kick off `grep index <root>` as a detached child so the
-/// semantic index builds in the background (P11). The current binary
-/// carries the embedded model, so no env is needed. Best-effort: a failure
-/// to spawn just means the next query heals inline instead.
-fn spawn_background_embed(root: Option<&str>) {
-    let _ = spawn_background_index(root, "embedding-first-use");
+fn spawn_background_index(root: Option<&str>, cause: &str) -> bool {
+    spawn_background_job(root, cause, "index", None)
+}
+
+/// Kick off the complete atomic graph + embedding snapshot as a detached
+/// child. The resolved inference policy is propagated so explicit CPU/Metal/
+/// CUDA choices and automatic GPU priority remain identical in the child.
+fn spawn_background_embed(root: Option<&str>, cfg: &EmbeddingModelConfig) -> bool {
+    spawn_background_job(root, "embedding-first-use", "embedding", Some(cfg))
+}
+
+fn embedding_generation_complete(
+    store: &greppy_store::Store,
+    project: &str,
+    graph_generation: u64,
+    model_id: &str,
+) -> bool {
+    let key = embedding_complete_key(project);
+    store
+        .conn()
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = ?1",
+            [&key],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        == Some(format!("{graph_generation}|{model_id}"))
+}
+
+fn embedding_progress_value(
+    root: &std::path::Path,
+    cfg: &EmbeddingModelConfig,
+    graph_generation: u64,
+) -> serde_json::Value {
+    if let Some(mut job) = read_background_job(&background_job_path(root)) {
+        let alive = job
+            .get("pid")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|pid| u32::try_from(pid).ok())
+            .is_some_and(process_is_alive);
+        job["alive"] = serde_json::json!(alive);
+        job["graph_generation"] = serde_json::json!(graph_generation);
+        return job;
+    }
+
+    let (backend, device) = embedding_backend_plan(cfg);
+    let total_spans = current_embedding_candidate_count(root);
+    let eta_seconds = initial_embedding_eta_seconds(total_spans, &backend);
+    let now = unix_now_secs_cli();
+    serde_json::json!({
+        "schema_version": BACKGROUND_JOB_SCHEMA_VERSION,
+        "kind": "embedding",
+        "state": "starting",
+        "alive": false,
+        "backend": backend,
+        "device": device,
+        "graph_generation": graph_generation,
+        "completed_spans": 0,
+        "total_spans": total_spans,
+        "progress_milli_percent": 0,
+        "rate_milli_spans_per_second": serde_json::Value::Null,
+        "eta_seconds": eta_seconds,
+        "eta_minutes": eta_seconds.map(|eta| eta.saturating_add(59) / 60),
+        "eta_unix_secs": eta_seconds.map(|eta| now.saturating_add(eta)),
+        "last_error": serde_json::Value::Null,
+    })
+}
+
+fn format_embedding_eta(seconds: u64) -> String {
+    let minutes = seconds / 60;
+    let remainder = seconds % 60;
+    if minutes == 0 {
+        format!("{remainder}s")
+    } else if remainder == 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{minutes}m {remainder}s")
+    }
+}
+
+fn embedding_progress_text(progress: &serde_json::Value) -> String {
+    let backend = progress
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("cpu");
+    let completed = progress
+        .get("completed_spans")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let total = progress
+        .get("total_spans")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let counts = if total == 0 {
+        String::new()
+    } else {
+        format!(" ({completed}/{total} spans)")
+    };
+    if let Some(eta) = progress
+        .get("eta_seconds")
+        .and_then(serde_json::Value::as_u64)
+    {
+        format!(
+            "semantic-search: semantic index is building on {backend}{counts}; semantic results will be available in about {}.",
+            format_embedding_eta(eta)
+        )
+    } else {
+        format!(
+            "semantic-search: semantic index is building on {backend}{counts}; completion time is being measured."
+        )
+    }
+}
+
+fn semantic_embedding_indexing_json(
+    project: &str,
+    cfg: &EmbeddingModelConfig,
+    graph_generation: u64,
+    freshness: &serde_json::Value,
+    progress: &serde_json::Value,
+) -> Result<()> {
+    let eta_seconds = progress
+        .get("eta_seconds")
+        .and_then(serde_json::Value::as_u64);
+    let retry_after_seconds = eta_seconds.map(|eta| eta.clamp(5, 30)).unwrap_or(10);
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema_version": SEMANTIC_JSON_SCHEMA_VERSION,
+            "command": "semantic-search",
+            "mode": "vector",
+            "status": "indexing",
+            "project": project,
+            "model_id": cfg.model_id,
+            "prompt_version": greppy_embed_native::PROMPT_VERSION,
+            "task_profile": greppy_embed_native::CODE_RETRIEVAL_PROFILE,
+            "graph_generation": graph_generation,
+            "fresh": freshness_json_is_fresh(freshness),
+            "freshness": freshness,
+            "retryable": true,
+            "retry_after_seconds": retry_after_seconds,
+            "embedding_index": progress,
+            "total_exact": 0,
+            "shown": 0,
+            "omitted": 0,
+            "truncated": false,
+            "hits": [],
+        }))
+        .map_err(|error| Error::Invalid(format!("serialize semantic indexing JSON: {error}")))?
+    );
+    Ok(())
 }
 
 /// Read one source line (1-based) for the grep-shaped call-site rows the
@@ -9763,15 +10169,16 @@ fn dispatch_semantic(
     let cfg = embedding_config_for_required_use(embedding_args)?;
     {
         let generation = current_graph_generation(&store, root)?;
-        let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
-            &project,
-            &cfg.model_id,
-            Some(generation),
-            SEMANTIC_VECTOR_CANDIDATE_LIMIT,
-        );
-        let total = greppy_search::count_vector_search_scope(&store, &scope)?;
         let candidate_limit = vector_exact_candidate_limit()?;
         if !freshness_json_is_fresh(&freshness) {
+            let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
+                &project,
+                &cfg.model_id,
+                Some(generation),
+                SEMANTIC_VECTOR_CANDIDATE_LIMIT,
+            );
+            scope.limit = SEMANTIC_VECTOR_CANDIDATE_LIMIT;
+            let total = greppy_search::count_vector_search_scope(&store, &scope)?;
             if json {
                 semantic_vector_json(
                     &store,
@@ -9792,6 +10199,26 @@ fn dispatch_semantic(
             }
             return Ok(freshness_refusal_exit(&freshness));
         }
+        if !embedding_generation_complete(&store, &project, generation, &cfg.model_id) {
+            let root_path = resolve_root(root)?;
+            let _ = spawn_background_embed(root, &cfg);
+            let progress = embedding_progress_value(&root_path, &cfg, generation);
+            if json {
+                semantic_embedding_indexing_json(
+                    &project, &cfg, generation, &freshness, &progress,
+                )?;
+            } else {
+                println!("{}", embedding_progress_text(&progress));
+            }
+            return Ok(i32::from(EXIT_TEMPFAIL));
+        }
+        let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
+            &project,
+            &cfg.model_id,
+            Some(generation),
+            SEMANTIC_VECTOR_CANDIDATE_LIMIT,
+        );
+        let total = greppy_search::count_vector_search_scope(&store, &scope)?;
         if total == 0 {
             if json {
                 semantic_vector_json(
@@ -10738,6 +11165,13 @@ fn context_vector_fallback(
     let cfg = embedding_config_for_required_use(embedding_args)?;
 
     let generation = current_graph_generation(store, root)?;
+    if !embedding_generation_complete(store, project, generation, &cfg.model_id) {
+        let root_path = resolve_root(root)?;
+        let _ = spawn_background_embed(root, &cfg);
+        let progress = embedding_progress_value(&root_path, &cfg, generation);
+        eprintln!("{}", embedding_progress_text(&progress));
+        return Ok(None);
+    }
     let mut scope = greppy_search::embeddinggemma_code_retrieval_scope(
         project,
         &cfg.model_id,
@@ -10746,24 +11180,8 @@ fn context_vector_fallback(
     );
     let total = greppy_search::count_vector_search_scope(store, &scope)?;
     if total == 0 {
-        // P2 (problem dossier): a resolvable model with a vector-less store
-        // used to degrade to lexical/FTS SILENTLY — the agent got junk
-        // results with no signal (spot-test forensics: pnpm-lock keys as
-        // top "semantic" hits). Self-heal instead: build the embeddings
-        // now (first semantic use), announced honestly. A second store
-        // handle is opened for the write so this read path keeps &Store.
         eprintln!(
-            "context: building the semantic index for this project (first \
-             use, model {}) — subsequent queries are instant.",
-            cfg.model_id
-        );
-        // First-use embeddings use the same atomic writer/snapshot path as a
-        // normal index. Never mutate the graph DB already opened by this query.
-        spawn_background_embed(root);
-        eprintln!(
-            "context: building the semantic index in the background through an \
-             atomic snapshot; answering from lexical results for now. Retry in \
-             a moment for semantic results."
+            "context: the completed semantic index contains no embeddable code spans for this project."
         );
         return Ok(None);
     }
@@ -12386,8 +12804,9 @@ fn open_default_store_query_writer(root: Option<&str>) -> Result<greppy_store::S
     Ok(store)
 }
 
-/// First-use indexing goes through the same all-or-nothing graph + embedding
-/// snapshot path as an explicit index command.
+/// First use publishes the deterministic graph quickly. Semantic commands
+/// start the generation-bound embedding snapshot in the background and report
+/// progress instead of making every graph command wait for inference.
 fn try_auto_index_inline(root: Option<&str>) -> bool {
     let Ok(effective_root) = resolve_root(root) else {
         return false;
@@ -12421,24 +12840,14 @@ fn try_auto_index_inline(root: Option<&str>) -> bool {
     let options = greppy_indexer::IndexOptions {
         discover_overrides: overrides,
     };
-    let embedding_cfg = if test_inference_skipped() {
-        None
-    } else {
-        let args = EmbeddingCliArgs {
-            device: None,
-            no_gpu: false,
-        };
-        match embedding_config_optional(args) {
-            Ok(value) => value,
-            Err(_) => return false,
-        }
-    };
     index_atomic_snapshot(
         &store_path,
         &effective_root,
         &project,
-        embedding_cfg.as_ref(),
+        None,
         &options,
+        false,
+        None,
     )
     .map(|snapshot| snapshot.index.is_clean())
     .unwrap_or(false)
@@ -12582,12 +12991,19 @@ fn dispatch_index(
     // supports in-place incremental updates for library tests; the CLI path is
     // the production publication boundary, so it must never expose a half-built
     // graph.db to query commands.
+    let is_background = background_job.is_background();
     let snapshot = match index_atomic_snapshot(
         &store_path,
         &target,
         &project,
         embedding_config.as_ref(),
         &index_options,
+        !is_background,
+        if is_background {
+            Some(&mut background_job)
+        } else {
+            None
+        },
     ) {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -12636,6 +13052,23 @@ fn dispatch_index(
     }
     retire_verified_legacy_store(&effective_root);
     background_job.complete();
+    let embedding_deferred = snapshot.embedding_deferred;
+    drop(_lock);
+    drop(_lifecycle);
+    if embedding_deferred {
+        if let Some(cfg) = embedding_config.as_ref() {
+            let effective_root_string = effective_root.to_string_lossy().into_owned();
+            if spawn_background_embed(Some(&effective_root_string), cfg) {
+                let progress =
+                    embedding_progress_value(&effective_root, cfg, report.graph_generation);
+                println!("{}", embedding_progress_text(&progress));
+            } else {
+                println!(
+                    "semantic-search: semantic index is pending; the next semantic query will retry the background job."
+                );
+            }
+        }
+    }
     Ok(0)
 }
 
@@ -12921,6 +13354,7 @@ fn remove_verified_legacy_entry(entry: &LegacyCacheEntry) -> bool {
 struct IndexSnapshotReport {
     index: greppy_indexer::IndexReport,
     embeddings: Option<greppy_indexer::EmbeddingIndexReport>,
+    embedding_deferred: bool,
 }
 
 fn index_atomic_snapshot(
@@ -12929,6 +13363,8 @@ fn index_atomic_snapshot(
     project: &str,
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
+    allow_deferred_embeddings: bool,
+    mut background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<IndexSnapshotReport> {
     for attempt in 0..2 {
         if let Some(report) = index_atomic_snapshot_attempt(
@@ -12937,6 +13373,8 @@ fn index_atomic_snapshot(
             project,
             embedding_config,
             index_options,
+            allow_deferred_embeddings,
+            background_job.as_deref_mut(),
         )? {
             return Ok(report);
         }
@@ -12955,6 +13393,8 @@ fn index_atomic_snapshot_attempt(
     project: &str,
     embedding_config: Option<&EmbeddingModelConfig>,
     index_options: &greppy_indexer::IndexOptions,
+    allow_deferred_embeddings: bool,
+    background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<Option<IndexSnapshotReport>> {
     cleanup_stale_snapshot_artifacts(active_path, true)?;
     let temp_path = unique_store_sibling(active_path, "next");
@@ -12988,10 +13428,16 @@ fn index_atomic_snapshot_attempt(
         return Ok(Some(IndexSnapshotReport {
             index: report,
             embeddings: None,
+            embedding_deferred: false,
         }));
     }
 
-    let embedding_report = if let Some(cfg) = embedding_config {
+    let embedding_deferred = embedding_config.is_some_and(|cfg| {
+        allow_deferred_embeddings
+            && greppy_indexer::count_embedding_candidate_nodes(&temp_store, project)
+                .is_ok_and(|count| should_defer_embedding(cfg, count))
+    });
+    let embedding_report = if let Some(cfg) = embedding_config.filter(|_| !embedding_deferred) {
         match index_embeddings_into_temp_store(
             &mut temp_store,
             target,
@@ -12999,6 +13445,7 @@ fn index_atomic_snapshot_attempt(
             cfg,
             &report,
             active_path.parent().map(std::path::Path::to_path_buf),
+            background_job,
         ) {
             Ok(report) => Some(report),
             Err(e) => {
@@ -13048,7 +13495,24 @@ fn index_atomic_snapshot_attempt(
     Ok(Some(IndexSnapshotReport {
         index: report,
         embeddings: embedding_report,
+        embedding_deferred,
     }))
+}
+
+fn should_defer_embedding(cfg: &EmbeddingModelConfig, candidate_nodes: usize) -> bool {
+    let configured = std::env::var(ENV_LAZY_EMBED_MIN_SPANS)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0);
+    let threshold = configured.unwrap_or_else(|| {
+        let (backend, _) = embedding_backend_plan(cfg);
+        if matches!(backend.as_str(), "metal" | "cuda") {
+            DEFAULT_LAZY_EMBED_GPU_SPANS
+        } else {
+            DEFAULT_LAZY_EMBED_CPU_SPANS
+        }
+    });
+    candidate_nodes >= threshold
 }
 
 fn index_embeddings_into_temp_store(
@@ -13058,7 +13522,11 @@ fn index_embeddings_into_temp_store(
     cfg: &EmbeddingModelConfig,
     report: &greppy_indexer::IndexReport,
     tokenizer_cache_dir: Option<std::path::PathBuf>,
+    mut background_job: Option<&mut BackgroundJobGuard>,
 ) -> Result<greppy_indexer::EmbeddingIndexReport> {
+    if let Some(job) = background_job.as_deref_mut() {
+        job.embedding_loading();
+    }
     let model = match load_embedding_model(cfg, tokenizer_cache_dir) {
         Ok(model) => model,
         Err(e) => {
@@ -13069,13 +13537,31 @@ fn index_embeddings_into_temp_store(
         }
     };
     let mut provider = greppy_indexer::EmbeddingGemmaCodeProvider::new(&cfg.model_id, &model);
-    let embedding_report = greppy_indexer::index_code_embeddings_for_project(
-        store,
-        target,
-        project,
-        &mut provider,
-        greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation),
-    )?;
+    let options = greppy_indexer::EmbeddingIndexOptions::for_generation(report.graph_generation);
+    let embedding_report = if let Some(job) = background_job {
+        let total_documents = greppy_indexer::count_code_embedding_documents_for_project(
+            store, target, project, &provider, options,
+        )?;
+        job.embedding_started(model.backend_name(), total_documents);
+        let mut progress = |value| job.embedding_progress(value);
+        greppy_indexer::index_code_embeddings_for_project_with_progress(
+            store,
+            target,
+            project,
+            &mut provider,
+            options,
+            total_documents,
+            &mut progress,
+        )?
+    } else {
+        greppy_indexer::index_code_embeddings_for_project(
+            store,
+            target,
+            project,
+            &mut provider,
+            options,
+        )?
+    };
     let key = embedding_complete_key(project);
     store
         .conn()
@@ -13799,6 +14285,50 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn embedding_eta_uses_backend_prior_then_measured_throughput() {
+        assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
+        assert_eq!(initial_embedding_eta_seconds(1_200, "metal"), Some(150));
+        assert_eq!(initial_embedding_eta_seconds(1_200, "cuda"), Some(100));
+        assert_eq!(observed_embedding_eta_seconds(10, 100, 5_000), Some(45));
+        assert_eq!(observed_embedding_rate_milli(10, 5_000), Some(2_000));
+    }
+
+    #[test]
+    fn embedding_progress_message_names_backend_counts_and_eta() {
+        let progress = serde_json::json!({
+            "backend": "metal",
+            "completed_spans": 412,
+            "total_spans": 2443,
+            "eta_seconds": 134,
+        });
+        assert_eq!(
+            embedding_progress_text(&progress),
+            "semantic-search: semantic index is building on metal (412/2443 spans); semantic results will be available in about 2m 14s."
+        );
+    }
+
+    #[test]
+    fn lazy_embedding_threshold_is_inclusive_and_testable() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _restore = EnvRestore::capture(&[ENV_LAZY_EMBED_MIN_SPANS]);
+        // SAFETY: serialized by ENV_LOCK and restored by EnvRestore.
+        unsafe {
+            std::env::set_var(ENV_LAZY_EMBED_MIN_SPANS, "3");
+        }
+        let cfg = EmbeddingModelConfig {
+            model_id: "test".into(),
+            source: EmbeddingModelSource::Gguf {
+                gguf: std::path::PathBuf::from("unused.gguf"),
+                tokenizer: std::path::PathBuf::from("unused-tokenizer.json"),
+            },
+            max_length: None,
+            device: greppy_embed_native::DevicePreference::Cpu,
+        };
+        assert!(!should_defer_embedding(&cfg, 2));
+        assert!(should_defer_embedding(&cfg, 3));
     }
 
     #[test]

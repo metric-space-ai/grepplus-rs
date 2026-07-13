@@ -65,6 +65,14 @@ legacy previews and are not the current production distribution. Build the
 current `main` revision from source for evaluation. Do not rename or install the
 binary as `grep`.
 
+The deterministic graph is published first. On a large repository, code-span
+embeddings continue in a generation-bound background job so graph navigation
+does not wait for several minutes of inference. `semantic-search` never exposes
+partial vectors: until that generation is complete it returns `status:
+"indexing"` in JSON (exit 75), the selected CPU/Metal/CUDA backend, exact span
+progress, and an estimated completion time. Automatic selection prefers a
+compatible Metal or CUDA device with sufficient memory and otherwise uses CPU.
+
 **2. Tell your agent the extra commands exist.** Delegate it — in your agent's
 chat, say **`install https://github.com/metric-space-ai/greppy/`** — or
 paste the snippet below into the file your agent reads for project instructions
@@ -92,6 +100,8 @@ SEMANTIC SEARCH — use when you do NOT know the symbol's name:
       Describe the behaviour or code you are looking for in plain English
       (e.g. "restrict a value to a range", "retry a failed HTTP request").
       Returns the closest-matching definitions by meaning (signature + file:line).
+      While first-use embeddings are still building, returns a retryable status
+      with the active backend, progress, and ETA instead of partial/empty hits.
 
 EXPAND — get the full source in one call instead of opening files by hand:
   greppy expand ID

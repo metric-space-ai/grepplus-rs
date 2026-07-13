@@ -128,8 +128,10 @@ use greppy_store::{
 use rayon::prelude::*;
 
 pub use embedding::{
-    index_code_embeddings_for_project, CodeEmbeddingProvider, EmbeddingGemmaCodeProvider,
-    EmbeddingIndexOptions, EmbeddingIndexReport,
+    count_code_embedding_documents_for_project, count_embedding_candidate_nodes,
+    index_code_embeddings_for_project, index_code_embeddings_for_project_with_progress,
+    CodeEmbeddingProvider, EmbeddingGemmaCodeProvider, EmbeddingIndexOptions,
+    EmbeddingIndexProgress, EmbeddingIndexReport,
 };
 
 /// Fraction of the process RAM budget the indexer initialises

@@ -1,18 +1,20 @@
-# Qwen3.5 MTP Q4_K_M Performance Baseline
+# Historical Qwen3.5 MTP Q4_K_M Performance Snapshot
 
 Date: 2026-07-12
 
-This is the current production-gate snapshot. It compares Greppy's native
-engine and llama.cpp with the same model file and token counts. Historical
-measurements against the non-MTP model were removed because they are not
-comparable to the embedded production asset.
+This is a retained pre-contract snapshot, not current release-gate evidence.
+It used the embedded production asset, but the native prompt path processed
+511 rows through batched prefill and held the final token out for decode. The
+strict contract in `bench/inference_performance/` rejects that shape as PP511.
+These values remain useful for regression archaeology only and must not be
+presented as exact PP512 performance.
 
 ## Fixed inputs
 
 - Model: `Qwen3.5-0.8B-MTP-Q4_K_M.gguf`
 - SHA256: `d45e08ad7bb8787ae9b6f56b6915e8b44ac6e13c6b740fdc7bd591249209a72c`
 - File size: `541903232` bytes
-- Prompt/prefill: PP512 (`511` measured native prefill tokens after the held-out first decode token)
+- Prompt/prefill label: legacy `PP512` (`511` native batch rows plus one decode row; not exact PP512)
 - Decode: TG128
 - Repetitions: 5
 - Apple CPU: four performance workers
@@ -24,9 +26,9 @@ comparable to the embedded production asset.
 
 ## Median comparison
 
-The release gate is at least `1.05x` llama.cpp for both PP512 and TG128, with
-no native sample below `1.00x`. Ratios below `1.05x` are failures, not rounded
-passes.
+The intended release gate was at least `1.05x` llama.cpp. This table does not
+satisfy the current input and generation contracts, so none of its ratios can
+pass or fail the current release gate.
 
 | Platform | Device | llama PP512 | Native PP512 | Ratio | llama TG128 | Native TG128 | Ratio | Gate |
 |---|---|---:|---:|---:|---:|---:|---:|---|

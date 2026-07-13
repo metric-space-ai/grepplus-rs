@@ -1208,6 +1208,7 @@ pub unsafe fn gp_embed_q6k(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 

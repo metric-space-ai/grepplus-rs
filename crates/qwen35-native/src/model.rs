@@ -7,9 +7,13 @@ use crate::inventory::Qwen35Inventory;
 use crate::postprocess::{postprocess_brief_output, postprocess_triage_output, TriageVerdict};
 use crate::prompt::{brief_prompt, non_thinking_chat_prompt, triage_prompt};
 use crate::sampler::{
-    BRIEF_FALLBACK_GENERATION_PARAMS, BRIEF_GENERATION_PARAMS, TRIAGE_GENERATION_PARAMS,
+    GenerationParams, BRIEF_FALLBACK_GENERATION_PARAMS, BRIEF_GENERATION_PARAMS,
+    TRIAGE_GENERATION_PARAMS,
 };
-use crate::{Error, Result};
+use crate::{
+    DiagnosticMtpGeneration, DiagnosticTargetPrefill, Error, MtpGenerationOutput, Result,
+    DIAGNOSTIC_MAX_OUTPUT_TOKENS, DIAGNOSTIC_TARGET_PREFILL_TOKENS,
+};
 
 pub use greppy_embed_native::DevicePreference;
 
@@ -33,7 +37,7 @@ pub struct Qwen35Summarizer {
 }
 
 enum Backend {
-    Cpu(CpuQwen35Model),
+    Cpu(Box<CpuQwen35Model>),
     #[cfg(all(feature = "metal", target_os = "macos"))]
     Metal(crate::metal::model::MetalQwen35Model),
     #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
@@ -149,6 +153,75 @@ impl Qwen35Summarizer {
         }
     }
 
+    /// Measure one exact 512-token target-model prefill on the selected production backend.
+    ///
+    /// Model loading, state allocation, and input validation happen outside the timed interval.
+    pub fn diagnostic_target_prefill_512(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<DiagnosticTargetPrefill> {
+        validate_diagnostic_token_ids(token_ids, &self.inventory)?;
+        if token_ids.len() != DIAGNOSTIC_TARGET_PREFILL_TOKENS {
+            return Err(Error::InvalidRequest(format!(
+                "diagnostic target prefill requires exactly {DIAGNOSTIC_TARGET_PREFILL_TOKENS} token IDs, got {}",
+                token_ids.len()
+            )));
+        }
+        let elapsed = match &self.backend {
+            Backend::Cpu(model) => model.diagnostic_target_prefill(token_ids)?,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(model) => model.diagnostic_target_prefill(token_ids)?,
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(model) => model.diagnostic_target_prefill(token_ids)?,
+        };
+        Ok(DiagnosticTargetPrefill {
+            input_tokens: token_ids.len(),
+            elapsed,
+        })
+    }
+
+    /// Run greedy, EOS-disabled generation through the production MTP algorithm.
+    ///
+    /// This diagnostic API returns committed token IDs and stage timings without changing the
+    /// 64-token, EOS-aware `summarize_source` product contract.
+    pub fn diagnostic_generate_mtp_greedy(
+        &self,
+        prompt_token_ids: &[u32],
+        max_output_tokens: usize,
+    ) -> Result<DiagnosticMtpGeneration> {
+        validate_diagnostic_token_ids(prompt_token_ids, &self.inventory)?;
+        if !(1..=DIAGNOSTIC_MAX_OUTPUT_TOKENS).contains(&max_output_tokens) {
+            return Err(Error::InvalidRequest(format!(
+                "diagnostic MTP generation output limit must be in 1..={DIAGNOSTIC_MAX_OUTPUT_TOKENS}, got {max_output_tokens}"
+            )));
+        }
+        if !self.inventory.has_mtp() {
+            return Err(Error::GenerationUnavailable(
+                "diagnostic MTP generation requires an MTP model layer".into(),
+            ));
+        }
+        let required_context = prompt_token_ids
+            .len()
+            .checked_add(max_output_tokens)
+            .and_then(|value| value.checked_add(1))
+            .ok_or_else(|| Error::InvalidRequest("diagnostic context length overflow".into()))?;
+        if required_context > self.inventory.context_length {
+            return Err(Error::InvalidRequest(format!(
+                "diagnostic MTP generation needs {required_context} context tokens, model limit is {}",
+                self.inventory.context_length
+            )));
+        }
+        let params = diagnostic_greedy_params(max_output_tokens);
+        let output = match &self.backend {
+            Backend::Cpu(model) => model.diagnostic_generate_mtp(prompt_token_ids, params)?,
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Backend::Metal(model) => model.diagnostic_generate_mtp(prompt_token_ids, params)?,
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Backend::Cuda(model) => model.diagnostic_generate_mtp(prompt_token_ids, params)?,
+        };
+        finish_diagnostic_generation(output, max_output_tokens)
+    }
+
     fn generate_raw(
         &self,
         prompt: &str,
@@ -164,9 +237,128 @@ impl Qwen35Summarizer {
     }
 }
 
+fn diagnostic_greedy_params(max_tokens: usize) -> GenerationParams {
+    GenerationParams {
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: 1,
+        min_p: 0.0,
+        presence_penalty: 0.0,
+        repetition_penalty: 1.0,
+        max_tokens,
+    }
+}
+
+fn validate_diagnostic_token_ids(token_ids: &[u32], inventory: &Qwen35Inventory) -> Result<()> {
+    if token_ids.is_empty() {
+        return Err(Error::InvalidRequest(
+            "diagnostic inference requires at least one token ID".into(),
+        ));
+    }
+    if let Some(token_id) = token_ids
+        .iter()
+        .copied()
+        .find(|token_id| usize::try_from(*token_id).map_or(true, |id| id >= inventory.vocab_size))
+    {
+        return Err(Error::InvalidRequest(format!(
+            "diagnostic input token ID {token_id} is outside vocabulary size {}",
+            inventory.vocab_size
+        )));
+    }
+    Ok(())
+}
+
+fn finish_diagnostic_generation(
+    output: MtpGenerationOutput,
+    expected_tokens: usize,
+) -> Result<DiagnosticMtpGeneration> {
+    if output.token_ids.len() != expected_tokens {
+        return Err(Error::GenerationUnavailable(format!(
+            "diagnostic MTP generation committed {} of {expected_tokens} requested tokens",
+            output.token_ids.len()
+        )));
+    }
+    let mut telemetry = output.telemetry.ok_or_else(|| {
+        Error::GenerationUnavailable("diagnostic MTP telemetry was not captured".into())
+    })?;
+    telemetry.output_token_ids = output.token_ids;
+    Ok(telemetry)
+}
+
 fn log_summary_debug(stage: &str, raw: &str, bullets: &[String]) {
     if std::env::var_os("GREPPY_QWEN35_SUMMARY_DEBUG").is_some() {
         eprintln!("qwen35-summary-debug {stage} raw={raw:?} bullets={bullets:?}");
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_api_tests {
+    use super::*;
+
+    fn inventory() -> Qwen35Inventory {
+        Qwen35Inventory {
+            architecture: "qwen35".into(),
+            block_count: 24,
+            hidden_size: 1024,
+            feed_forward_size: 3584,
+            vocab_size: 16,
+            attention_heads: 8,
+            kv_heads: 2,
+            head_dim: 256,
+            value_dim: 256,
+            rope_dim: 64,
+            context_length: 1024,
+            full_attention_interval: 4,
+            ssm_inner_size: 2048,
+            ssm_group_count: 16,
+            ssm_time_step_rank: 16,
+            nextn_predict_layers: 1,
+        }
+    }
+
+    #[test]
+    fn diagnostic_sampling_is_greedy_and_keeps_requested_limit() {
+        let params = diagnostic_greedy_params(128);
+        assert_eq!(params.temperature, 0.0);
+        assert_eq!(params.top_k, 1);
+        assert_eq!(params.max_tokens, 128);
+    }
+
+    #[test]
+    fn diagnostic_token_validation_rejects_empty_and_out_of_vocab() {
+        let inventory = inventory();
+        assert!(validate_diagnostic_token_ids(&[], &inventory).is_err());
+        assert!(validate_diagnostic_token_ids(&[0, 15], &inventory).is_ok());
+        assert!(validate_diagnostic_token_ids(&[16], &inventory).is_err());
+    }
+
+    #[test]
+    fn diagnostic_generation_requires_exact_committed_count() {
+        let telemetry = DiagnosticMtpGeneration {
+            output_token_ids: Vec::new(),
+            target_prefill: std::time::Duration::from_nanos(1),
+            mtp_prefill: std::time::Duration::from_nanos(2),
+            decode: std::time::Duration::from_nanos(3),
+            mtp: crate::DiagnosticMtpStats {
+                used: true,
+                cycles: 1,
+                drafted_tokens: 2,
+                accepted_tokens: 1,
+                fallback: false,
+            },
+        };
+        let output = MtpGenerationOutput {
+            token_ids: vec![7, 8],
+            telemetry: Some(telemetry.clone()),
+        };
+        let finished = finish_diagnostic_generation(output, 2).expect("exact output count");
+        assert_eq!(finished.output_token_ids, [7, 8]);
+
+        let short = MtpGenerationOutput {
+            token_ids: vec![7],
+            telemetry: Some(telemetry),
+        };
+        assert!(finish_diagnostic_generation(short, 2).is_err());
     }
 }
 
@@ -622,7 +814,9 @@ fn load_cpu_backend(
     inventory: Qwen35Inventory,
     eos_token_id: u32,
 ) -> Result<Backend> {
-    CpuQwen35Model::load(model, inventory, eos_token_id).map(Backend::Cpu)
+    CpuQwen35Model::load(model, inventory, eos_token_id)
+        .map(Box::new)
+        .map(Backend::Cpu)
 }
 
 fn load_auto_backend(
@@ -632,11 +826,11 @@ fn load_auto_backend(
 ) -> Result<Backend> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        return load_metal_with_cpu_fallback(model, inventory, eos_token_id);
+        load_metal_with_cpu_fallback(model, inventory, eos_token_id)
     }
     #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
     {
-        return load_cuda_with_cpu_fallback(model, inventory, eos_token_id);
+        load_cuda_with_cpu_fallback(model, inventory, eos_token_id)
     }
     #[cfg(not(any(
         all(feature = "metal", target_os = "macos"),
@@ -684,8 +878,8 @@ fn load_metal_backend(
 ) -> Result<Backend> {
     #[cfg(all(feature = "metal", target_os = "macos"))]
     {
-        return crate::metal::model::MetalQwen35Model::from_gguf(model, inventory, eos_token_id)
-            .map(Backend::Metal);
+        crate::metal::model::MetalQwen35Model::from_gguf(model, inventory, eos_token_id)
+            .map(Backend::Metal)
     }
     #[cfg(not(all(feature = "metal", target_os = "macos")))]
     {
@@ -703,8 +897,8 @@ fn load_cuda_backend(
 ) -> Result<Backend> {
     #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
     {
-        return crate::cuda::model::CudaQwen35Model::from_gguf(model, inventory, eos_token_id)
-            .map(Backend::Cuda);
+        crate::cuda::model::CudaQwen35Model::from_gguf(model, inventory, eos_token_id)
+            .map(Backend::Cuda)
     }
     #[cfg(not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))))]
     {
@@ -1023,16 +1217,12 @@ mod cpu_perf_tests {
             .to_vec();
         let hidden_size = summarizer.inventory.hidden_size;
         let mut target_state = model.new_state(prompt_ids.len() + 3);
-        let mut prompt_hidden = model
-            .prefill_tokens_hidden(&prompt_ids[..prompt_ids.len() - 1], &mut target_state)
-            .expect("MTP golden target prefix");
+        let prompt_hidden = model
+            .prefill_tokens_hidden(&prompt_ids, &mut target_state)
+            .expect("MTP golden target prompt");
         let target = model
-            .forward_token_logits_hidden(
-                *prompt_ids.last().expect("non-empty MTP golden prompt"),
-                &mut target_state,
-            )
-            .expect("MTP golden target last token");
-        prompt_hidden.extend_from_slice(&target.hidden);
+            .target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())
+            .expect("MTP golden target projection");
         let first = greedy_argmax(&target.logits);
         assert_eq!(first, 10296, "unexpected MTP golden target token");
 

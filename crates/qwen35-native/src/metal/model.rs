@@ -15,7 +15,7 @@ use tokenizers::Tokenizer;
 
 use crate::inventory::Qwen35Inventory;
 use crate::sampler::{sample_token, GenerationParams, SamplerRng};
-use crate::{Error, Result};
+use crate::{Error, MtpGenerationOutput, MtpRunOptions, Result};
 
 pub struct MetalQwen35Model {
     dev: &'static Device,
@@ -140,9 +140,39 @@ impl MetalQwen35Model {
             return Ok(String::new());
         }
         if self.inventory.has_mtp() {
-            return self.generate_with_mtp(tokenizer, prompt, prompt_ids, params);
+            let output =
+                self.generate_with_mtp(prompt, prompt_ids, params, MtpRunOptions::production())?;
+            return tokenizer
+                .decode(&output.token_ids, true)
+                .map_err(|error| Error::Tokenizer(error.to_string()));
         }
         self.generate_target_only(tokenizer, prompt, prompt_ids, params)
+    }
+
+    pub(crate) fn diagnostic_target_prefill(
+        &self,
+        token_ids: &[u32],
+    ) -> Result<std::time::Duration> {
+        if token_ids.is_empty() {
+            return Err(Error::InvalidRequest("empty diagnostic prefill".into()));
+        }
+        let mut state = self.new_forward_state(token_ids.len())?;
+        let mut final_chunk_hidden = Vec::new();
+        let started = std::time::Instant::now();
+        for tokens in token_ids.chunks(METAL_PREFILL_BATCH_ROWS) {
+            final_chunk_hidden = self.prefill_tokens_hidden(tokens, &mut state)?;
+        }
+        let final_rows = token_ids.len().min(METAL_PREFILL_BATCH_ROWS);
+        let _ = self.target_from_prefilled_hidden(&final_chunk_hidden, final_rows)?;
+        Ok(started.elapsed())
+    }
+
+    pub(crate) fn diagnostic_generate_mtp(
+        &self,
+        prompt_ids: &[u32],
+        params: GenerationParams,
+    ) -> Result<MtpGenerationOutput> {
+        self.generate_with_mtp("", prompt_ids, params, MtpRunOptions::diagnostic())
     }
 
     #[cfg(test)]
@@ -209,31 +239,26 @@ impl MetalQwen35Model {
 
     fn generate_with_mtp(
         &self,
-        tokenizer: &Tokenizer,
         prompt: &str,
         prompt_ids: &[u32],
         params: GenerationParams,
-    ) -> Result<String> {
+        options: MtpRunOptions,
+    ) -> Result<MtpGenerationOutput> {
         let max_context = prompt_ids
             .len()
             .saturating_add(params.max_tokens)
             .saturating_add(1)
             .min(self.inventory.context_length);
         let hidden_size = self.inventory.hidden_size;
-        let mut perf = crate::MtpPerfTimer::new();
+        let mut perf = crate::MtpPerfTimer::new(options.capture_telemetry);
         let mut target_state = self.new_forward_state(max_context)?;
         let mut target_workspace = self.new_forward_workspace(max_context)?;
         let mut prompt_hidden = Vec::with_capacity(prompt_ids.len() * hidden_size);
         perf.begin_target_prefill();
-        for tokens in prompt_ids[..prompt_ids.len() - 1].chunks(METAL_PREFILL_BATCH_ROWS) {
+        for tokens in prompt_ids.chunks(METAL_PREFILL_BATCH_ROWS) {
             prompt_hidden.extend(self.prefill_tokens_hidden(tokens, &mut target_state)?);
         }
-        let mut target = self.forward_token_logits_hidden(
-            *prompt_ids.last().expect("checked non-empty above"),
-            &mut target_state,
-            &mut target_workspace,
-        )?;
-        prompt_hidden.extend_from_slice(&target.hidden);
+        let mut target = self.target_from_prefilled_hidden(&prompt_hidden, prompt_ids.len())?;
         perf.finish_target_prefill();
 
         let zero_hidden = vec![0.0f32; hidden_size];
@@ -254,10 +279,18 @@ impl MetalQwen35Model {
         let mut generated = Vec::with_capacity(params.max_tokens);
         let mut rng = SamplerRng::new(prompt_seed(prompt));
         let Some(first) = sample_token(&mut target.logits, &generated, params, &mut rng) else {
-            return Ok(String::new());
+            let telemetry = perf.finish("metal", prompt_ids.len(), 0, 0, 0, 0, false);
+            return Ok(MtpGenerationOutput {
+                token_ids: generated,
+                telemetry,
+            });
         };
-        if first == self.eos_token_id {
-            return Ok(String::new());
+        if options.stop_on_eos && first == self.eos_token_id {
+            let telemetry = perf.finish("metal", prompt_ids.len(), 0, 0, 0, 0, false);
+            return Ok(MtpGenerationOutput {
+                token_ids: generated,
+                telemetry,
+            });
         }
         generated.push(first);
         let mtp_debug = std::env::var_os("GREPPY_QWEN35_MTP_DEBUG").is_some();
@@ -282,7 +315,7 @@ impl MetalQwen35Model {
                 let Some(token) = sample_token(&mut logits, &generated, params, &mut rng) else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -301,7 +334,7 @@ impl MetalQwen35Model {
                 else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -334,7 +367,7 @@ impl MetalQwen35Model {
                     break;
                 };
                 draft_tokens.push(token);
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 draft_history.push(token);
@@ -354,7 +387,7 @@ impl MetalQwen35Model {
                 else {
                     break;
                 };
-                if token == self.eos_token_id {
+                if options.stop_on_eos && token == self.eos_token_id {
                     break;
                 }
                 generated.push(token);
@@ -391,7 +424,7 @@ impl MetalQwen35Model {
                     finished = true;
                     break;
                 };
-                if target_token == self.eos_token_id {
+                if options.stop_on_eos && target_token == self.eos_token_id {
                     finished = true;
                     break;
                 }
@@ -433,7 +466,7 @@ impl MetalQwen35Model {
                 else {
                     break;
                 };
-                if target_token == self.eos_token_id {
+                if options.stop_on_eos && target_token == self.eos_token_id {
                     break;
                 }
                 generated.push(target_token);
@@ -482,7 +515,7 @@ impl MetalQwen35Model {
                 "qwen35-mtp-debug backend=metal cycles={cycles} drafted={drafted_total} accepted={accepted_total}"
             );
         }
-        perf.report(
+        let telemetry = perf.finish(
             "metal",
             prompt_ids.len(),
             generated.len(),
@@ -491,9 +524,10 @@ impl MetalQwen35Model {
             accepted_total,
             mtp_fallback,
         );
-        tokenizer
-            .decode(&generated, true)
-            .map_err(|error| Error::Tokenizer(error.to_string()))
+        Ok(MtpGenerationOutput {
+            token_ids: generated,
+            telemetry,
+        })
     }
 
     pub fn new_forward_state(&self, max_context: usize) -> Result<MetalForwardState> {
@@ -719,6 +753,49 @@ impl MetalQwen35Model {
         Ok(MetalTargetForwardOutput {
             hidden: self.read_f32(&ws.hidden, self.inventory.hidden_size)?,
             logits: self.read_f32(&ws.logits, self.inventory.vocab_size)?,
+        })
+    }
+
+    fn target_from_prefilled_hidden(
+        &self,
+        hidden_rows: &[f32],
+        rows: usize,
+    ) -> Result<MetalTargetForwardOutput> {
+        let hidden = last_hidden_row(hidden_rows, rows, self.inventory.hidden_size)?.to_vec();
+        let src = self.upload_pod(&hidden)?;
+        let normed = self.new_f32(self.inventory.hidden_size)?;
+        let logits = self.new_f32(self.inventory.vocab_size)?;
+        let cb = self.command_buffer()?;
+        let enc = cb
+            .compute()
+            .ok_or_else(|| Error::GenerationUnavailable("failed to create Metal encoder".into()))?;
+        self.encode_rms_norm(
+            &enc,
+            "output_norm.weight",
+            &src,
+            &normed,
+            1,
+            self.inventory.hidden_size,
+            true,
+        )?;
+        enc.memory_barrier_buffers();
+        self.encode_matvec_to(
+            &enc,
+            "token_embd.weight",
+            &normed,
+            self.inventory.hidden_size,
+            &logits,
+            self.inventory.vocab_size,
+        )?;
+        enc.end();
+        cb.commit_and_wait().map_err(|error| {
+            Error::GenerationUnavailable(format!(
+                "Metal prefetched target projection failed: {error}"
+            ))
+        })?;
+        Ok(MetalTargetForwardOutput {
+            hidden,
+            logits: self.read_f32(&logits, self.inventory.vocab_size)?,
         })
     }
 
@@ -1468,6 +1545,9 @@ impl MetalQwen35Model {
 
         let src = self.upload_pod(input)?;
         let dst = self.new_f32(input_rows * rows)?;
+        let input_bytes = u64::try_from(std::mem::size_of_val(input)).map_err(|_| {
+            Error::InvalidRequest("Metal matmul input byte length does not fit u64".into())
+        })?;
         let cb = self.command_buffer()?;
         let enc = cb
             .compute()
@@ -1493,8 +1573,8 @@ impl MetalQwen35Model {
             1,
             std::mem::size_of::<f32>() as u64,
             (cols * std::mem::size_of::<f32>()) as u64,
-            (input.len() * std::mem::size_of::<f32>()) as u64,
-            (input.len() * std::mem::size_of::<f32>()) as u64,
+            input_bytes,
+            input_bytes,
             checked_i32(rows, "matmul dst cols")?,
             checked_i32(input_rows, "matmul dst rows")?,
         ))?;
@@ -1520,7 +1600,7 @@ impl MetalQwen35Model {
         dim: usize,
         qwen_scale: bool,
     ) -> Result<Vec<f32>> {
-        if dim == 0 || input.len() % dim != 0 {
+        if dim == 0 || !input.len().is_multiple_of(dim) {
             return Err(Error::InvalidRequest(format!(
                 "{tensor_name} RMSNorm input len {} is not divisible by dim {dim}",
                 input.len()
@@ -1559,7 +1639,7 @@ impl MetalQwen35Model {
         rhs: &[f32],
         dim: usize,
     ) -> Result<(Vec<f32>, Vec<f32>)> {
-        if lhs.len() != rhs.len() || dim == 0 || lhs.len() % dim != 0 {
+        if lhs.len() != rhs.len() || dim == 0 || !lhs.len().is_multiple_of(dim) {
             return Err(Error::InvalidRequest(format!(
                 "{tensor_name} add_rms_norm lhs len {}, rhs len {}, dim {dim}",
                 lhs.len(),
@@ -2028,6 +2108,7 @@ impl MetalQwen35Model {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_matmul_rows_to(
         &self,
         enc: &greppy_embed_native::metal::ffi::ComputeEncoder,
@@ -2076,6 +2157,7 @@ impl MetalQwen35Model {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn encode_rms_norm(
         &self,
         enc: &greppy_embed_native::metal::ffi::ComputeEncoder,
@@ -3731,20 +3813,12 @@ mod tests {
         let mut target_state = metal
             .new_forward_state(max_context)
             .expect("Metal MTP target state");
-        let mut prompt_hidden = metal
-            .prefill_tokens_hidden(&ids[..ids.len() - 1], &mut target_state)
+        let prompt_hidden = metal
+            .prefill_tokens_hidden(&ids, &mut target_state)
             .expect("Metal MTP target prompt hidden");
-        let mut target_workspace = metal
-            .new_forward_workspace(max_context)
-            .expect("Metal MTP target workspace");
         let target = metal
-            .forward_token_logits_hidden(
-                *ids.last().expect("non-empty Metal MTP prompt"),
-                &mut target_state,
-                &mut target_workspace,
-            )
-            .expect("Metal MTP target final row");
-        prompt_hidden.extend_from_slice(&target.hidden);
+            .target_from_prefilled_hidden(&prompt_hidden, ids.len())
+            .expect("Metal MTP target projection");
         let first = greedy_argmax(&target.logits);
         assert_eq!(first, 10296, "unexpected Metal MTP target token");
 
@@ -5140,17 +5214,17 @@ mod tests {
         state: &mut [f32],
         kernel: usize,
     ) {
-        for channel in 0..values.len() {
+        for (channel, value) in values.iter_mut().enumerate() {
             let base = channel * kernel;
             for i in 0..kernel - 1 {
                 state[base + i] = state[base + i + 1];
             }
-            state[base + kernel - 1] = values[channel];
+            state[base + kernel - 1] = *value;
             let mut acc = 0.0f32;
             for i in 0..kernel {
                 acc += state[base + i] * weights[base + i];
             }
-            values[channel] = silu(acc);
+            *value = silu(acc);
         }
     }
 
