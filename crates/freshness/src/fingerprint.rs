@@ -46,6 +46,64 @@ fn stored_git_path_matches(stored: Option<&str>, current: Option<&Path>) -> bool
     }
 }
 
+fn metadata_only_reasons(reasons: &[String]) -> bool {
+    !reasons.is_empty()
+        && reasons.iter().all(|reason| {
+            reason.starts_with("git_dir changed")
+                || reason.starts_with("git_common_dir changed")
+                || reason.starts_with("head_oid changed")
+                || reason.starts_with("index signature changed")
+        })
+}
+
+/// Refresh Git fingerprint metadata without changing graph or vector state.
+///
+/// Callers must first prove that the current file inventory has no content
+/// drift. This function independently rejects root, schema-scope, and indexer
+/// drift, then updates only the four Git fingerprint fields under the caller's
+/// writer lock.
+pub fn refresh_fingerprint_metadata(
+    store: &mut Store,
+    current: &WorkspaceFingerprint,
+    budget: Duration,
+    overrides: &WalkOverrides,
+) -> Result<bool> {
+    let state = check_with_overrides(store, current, budget, overrides)?;
+    let FreshnessOutcome::Stale { reasons } = state.outcome else {
+        return Ok(false);
+    };
+    if !metadata_only_reasons(&reasons) {
+        return Ok(false);
+    }
+
+    let Some(mut persisted) = store
+        .list_workspace_states()?
+        .into_iter()
+        .find(|row| paths_match(&row.root_path, &current.canonical_root))
+    else {
+        return Ok(false);
+    };
+    persisted.git_dir = current
+        .git_dir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    persisted.git_common_dir = current
+        .git_common_dir
+        .as_ref()
+        .map(|path| path.to_string_lossy().into_owned());
+    persisted.head_oid.clone_from(&current.head_oid);
+    persisted
+        .index_signature
+        .clone_from(&current.index_signature);
+    persisted.updated_at = greppy_store::workspace_state::now_iso8601();
+    store.upsert_workspace_state(&persisted)?;
+
+    Ok(matches!(
+        check_with_overrides(store, current, budget, overrides)?.outcome,
+        FreshnessOutcome::Fresh
+    ))
+}
+
 /// One row of the on-demand freshness check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FreshnessOutcome {
@@ -749,6 +807,61 @@ mod tests {
             }
             other => panic!("expected Stale, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn metadata_refresh_updates_head_without_bumping_generation() {
+        let mut store = Store::open_memory().unwrap();
+        let tmp = tempdir_via_env();
+        run_git(&tmp, &["init", "-q"]);
+        run_git(
+            &tmp,
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "--allow-empty",
+                "-q",
+                "-m",
+                "v1",
+            ],
+        );
+        let fp = WorkspaceFingerprint::capture(&tmp);
+        store
+            .upsert_workspace_state(&WorkspaceState {
+                root_path: fp.canonical_root.to_string_lossy().into_owned(),
+                git_dir: fp
+                    .git_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                git_common_dir: fp
+                    .git_common_dir
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                head_oid: Some("deadbeef".into()),
+                index_signature: fp.index_signature.clone(),
+                schema_version: 1,
+                indexer_version: greppy_core::INDEXER_VERSION_BASE.into(),
+                graph_generation: 41,
+                updated_at: "2026-06-28T20:00:00Z".into(),
+            })
+            .unwrap();
+
+        assert!(refresh_fingerprint_metadata(
+            &mut store,
+            &fp,
+            Duration::from_secs(1),
+            &WalkOverrides::empty(),
+        )
+        .unwrap());
+        let persisted = store
+            .get_workspace_state(fp.canonical_root.to_string_lossy().as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.head_oid, fp.head_oid);
+        assert_eq!(persisted.graph_generation, 41);
     }
 
     #[test]

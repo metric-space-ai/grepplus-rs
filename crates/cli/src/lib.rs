@@ -3747,6 +3747,65 @@ fn version_drift_is_scope_stable(freshness: &serde_json::Value) -> bool {
     scope_of(was) == scope_of(expected) && was != expected
 }
 
+fn metadata_only_fingerprint_drift(freshness: &serde_json::Value) -> bool {
+    if freshness.get("state").and_then(serde_json::Value::as_str) != Some("drift")
+        || freshness
+            .get("stale_file_count")
+            .and_then(serde_json::Value::as_u64)
+            != Some(0)
+    {
+        return false;
+    }
+    freshness
+        .get("reasons")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|reasons| {
+            !reasons.is_empty()
+                && reasons.iter().all(|reason| {
+                    reason.as_str().is_some_and(|reason| {
+                        reason.starts_with("git_dir changed")
+                            || reason.starts_with("git_common_dir changed")
+                            || reason.starts_with("head_oid changed")
+                            || reason.starts_with("index signature changed")
+                    })
+                })
+        })
+}
+
+fn try_refresh_metadata_only_fingerprint(
+    root: Option<&str>,
+    freshness: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    if !metadata_only_fingerprint_drift(freshness) {
+        return None;
+    }
+    let effective_root = resolve_root(root).ok()?;
+    let overrides = discover_overrides_from_env().ok()?;
+    let store_path = workspace_locator::store_path(&effective_root);
+    let _writer = greppy_freshness::try_acquire(&store_path).ok()?;
+    let mut store =
+        greppy_store::Store::open_with(&store_path, greppy_store::OpenOptions::query_writer())
+            .ok()?;
+    let fingerprint = greppy_core::GitFingerprint::capture(&effective_root);
+    if !greppy_freshness::refresh_fingerprint_metadata(
+        &mut store,
+        &fingerprint,
+        NAV_FRESHNESS_BUDGET,
+        &overrides,
+    )
+    .ok()?
+    {
+        return None;
+    }
+
+    let mut refreshed = freshness.clone();
+    let object = refreshed.as_object_mut()?;
+    object.insert("fresh".into(), serde_json::Value::Bool(true));
+    object.insert("state".into(), serde_json::Value::String("fresh".into()));
+    object.insert("reasons".into(), serde_json::Value::Array(Vec::new()));
+    Some(refreshed)
+}
+
 fn freshness_serve_decision_with_policy(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -3786,6 +3845,16 @@ fn freshness_serve_decision_with_policy(
             ));
         }
         return FreshnessServe::Refuse(freshness);
+    }
+
+    // A commit can change only HEAD after the exact source contents were
+    // already indexed. The inventory diff above proves there are zero stale
+    // files, so refresh just the fingerprint instead of rebuilding the graph
+    // and every embedding at a new generation.
+    if allow_auto_reindex && auto_reindex_enabled() {
+        if let Some(refreshed) = try_refresh_metadata_only_fingerprint(root, &freshness) {
+            return FreshnessServe::Fresh(refreshed);
+        }
     }
 
     let stale_file_count = freshness

@@ -1530,6 +1530,56 @@ fn discover_scope_env_controls_index_and_query_freshness() {
     assert_eq!(v["hits"].as_array().unwrap().len(), 0);
 }
 
+#[test]
+fn pure_head_drift_refreshes_metadata_without_reindexing() {
+    let (repo, store_dir) = make_real_git_repo("pure-head-drift");
+    let (code, out, err) = run(&["index", "."], &repo, &store_dir);
+    assert_eq!(
+        code, 0,
+        "initial index should succeed; stderr={err}\nstdout={out}"
+    );
+
+    let db = find_graph_db(&store_dir).expect("graph.db exists after index");
+    let before = greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only())
+        .unwrap()
+        .list_workspace_states()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("workspace state present");
+    git(&repo, &["commit", "--allow-empty", "-m", "metadata only"]);
+    let committed = greppy_core::GitFingerprint::capture(&repo);
+    assert_ne!(before.head_oid, committed.head_oid);
+
+    let (code, out, err) = run(
+        &["search-symbols", "clean_committed_marker", "--json"],
+        &repo,
+        &store_dir,
+    );
+    assert_eq!(
+        code, 0,
+        "metadata-only drift should remain queryable; stderr={err}\nstdout={out}"
+    );
+    let payload: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|error| panic!("invalid JSON: {error}; stdout={out:?}"));
+    assert_eq!(payload["status"], "ok");
+    assert_eq!(payload["fresh"], true);
+    assert_eq!(payload["freshness"]["state"], "fresh");
+
+    let after = greppy_store::Store::open_with(&db, greppy_store::OpenOptions::read_only())
+        .unwrap()
+        .list_workspace_states()
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("workspace state present after metadata refresh");
+    assert_eq!(after.head_oid, committed.head_oid);
+    assert_eq!(
+        after.graph_generation, before.graph_generation,
+        "metadata refresh must not rebuild graph or vectors"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // RV-006 — explicit global `--root` targets the same store from anywhere.
 // ---------------------------------------------------------------------------

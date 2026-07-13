@@ -23,8 +23,8 @@ pub mod lock;
 pub use fingerprint::{
     capture_fingerprint as capture, check, check_files, check_files_report_with_overrides,
     check_files_report_with_ttl, check_files_with_overrides, check_with_overrides,
-    FileFreshnessReport, FreshnessOutcome, FreshnessState, WorkspaceFingerprint,
-    DEFAULT_FRESHNESS_TTL, ENV_FRESHNESS_TTL_MS,
+    refresh_fingerprint_metadata, FileFreshnessReport, FreshnessOutcome, FreshnessState,
+    WorkspaceFingerprint, DEFAULT_FRESHNESS_TTL, ENV_FRESHNESS_TTL_MS,
 };
 pub use incremental::{compute_file_diff, incremental_update, FileDiff};
 pub use lock::{acquire, lock_path_for, try_acquire, try_lock, with_lock, Lock, LockError};
