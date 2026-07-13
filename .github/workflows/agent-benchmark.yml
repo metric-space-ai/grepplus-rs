@@ -54,7 +54,9 @@ jobs:
             --repos serde flask gson zod tokio django
 
       - name: Verify pinned task and repository contract
-        run: python3 bench/agent_efficiency/verify_real_tasks.py
+        run: |
+          python3 -m unittest discover -s bench/agent_efficiency -p 'test_*.py' -v
+          python3 bench/agent_efficiency/verify_real_tasks.py
 
       - name: Run pre-registered acceptance gate
         env:

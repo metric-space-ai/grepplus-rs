@@ -9,7 +9,7 @@
     "greppy-10x/bench/agent_efficiency/REALCORPUS_TASKGEN_SPEC.md"
   ],
   "generator": "bench/agent_efficiency/gen_real_tasks.py -- deterministic function of the inputs; no randomness, no timestamps.",
-  "input_candidates_sha256": "ce275fb39572d99b30a97cddb6efacafcc2e251eec3e0a47dab7130f06471547",
+  "input_candidates_sha256": "1ca14f6883b6d1e0fa2a00a5468a55d7ad6151ca9a58333ccf2501eb74e3dd92",
   "grading_semantics": "floor: expect_members = real caller-name subset floor, file_evidence = path-only match, min_count = floor; the reference oracle undercounts, so an agent finding MORE true callers must pass.",
   "classes": {
     "graph_discovery": {

@@ -101,6 +101,8 @@ MULTIHOP_MAX_RATIO = 0.3
 IMPACT_DEPTH_DIRECT = 1
 IMPACT_DEPTH_TOTAL = 12  # "total" transitive reach proxy (default CLI depth is 6)
 CHAIN_TASK_MAX = 5       # at most this many research tasks phrased as A->..->B traces
+INDEX_TIMEOUT_SECONDS = 1800
+INDEX_DIAGNOSTIC_LIMIT = 4096
 
 # ------------------------------------------------------- firewall pieces
 # English function words + the fixed task scaffolding vocabulary that appears
@@ -294,11 +296,29 @@ def ensure_mirrors(manifest: dict) -> dict[str, pathlib.Path]:
         mirrors[name] = dst
     env = dict(os.environ, GREPPY_STORE_DIR=str(STORE_DIR))
     for name, dst in mirrors.items():
-        subprocess.run(
-            [str(BIN), "index", str(dst), "--root", str(dst)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
-            stdin=subprocess.DEVNULL, check=True,
-        )
+        try:
+            completed = subprocess.run(
+                [str(BIN), "index", str(dst), "--root", str(dst)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=INDEX_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(
+                f"greppy index timed out for {name} after "
+                f"{INDEX_TIMEOUT_SECONDS}s"
+            ) from error
+        if completed.returncode != 0:
+            diagnostic = (completed.stderr or completed.stdout).strip()
+            if len(diagnostic) > INDEX_DIAGNOSTIC_LIMIT:
+                diagnostic = diagnostic[-INDEX_DIAGNOSTIC_LIMIT:]
+            raise RuntimeError(
+                f"greppy index failed for {name} with exit "
+                f"{completed.returncode}: {diagnostic or '<no diagnostic>'}"
+            )
     return mirrors
 
 
