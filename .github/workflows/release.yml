@@ -317,11 +317,12 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           if (-not $env:CERTIFICATE_PFX -or -not $env:CERTIFICATE_PASSWORD) {
-            # Owner decision 2026-07-13: only macOS is signed for now; Windows
-            # certificates are not provisioned. Skip LOUDLY instead of failing
-            # the whole release matrix - the release notes must state that the
-            # Windows binary is unsigned until a certificate exists.
-            Write-Host '::warning title=Windows binary UNSIGNED::No Windows signing certificate provisioned (macOS-only signing). Shipping unsigned Windows binary.'
+            # Owner decision 2026-07-13 (WINDOWS_SIGNING_MODE=MICROSOFT_STORE_MSIX):
+            # Windows ships via the Microsoft Store, where Microsoft signs the
+            # MSIX submission - the PFX secrets stay empty BY DESIGN. The
+            # direct-download binary is intentionally unsigned; release notes
+            # must point Windows users to the Store for a signed install.
+            Write-Host '::warning title=Windows direct-download binary is unsigned by design::Windows signing happens via Microsoft Store MSIX submission; the PFX path is intentionally disabled.'
             exit 0
           }
           $cert = Join-Path $env:RUNNER_TEMP 'greppy-signing.pfx'
@@ -622,10 +623,10 @@ jobs:
           if (-not (Test-Path "package/${{ matrix.asset }}.spdx.json")) { throw 'missing SPDX SBOM' }
           if ($env:GITHUB_REF -like 'refs/tags/*') {
             if (-not $env:HAVE_WINDOWS_CERT_SECRETS) {
-              # Consistent with the signing step: no Windows certificate is
-              # provisioned (macOS-only signing per owner) - the binary is
-              # deliberately unsigned; warn instead of failing the tag.
-              Write-Host '::warning title=Windows binary UNSIGNED::Skipping Authenticode verification - no Windows signing certificate provisioned.'
+              # Consistent with the signing step: Windows signing happens via
+              # the Microsoft Store MSIX channel; the direct-download binary is
+              # unsigned by design.
+              Write-Host '::warning title=Windows direct-download binary is unsigned by design::Authenticode verification skipped - signing happens via Microsoft Store MSIX.'
             } else {
               $signature = Get-AuthenticodeSignature "$PWD/unpack/greppy.exe"
               if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
