@@ -107,6 +107,13 @@ export GREPPY_EMBED_DAEMON_MODEL_TTL_S=5
 export GREPPY_EMBED_DAEMON_EXIT_TTL_S=15
 export GREPPY_SUMMARIZE_DAEMON_MODEL_TTL_S=5
 export GREPPY_SUMMARIZE_DAEMON_EXIT_TTL_S=15
+# Contain daemon sockets (crates/cli/src/inference_daemon.rs
+# unix_runtime_dir(): $XDG_RUNTIME_DIR/greppy when the joined path fits a
+# unix-socket-safe 32 chars, else /tmp/greppy-daemon-$UID) in a directory this
+# script owns, so the install/removal section can assert socket residue.
+RUNTIME_BASE="/tmp/gsr-$$"
+mkdir -p -m 700 "$RUNTIME_BASE"
+export XDG_RUNTIME_DIR="$RUNTIME_BASE"
 
 # --- baseline: doctor, index, JSON brief/semantic-search, expand ------------
 section "baseline: doctor, index, JSON brief + semantic-search + expand"
@@ -434,5 +441,101 @@ else
   fail "KNOWN-BUG marker outdated: cache clear --all now removes extracted model blobs — delete the expected-fail block and assert their removal"
 fi
 
+# --- simulated install + residue-free removal --------------------------------
+# Install the packaged binary into a temp prefix (exactly what the tarball
+# layout provides: a single `greppy` executable), run index+search end to end
+# under a fresh HOME/TMPDIR, then remove the prefix and assert the product
+# left NOTHING outside the two documented locations:
+# * the platform cache root (crates/core/src/cache.rs data_root(): macOS
+#   $HOME/Library/Application Support/greppy, Linux
+#   $XDG_DATA_HOME|$HOME/.local/share/greppy) — legitimate, enumerated below;
+# * the daemon runtime dir (crates/cli/src/inference_daemon.rs
+#   unix_runtime_dir(), pinned above to $XDG_RUNTIME_DIR/greppy) whose socket
+#   files must be gone once the daemons exit.
+section "simulated install + residue-free removal"
+
+PREFIX="$WORK/install-prefix"
+FAKE_HOME="$WORK/fake-home"
+FAKE_TMP="$WORK/fake-tmp"
+mkdir -p "$PREFIX/bin" "$PREFIX/smoke-repo/src" "$PREFIX/smoke-repo/.git" "$FAKE_HOME" "$FAKE_TMP"
+cp "$BIN" "$PREFIX/bin/greppy"
+chmod +x "$PREFIX/bin/greppy"
+cp "$WORK/repo/src/lib.rs" "$WORK/repo/src/case.rs" "$PREFIX/smoke-repo/src/"
+
+# macOS-vs-Linux guard: the documented default cache root differs per OS.
+case "$(uname -s)" in
+  Darwin) EXPECTED_CACHE="$FAKE_HOME/Library/Application Support/greppy" ;;
+  Linux)  EXPECTED_CACHE="$FAKE_HOME/.local/share/greppy" ;;
+  *)      fail "unsupported platform for the install/removal section: $(uname -s)" ;;
+esac
+
+# Snapshot the REAL environment so we can prove the sandboxed run did not
+# leak into it: the user's cache root and greppy-named /tmp entries.
+case "$(uname -s)" in
+  Darwin) REAL_CACHE="$HOME/Library/Application Support/greppy" ;;
+  Linux)  REAL_CACHE="${XDG_DATA_HOME:-$HOME/.local/share}/greppy" ;;
+esac
+real_cache_existed=0
+[ -e "$REAL_CACHE" ] && real_cache_existed=1
+STAMP="$WORK/install-stamp"
+touch "$STAMP"
+sleep 1  # ensure any leak is strictly newer than the stamp
+ls -d /tmp/greppy* "${TMPDIR:-/tmp}"/greppy* 2>/dev/null | LC_ALL=C sort -u >"$WORK/tmp-before.txt" || true
+
+# Run the installed binary with HOME/TMPDIR redirected and the store override
+# removed, so it exercises the real default cache-root selection.
+run_installed() {
+  env -u GREPPY_STORE_DIR -u XDG_DATA_HOME -u XDG_CACHE_HOME \
+    HOME="$FAKE_HOME" TMPDIR="$FAKE_TMP" \
+    "$PREFIX/bin/greppy" "$@"
+}
+run_installed --device cpu --root "$PREFIX/smoke-repo" index "$PREFIX/smoke-repo" >"$WORK/install-index.txt"
+run_installed --device cpu --root "$PREFIX/smoke-repo" semantic-search \
+  "restrict a numeric value to an allowed range" --json >"$WORK/install-semantic.json"
+jq -e '.status == "ok" and (.hits | length) >= 1' "$WORK/install-semantic.json" >/dev/null \
+  || fail "installed binary: semantic-search returned no hits"
+
+drain_daemons
+
+# The product may leave exactly one thing in the fake HOME: the documented
+# cache root (plus the bare ancestor directories needed to hold it).
+[ -d "$EXPECTED_CACHE" ] || fail "installed binary did not create the documented cache root at $EXPECTED_CACHE"
+find "$FAKE_HOME" -mindepth 1 | while IFS= read -r path; do
+  case "$path" in
+    "$EXPECTED_CACHE"|"$EXPECTED_CACHE"/*) ;;  # documented cache subtree
+    *)
+      case "$EXPECTED_CACHE/" in
+        "$path"/*) [ -d "$path" ] || fail "unexpected non-directory ancestor in fake HOME: $path" ;;
+        *) fail "unexpected residue in fake HOME outside the documented cache root: $path" ;;
+      esac
+      ;;
+  esac
+done
+# Nothing may be left in the redirected TMPDIR once the daemons exited.
+[ -z "$(find "$FAKE_TMP" -mindepth 1 2>/dev/null)" ] \
+  || fail "installed binary left residue in TMPDIR: $(find "$FAKE_TMP" -mindepth 1 | tr '\n' ' ')"
+# Daemon sockets must be gone from the runtime dir after drain (empty dirs ok).
+[ -z "$(find "$RUNTIME_BASE" -type f -o -type s 2>/dev/null)" ] \
+  || fail "daemon runtime dir still holds files after drain: $(find "$RUNTIME_BASE" -mindepth 1 | tr '\n' ' ')"
+
+# Removal: delete the prefix and the documented cache root; nothing else of
+# the product may remain anywhere in the fake HOME.
+rm -rf "$PREFIX" "$EXPECTED_CACHE"
+[ -z "$(find "$FAKE_HOME" -type f 2>/dev/null)" ] \
+  || fail "residue files remain in fake HOME after removal: $(find "$FAKE_HOME" -type f | tr '\n' ' ')"
+
+# The real environment must be untouched: no new/updated real cache root, no
+# new greppy-named /tmp entries.
+if [ "$real_cache_existed" -eq 1 ]; then
+  [ -z "$(find "$REAL_CACHE" -newer "$STAMP" -print 2>/dev/null | head -1)" ] \
+    || fail "sandboxed install run modified the real cache root at $REAL_CACHE"
+else
+  [ ! -e "$REAL_CACHE" ] || fail "sandboxed install run created the real cache root at $REAL_CACHE"
+fi
+ls -d /tmp/greppy* "${TMPDIR:-/tmp}"/greppy* 2>/dev/null | LC_ALL=C sort -u >"$WORK/tmp-after.txt" || true
+cmp -s "$WORK/tmp-before.txt" "$WORK/tmp-after.txt" \
+  || { diff -u "$WORK/tmp-before.txt" "$WORK/tmp-after.txt" >&2 || true; \
+       fail "sandboxed install run left new greppy entries under /tmp"; }
+rm -rf "$RUNTIME_BASE"
 
 printf '\nrelease package inference smoke passed: %s\n' "$BIN"
