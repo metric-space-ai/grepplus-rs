@@ -35,6 +35,21 @@ class WorkflowActionPinTests(unittest.TestCase):
         self.assertIn(f"{path}:2", errors[0])
         self.assertIn("actions/checkout@v4", errors[0])
 
+    def test_immutable_rust_toolchain_action_requires_explicit_repository_channel(self):
+        reference = "dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88"
+        missing = self.workflow(f"steps:\n  - uses: {reference}\n")
+        pinned = self.workflow(
+            f"steps:\n  - uses: {reference}\n"
+            "    with:\n"
+            "      toolchain: '1.95.0'\n"
+        )
+
+        errors = verifier.verify([missing])
+
+        self.assertEqual(len(errors), 1)
+        self.assertIn("must declare toolchain '1.95.0'", errors[0])
+        self.assertEqual(verifier.verify([pinned]), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -54,11 +54,12 @@ jobs:
       # small; `real-assets-link` verifies the actual product payloads.
 
       # rust-toolchain.toml pins the channel + components; this action
-      # reads it and installs exactly that toolchain. No `toolchain:`
-      # override so the pin is the single source of truth.
+      # The immutable action SHA cannot infer a channel from its ref name, so
+      # keep this explicit value synchronized with rust-toolchain.toml.
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
+          toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo registry, git, and target
@@ -191,6 +192,8 @@ jobs:
 
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
+        with:
+          toolchain: '1.95.0'
 
       - name: Build default product binary with real assets
         run: cargo build -p greppy --bin greppy
@@ -221,6 +224,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
+          toolchain: '1.95.0'
           components: rustfmt
 
       - name: Cache cargo registry, git, and target
@@ -283,6 +287,7 @@ jobs:
       - name: Install pinned Rust toolchain
         uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88
         with:
+          toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo registry, git, and target
