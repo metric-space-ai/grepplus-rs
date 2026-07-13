@@ -10,7 +10,10 @@ on:
       parallel:
         description: Concurrent agent tasks
         required: true
-        default: "5"
+        # 5 hit the 6-hour hosted-runner hard cap (job cancelled at exactly
+        # 6h00); the tasks are API-bound, not CPU-bound, so 10 halves the
+        # wall clock with the same runner.
+        default: "10"
 
 permissions:
   contents: read
@@ -111,7 +114,7 @@ jobs:
             --skip-verify \
             --tasks tasks_v2.json \
             --agents grep,greppy,explorer \
-            --parallel '${{ inputs.parallel || '5' }}' \
+            --parallel '${{ inputs.parallel || '10' }}' \
             --output-dir "$RUN_DIR"
 
       - name: Package publishable evidence without raw traces
