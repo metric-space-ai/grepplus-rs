@@ -1,6 +1,10 @@
 name: function summary quality release gate
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - crates/cli/assets/MODEL_ASSETS.json
   workflow_dispatch:
 
 permissions:

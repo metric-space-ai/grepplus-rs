@@ -1,6 +1,10 @@
 name: agent benchmark release gate
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - crates/cli/assets/MODEL_ASSETS.json
   workflow_dispatch:
     inputs:
       parallel:
@@ -107,7 +111,7 @@ jobs:
             --skip-verify \
             --tasks tasks_v2.json \
             --agents grep,greppy,explorer \
-            --parallel '${{ inputs.parallel }}' \
+            --parallel '${{ inputs.parallel || '5' }}' \
             --output-dir "$RUN_DIR"
 
       - name: Package publishable evidence without raw traces
