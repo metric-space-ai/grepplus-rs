@@ -27,12 +27,37 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: read
+      actions: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with:
           fetch-depth: 0
       - name: Test release artifact contract and verifiers
         run: python3 -m unittest tools.test_release_artifacts -v
+      - name: Require green CI, CodeQL, security-audit and task-bank for this commit
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # The publish job already binds summary/agent/coding benchmark evidence
+          # to this SHA; require the remaining mechanical gates on the exact
+          # release subject as well - a tag must never outrun its checks.
+          for wf in ci.yml codeql.yml security-audit.yml task-bank-audit.yml; do
+            ok="$(gh run list \
+              --repo "$GITHUB_REPOSITORY" \
+              --limit 100 \
+              --workflow "$wf" \
+              --commit "$GITHUB_SHA" \
+              --status completed \
+              --json conclusion \
+              --jq '[.[] | select(.conclusion == "success")] | length')"
+            if [ "${ok:-0}" -lt 1 ]; then
+              echo "::error::no successful $wf run exists for $GITHUB_SHA - all gates must be green on the exact release subject"
+              exit 1
+            fi
+            echo "$wf: green for $GITHUB_SHA"
+          done
       - name: Reject reused or replaced release subjects
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
