@@ -4,6 +4,7 @@ crates/cli/tests/assets/ci-test/** -text
 # platform. Keep LF checkout bytes stable when Git runs on Windows.
 licenses/*.html text eol=lf
 licenses/*.json text eol=lf
+licenses/*.md text eol=lf
 licenses/*.txt text eol=lf
 training/qwen35/*.json text eol=lf
 training/qwen35/*.sha256 text eol=lf

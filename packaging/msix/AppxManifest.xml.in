@@ -78,11 +78,14 @@
 
   <Applications>
     <!-- uap10:Subsystem="console" marks the app as a console app so launches
-         attach to the console correctly (10.0.19041+). -->
+         attach to the console correctly (10.0.19041+). MakeAppx requires
+         console apps to also declare SupportsMultipleInstances="true"
+         (each terminal invocation is its own process instance). -->
     <Application Id="Greppy"
         Executable="greppy.exe"
         EntryPoint="Windows.FullTrustApplication"
-        uap10:Subsystem="console">
+        uap10:Subsystem="console"
+        uap10:SupportsMultipleInstances="true">
       <!-- AppListEntry="none": greppy is a pure CLI - hide the Start-menu
            tile; users invoke the AppExecutionAlias from a terminal. This is
            permitted for Store apps; the Store listing must make the CLI

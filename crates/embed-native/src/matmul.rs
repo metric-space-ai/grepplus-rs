@@ -4524,8 +4524,13 @@ unsafe fn load_f16x4(ptr: *const f16) -> float32x4_t {
     result
 }
 
+// `sdot` needs the dotprod feature, which is baseline on Apple aarch64 but
+// NOT on aarch64-pc-windows-msvc; the attribute (not RUSTFLAGS) keeps the
+// kernel compiling on every aarch64 target. Callers stay sound because the
+// x8 prepack is only built behind a runtime dotprod/i8mm check.
 #[cfg(target_arch = "aarch64")]
-#[inline(always)]
+#[target_feature(enable = "dotprod")]
+#[inline]
 unsafe fn sdot_acc(acc: int32x4_t, a: int8x16_t, b: int8x16_t) -> int32x4_t {
     let mut out = acc;
     core::arch::asm!(
@@ -4576,6 +4581,7 @@ unsafe fn decode_q4kx8_scales(scales_in: *const u8) -> (int16x8_t, int16x8_t) {
 
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "i8mm")]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot8x4_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8Kx4]) -> [[f32; 8]; 4] {
     debug_assert!(std::arch::is_aarch64_feature_detected!("i8mm"));
     let mut out = [[0.0f32; 8]; 4];
@@ -4735,6 +4741,7 @@ unsafe fn dot8x4_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8Kx4]) -> [[f32; 8]
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot8_q4k_q8k_neon(xs: &[BlockQ4Kx8], ys: &[BlockQ8K]) -> [f32; 8] {
     let mut out = [0.0f32; 8];
     let mut vacc_0 = vdupq_n_f32(0.0);
@@ -5156,6 +5163,7 @@ unsafe fn dot4x4_q5k_q8k_neon(
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot_q5k_u8_q8k_neon(
     decoded: &[u8; QK_K],
     scale_mins: &([u8; 8], [u8; 8]),
@@ -5365,6 +5373,7 @@ unsafe fn dot4x4_q6k_q8k_neon(
 }
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[target_feature(enable = "dotprod")]
 unsafe fn dot_q6k_i8_q8k_neon(
     decoded: &[i8; QK_K],
     scales: &[i8; QK_K / 16],

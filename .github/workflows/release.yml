@@ -390,7 +390,11 @@ jobs:
           # on standalone executables - only bundles/dmg/pkg can be stapled;
           # proven by the first signing dry-run). CLI standard practice applies:
           # the notarization ticket is served online, which Gatekeeper checks.
-          spctl --assess --type execute --verbose=4 target/release/greppy
+          # spctl --assess --type execute is equally app-bundle-only: it exits 3
+          # ("valid but does not seem to be an app") for every bare executable
+          # (proven by the second dry-run), so strict signature verification is
+          # the correct final gate for a CLI.
+          codesign --verify --strict --verbose=2 target/release/greppy
 
       - name: Measure runtime footprint (Unix)
         if: runner.os != 'Windows'
@@ -441,6 +445,7 @@ jobs:
           mkdir -p dist
           cp target/release/greppy dist/greppy
           cp bench/release_package_smoke.sh dist/
+          cp bench/release_daemon_stress.sh dist/
           cp tools/release_artifacts.py dist/
           cp README.md LICENSE THIRD_PARTY.md SECURITY.md SUPPORT.md CHANGELOG.md Cargo.lock dist/
           cp -R licenses dist/licenses
@@ -604,6 +609,7 @@ jobs:
             spctl --assess --type execute --verbose=4 unpack/greppy
           fi
           bash unpack/release_package_smoke.sh "$PWD/unpack/greppy" "$PWD/smoke"
+          bash unpack/release_daemon_stress.sh "$PWD/unpack/greppy" "$PWD/daemon-stress"
           if [ "${{ runner.os }}" = Linux ]; then
             ! ldd unpack/greppy | grep -E 'cudart|cublas|nvrtc'
             test -s package/runtime-footprint-linux-x86_64-cpu.json
