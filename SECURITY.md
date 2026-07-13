@@ -94,6 +94,21 @@ SBOMs, build-environment records, benchmarks, and Qwen training evidence. Do
 not install a release if any contract, checksum, signature, or attestation
 check fails.
 
+## Dependency audit policy
+
+Every Cargo dependency change and the weekly scheduled audit are checked
+against RustSec. Vulnerability advisories are never allowlisted.
+
+`RUSTSEC-2024-0436` is the sole informational exception. It reports that the
+`paste` proc-macro crate is no longer maintained; it does not describe a
+vulnerability. Greppy does not depend on `paste` directly. The locked version
+is used transitively by `gemm`, `pulp`, `tokenizers`, and
+`macro_rules_attribute` while compiling the binary, and is not linked as
+runtime code. The exception must be removed as soon as those upstream crates
+offer a compatible maintained replacement. Any source, version, or dependency
+path change remains visible in `Cargo.lock`, Dependency Review, SBOMs, and the
+release provenance checks.
+
 ## Reporting a vulnerability
 
 Report vulnerabilities privately through GitHub's **Security > Report a

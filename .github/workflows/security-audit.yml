@@ -31,3 +31,7 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          # Informational maintenance advisory only. The locked `paste` crate
+          # is a transitive compile-time proc macro, not runtime code. The
+          # bounded exception and removal condition are in SECURITY.md.
+          ignore: RUSTSEC-2024-0436
