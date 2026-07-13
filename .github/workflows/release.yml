@@ -17,6 +17,15 @@ on:
   push:
     tags: ['v*']
   workflow_dispatch:
+    inputs:
+      sign_dry_run:
+        description: >-
+          RC signing dry-run: run the Apple/Windows signing, notarization and
+          verification steps on the built artifacts WITHOUT a tag and WITHOUT
+          publishing. Lets the first real signing test happen before the
+          immutable release tag exists. Requires the signing secrets.
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -280,7 +289,7 @@ jobs:
         run: cargo build --locked --release --bin greppy ${{ matrix.features != 'cpu' && format('--features {0}', matrix.features) || '' }}
 
       - name: Sign macOS binary with Developer ID
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
         shell: bash
         env:
           CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
@@ -301,7 +310,7 @@ jobs:
           codesign --verify --strict --verbose=2 target/release/greppy
 
       - name: Sign Windows binary with Authenticode
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'Windows'
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'Windows'
         shell: pwsh
         env:
           CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX_BASE64 }}
@@ -351,7 +360,7 @@ jobs:
           if ($want -ne $got) { Write-Error "version mismatch"; exit 1 }
 
       - name: Notarize and staple macOS signed binary
-        if: startsWith(github.ref, 'refs/tags/') && runner.os == 'macOS'
+        if: (startsWith(github.ref, 'refs/tags/') || inputs.sign_dry_run) && runner.os == 'macOS'
         shell: bash
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
