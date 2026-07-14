@@ -62,7 +62,7 @@
       "assets": [
         {
           "path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf",
-          "sha256": "d09d5028e28ea9df501d83a9a60b80ed73f878b4b98424b09a39505364a1053f",
+          "sha256": "1fd75d3d33ec508633054de2ecca341e7f8c4f4b49d2db654a4db78286c1827a",
           "size": 541903232
         },
         {
@@ -72,7 +72,7 @@
         },
         {
           "path": "crates/cli/assets/qwen35-0.8b-mtp-q4km/Qwen3.5-0.8B-MTP-Q4_K_M.gguf.sha256",
-          "sha256": "583a0dc1cad755f5f3b4d87d711683c7a96846c3700310007232d6eb1f00ea43",
+          "sha256": "90b05932b6986cc2dcc9ce4894a0eee8ebcaae48d37944cd3987569c9a480b97",
           "size": 65
         },
         {
