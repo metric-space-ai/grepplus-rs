@@ -86,3 +86,72 @@ class ReleaseGateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def graded(verdict: str, score: float, *, tools: int = 10, opens: int = 5,
+           variable_input: int = 1000) -> dict:
+    return {
+        "quality": {
+            "grader": "ground_truth_mechanical_v1",
+            "verdict": verdict,
+            "score": score,
+            "accepted_for_speed_claim": verdict == "pass",
+        },
+        "tool_calls": tools,
+        "source_open_calls": opens,
+        "variable_input": variable_input,
+    }
+
+
+class GradedQualityContractTests(ReleaseGateTests):
+    """BENCHMARK_CONTRACT.md: only genuinely missing grades void a run; a
+    graded partial/fail is a comparison datapoint, not a coverage gap."""
+
+    def test_partial_baseline_counts_as_candidate_win_not_missing(self) -> None:
+        rows = [
+            {
+                "id": f"t{index}",
+                "type": "locate",
+                "explorer": graded("partial", 0.5),
+                "greppy": graded("pass", 1.0, tools=7, opens=3, variable_input=700),
+            }
+            for index in range(4)
+        ]
+        status, report = self.evaluate(rows)
+        self.assertEqual(status, 0)
+        self.assertTrue(report["checks"]["all_rows_have_accepted_quality"])
+        self.assertEqual(report["quality"]["missing"], 0)
+        self.assertEqual(report["quality"]["candidate_wins"], 4)
+
+    def test_candidate_partial_against_pass_baseline_is_a_loss(self) -> None:
+        status, report = self.evaluate(
+            [
+                {
+                    "id": "t1",
+                    "type": "locate",
+                    "explorer": graded("pass", 1.0),
+                    "greppy": graded("partial", 0.5, tools=7, opens=3,
+                                     variable_input=700),
+                }
+            ]
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(report["quality"]["candidate_losses"], 1)
+        self.assertFalse(report["checks"]["candidate_observed_correctness_not_lower"])
+
+    def test_absent_grade_still_voids_the_run(self) -> None:
+        status, report = self.evaluate(
+            [
+                {
+                    "id": "t1",
+                    "type": "locate",
+                    "explorer": {"tool_calls": 10, "source_open_calls": 5,
+                                 "variable_input": 1000},
+                    "greppy": graded("pass", 1.0, tools=7, opens=3,
+                                     variable_input=700),
+                }
+            ]
+        )
+        self.assertEqual(status, 2)
+        self.assertEqual(report["quality"]["missing"], 1)
+        self.assertFalse(report["checks"]["all_rows_have_accepted_quality"])
