@@ -406,7 +406,11 @@ jobs:
           for device in ${{ matrix.footprint_devices }}; do
             timeout_args=()
             if [ "$device" = cpu ]; then
-              timeout_args=(--timeout-seconds 3600)
+              # 3600 was too tight: the serde embedding build on the 4-core
+              # hosted runner needs >1h on the pure-CPU path (dry-run #4 hit
+              # the cap). This is a measurement, not a quality gate - the
+              # numbers land in the release evidence either way.
+              timeout_args=(--timeout-seconds 7200)
             fi
             python3 bench/runtime_footprint.py \
               --greppy "$PWD/target/release/greppy" \
