@@ -11,13 +11,25 @@ from typing import Any
 
 
 def quality(row: dict[str, Any], agent: str) -> float | None:
+    """Graded quality score for the correctness comparison, or None when the
+    row genuinely lacks a grade.
+
+    Per BENCHMARK_CONTRACT.md, *missing grades* (grader absent/errored) make a
+    run non-decision-capable - a graded partial/fail verdict is NOT a missing
+    grade, it is a datapoint the paired win/loss gates exist to compare. The
+    earlier implementation returned None unless accepted_for_speed_claim was
+    True, which (a) hid every discordant pair from gates 1-2 and (b) charged
+    baseline-side partial verdicts against the candidate.
+    accepted_for_speed_claim keeps its documented role for speed claims; it
+    does not gate correctness scoring."""
     result = row.get(agent)
     if not isinstance(result, dict):
         return None
     evidence = result.get("quality")
-    if isinstance(evidence, dict) and evidence.get("accepted_for_speed_claim") is True:
+    if isinstance(evidence, dict):
         value = evidence.get("score")
-        return float(value) if value is not None else None
+        if value is not None:
+            return float(value)
     if result.get("correct") is not None:
         return 1.0 if result["correct"] else 0.0
     return None

@@ -452,9 +452,21 @@ chmod +x "$PREFIX/bin/greppy"
 cp "$WORK/repo/src/lib.rs" "$WORK/repo/src/case.rs" "$PREFIX/smoke-repo/src/"
 
 # macOS-vs-Linux guard: the documented default cache root differs per OS.
+# CUDA-featured binaries additionally materialize their embedded GPU backend
+# into the platform *cache* root (embed-native cuda_runtime_cache_root():
+# $XDG_CACHE_HOME|$HOME/.cache/greppy on Linux; with GREPPY_STORE_DIR set it
+# lands under the store instead, which is why only this env-stripped install
+# phase sees it). That is the second documented location an uninstall must
+# delete.
 case "$(uname -s)" in
-  Darwin) EXPECTED_CACHE="$FAKE_HOME/Library/Application Support/greppy" ;;
-  Linux)  EXPECTED_CACHE="$FAKE_HOME/.local/share/greppy" ;;
+  Darwin)
+    EXPECTED_CACHE="$FAKE_HOME/Library/Application Support/greppy"
+    EXPECTED_RUNTIME_CACHE="$FAKE_HOME/Library/Caches/greppy"
+    ;;
+  Linux)
+    EXPECTED_CACHE="$FAKE_HOME/.local/share/greppy"
+    EXPECTED_RUNTIME_CACHE="$FAKE_HOME/.cache/greppy"
+    ;;
   *)      fail "unsupported platform for the install/removal section: $(uname -s)" ;;
 esac
 
@@ -486,16 +498,19 @@ jq -e '.status == "ok" and (.hits | length) >= 1' "$WORK/install-semantic.json" 
 
 drain_daemons
 
-# The product may leave exactly one thing in the fake HOME: the documented
-# cache root (plus the bare ancestor directories needed to hold it).
+# The product may leave exactly two things in the fake HOME: the documented
+# data root and (cuda builds only) the runtime cache root, plus the bare
+# ancestor directories needed to hold them.
 [ -d "$EXPECTED_CACHE" ] || fail "installed binary did not create the documented cache root at $EXPECTED_CACHE"
 find "$FAKE_HOME" -mindepth 1 | while IFS= read -r path; do
   case "$path" in
-    "$EXPECTED_CACHE"|"$EXPECTED_CACHE"/*) ;;  # documented cache subtree
+    "$EXPECTED_CACHE"|"$EXPECTED_CACHE"/*) ;;                  # documented data subtree
+    "$EXPECTED_RUNTIME_CACHE"|"$EXPECTED_RUNTIME_CACHE"/*) ;;  # materialized GPU backend cache
+    "$FAKE_HOME/.nv"|"$FAKE_HOME/.nv"/*) ;;  # NVIDIA driver ComputeCache - libcuda writes it during the GPU probe on GPU hosts; third-party, not product residue
     *)
-      case "$EXPECTED_CACHE/" in
-        "$path"/*) [ -d "$path" ] || fail "unexpected non-directory ancestor in fake HOME: $path" ;;
-        *) fail "unexpected residue in fake HOME outside the documented cache root: $path" ;;
+      case "$EXPECTED_CACHE/:$EXPECTED_RUNTIME_CACHE/" in
+        "$path"/*|*":$path/"*) [ -d "$path" ] || fail "unexpected non-directory ancestor in fake HOME: $path" ;;
+        *) fail "unexpected residue in fake HOME outside the documented roots: $path" ;;
       esac
       ;;
   esac
@@ -507,9 +522,9 @@ done
 [ -z "$(find "$RUNTIME_BASE" -type f -o -type s 2>/dev/null)" ] \
   || fail "daemon runtime dir still holds files after drain: $(find "$RUNTIME_BASE" -mindepth 1 | tr '\n' ' ')"
 
-# Removal: delete the prefix and the documented cache root; nothing else of
+# Removal: delete the prefix and both documented roots; nothing else of
 # the product may remain anywhere in the fake HOME.
-rm -rf "$PREFIX" "$EXPECTED_CACHE"
+rm -rf "$PREFIX" "$EXPECTED_CACHE" "$EXPECTED_RUNTIME_CACHE"
 [ -z "$(find "$FAKE_HOME" -type f 2>/dev/null)" ] \
   || fail "residue files remain in fake HOME after removal: $(find "$FAKE_HOME" -type f | tr '\n' ' ')"
 
