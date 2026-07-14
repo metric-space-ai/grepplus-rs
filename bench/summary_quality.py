@@ -28,7 +28,12 @@ RESULTS_SCHEMA = "greppy.summary-quality-results.v1"
 JUDGMENTS_SCHEMA = "greppy.summary-quality-judgments.v1"
 GATE_SCHEMA = "greppy.summary-quality-gate.v1"
 SELECTION_VERSION = "greppy-summary-quality-selection-v1"
-JUDGE_PROMPT_VERSION = "greppy-summary-quality-judge-v2"
+# v3: the item file_path became a legitimate grounding source. The summary
+# generator (teacher and product alike) sees the path, and role terms taken
+# from it (tcp/listener.rs -> "listener") are grounded statements, not
+# inventions. Measured 2026-07-14: even the teacher failed the zero-tolerance
+# checks under v2 solely through path-grounded terms on one-line wrappers.
+JUDGE_PROMPT_VERSION = "greppy-summary-quality-judge-v3"
 SUMMARY_PROMPT_VERSION = "qwen35-brief-tag-v4"
 DEFAULT_REPOS = ("serde", "flask", "gson", "zod", "tokio", "hugo")
 EXCLUDED_PATH = re.compile(
@@ -316,12 +321,14 @@ def mechanical_flags(case: dict[str, Any], summary: list[str], source: str) -> l
         flags.append("signature_echo")
     if CODE_HINT.search(joined):
         flags.append("code_shaped_output")
-    source_lower = source.lower()
+    # file_path is grounding the generator legitimately sees (judge-v3
+    # symmetry): "JsonObject" from JsonObject.java is not an invented shape.
+    grounded = source.lower() + "\n" + case["file_path"].lower()
     invented = sorted(
         {
             token
             for token in SYMBOLISH.findall(joined)
-            if token.lower() not in source_lower
+            if token.lower() not in grounded
         }
     )
     if invented:
@@ -519,7 +526,8 @@ For each item, compare the generated summary with the exact source.
 Definitions:
 - helpful=true only when the hint gives a semantically correct high-level purpose that helps a developer decide whether to open the function. A vague but correct direction may pass.
 - misleading=true when it makes any material false claim about behavior, data flow, side effects, result, or role. Missing detail is not misleading.
-- invented_symbols lists code symbols named by the summary that do not exist in the source. Ordinary English words are not symbols.
+- The file_path of each item is legitimate grounding context: the generator sees it, so naming the role it implies (for example "listener" for tcp/listener.rs, or the type name from JsonObject.java) is grounded, not invented and not misleading by itself. Claims about BEHAVIOR must still be supported by the source.
+- invented_symbols lists code symbols named by the summary that appear neither in the source nor in the file_path. Ordinary English words are not symbols.
 - signature_echo=true when the output mainly restates the declaration/signature instead of purpose.
 - An empty summary is helpful=false and misleading=false.
 
@@ -625,6 +633,7 @@ def judge(args: argparse.Namespace) -> int:
         items = [
             {
                 "id": record["id"],
+                "file_path": cases[record["id"]]["file_path"],
                 "signature": cases[record["id"]]["signature"],
                 "source": source_for(cases[record["id"]]),
                 "summary": record["summary"],
@@ -657,11 +666,12 @@ def judge(args: argparse.Namespace) -> int:
         if response is None or rows is None:
             raise RuntimeError(f"judge failed after retries: {error}")
         for row in rows:
-            source_lower = source_for(cases[row["id"]]).lower()
+            case = cases[row["id"]]
+            grounded = source_for(case).lower() + "\n" + case["file_path"].lower()
             row["invented_symbols"] = [
                 symbol
                 for symbol in row.get("invented_symbols", [])
-                if isinstance(symbol, str) and symbol.lower() not in source_lower
+                if isinstance(symbol, str) and symbol.lower() not in grounded
             ]
         verdict_by_id.update({row["id"]: row for row in rows})
         document = {
