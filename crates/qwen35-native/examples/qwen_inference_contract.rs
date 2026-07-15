@@ -208,9 +208,12 @@ fn read_cases(path: &str) -> Result<Vec<PromptCase>, Box<dyn std::error::Error>>
             .map_err(|error| format!("{}:{}: {error}", path, index + 1))?;
         if case.id.trim().is_empty() || case.path.trim().is_empty() || case.source.trim().is_empty()
         {
-            return Err(
-                format!("{}:{}: id, path, and source must be non-empty", path, index + 1).into(),
-            );
+            return Err(format!(
+                "{}:{}: id, path, and source must be non-empty",
+                path,
+                index + 1
+            )
+            .into());
         }
         cases.push(case);
     }

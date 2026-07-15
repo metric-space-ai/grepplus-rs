@@ -58,7 +58,10 @@ mod tests {
         // One space after the colon, one newline before the source, and the
         // source itself byte-identical — training and inference must agree.
         let prompt = brief_prompt("crates/core/src/graph store.rs", "  fn g() {}\n\n");
-        assert_eq!(prompt, "brief: crates/core/src/graph store.rs\n  fn g() {}\n\n");
+        assert_eq!(
+            prompt,
+            "brief: crates/core/src/graph store.rs\n  fn g() {}\n\n"
+        );
     }
 
     #[test]

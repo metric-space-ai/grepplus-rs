@@ -10443,10 +10443,9 @@ fn semantic_vector_purposes(
         {
             if let Some((cfg, model_key)) = summary_runtime.as_ref() {
                 let code = cap_semantic_purpose_span(&span.text);
-                bullets = summarize_daemon::summarize_source_via_daemon(
-                    cfg, model_key, file_path, &code,
-                )
-                .unwrap_or_default();
+                bullets =
+                    summarize_daemon::summarize_source_via_daemon(cfg, model_key, file_path, &code)
+                        .unwrap_or_default();
             }
         }
         purposes.push(SemanticVectorPurpose {
