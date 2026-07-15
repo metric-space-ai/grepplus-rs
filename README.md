@@ -44,16 +44,17 @@ greppy brief _split_blueprint_path             # definition + callers + callees
 
 ```bash
 # Portable CPU build (both models are always embedded)
-git lfs install
-git lfs pull
+./tools/fetch_model_assets.sh   # sha256-pinned model weights from this repo's model releases
 cargo build --release --bin greppy
 sudo install -m 0755 target/release/greppy /usr/local/bin/greppy
 ```
 
 Every build embeds EmbeddingGemma and Qwen3.5 plus their tokenizers. No model is
-downloaded at runtime and neither model can be disabled. Git LFS must materialize
-the tracked model objects before Cargo runs; the build rejects missing or
-incorrect assets. CPU inference is always available; build with `--features
+downloaded at runtime and neither model can be disabled. The model weights are
+hosted as GitHub release assets and pinned by SHA-256 in
+[`crates/cli/assets/MODEL_ASSETS.json`](crates/cli/assets/MODEL_ASSETS.json);
+`tools/fetch_model_assets.sh` materializes and verifies them before Cargo runs,
+and the build rejects missing or incorrect assets. CPU inference is always available; build with `--features
 metal` on Apple Silicon or `--features cuda` on Linux/NVIDIA to include the
 accelerated backend. Runtime selection is automatic and can be made explicit
 with `--device cpu|metal|cuda[:INDEX]` or `GREPPY_DEVICE`.
@@ -236,6 +237,25 @@ evidence until current navigation and coding-outcome runs pass those gates.
 Index construction is outside measured agent sessions because it is reusable;
 release evidence reports its CPU/GPU wall time and resource cost separately and
 includes the amortized break-even instead of presenting precomputation as free.
+
+---
+
+## The research behind it
+
+The navigation problem greppy optimizes is formalized in an accompanying
+paper: **“The Minimum Sufficient Code Context Problem — Complexity, Discovery
+Overhead, and Approximation in Coding Agents”** (Michael Welsch, GPT-5.6 Sol,
+Fable 5.0 — theory and empirical draft, July 2026).
+**[Read the PDF](docs/paper/mscc-greppy-paper.pdf)**
+
+It defines the minimum sufficient code context (MSCC) an agent needs for a
+task, proves that constructing it exactly is NP-complete, lower-bounds what
+purely lexical navigation must pay for entry ambiguity and unresolved
+relations, and states the measurable conditions under which the combined
+policy greppy implements is strictly cheaper without losing correctness.
+The pre-registered factorial study in the paper is the same evidence design
+this repository enforces as release gates; the current draft ships the frozen
+protocol and first model panel, with the remaining panels in progress.
 
 ---
 
