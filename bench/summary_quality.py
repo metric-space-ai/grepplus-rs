@@ -34,7 +34,7 @@ SELECTION_VERSION = "greppy-summary-quality-selection-v1"
 # inventions. Measured 2026-07-14: even the teacher failed the zero-tolerance
 # checks under v2 solely through path-grounded terms on one-line wrappers.
 JUDGE_PROMPT_VERSION = "greppy-summary-quality-judge-v3"
-SUMMARY_PROMPT_VERSION = "qwen35-brief-tag-v4"
+SUMMARY_PROMPT_VERSION = "qwen35-brief-path-v5"
 DEFAULT_REPOS = ("serde", "flask", "gson", "zod", "tokio", "hugo")
 EXCLUDED_PATH = re.compile(
     r"(^|/)(tests?|testdata|bench(mark)?s?|examples?|vendor|third_party|generated)(/|$)"
