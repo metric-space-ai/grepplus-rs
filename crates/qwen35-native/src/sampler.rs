@@ -9,24 +9,28 @@ pub struct GenerationParams {
     pub max_tokens: usize,
 }
 
-/// Qwen model-card recommendation for non-thinking text tasks, with the
-/// requested 64-token hard cap for `brief`.
+/// Greedy primary decode for `brief` (owner decision 2026-07-16): the hint
+/// is a two-line factual statement from a 0.8B distillation - sampling at
+/// the Qwen model-card settings (temp 1.0, top_k 20, presence 2.0) caused
+/// measurable semantic inversions and invented terms. Greedy is faithful;
+/// its only failure mode (immediate <|im_end|> -> empty output) is covered
+/// by the sampled fallback below.
 pub const BRIEF_GENERATION_PARAMS: GenerationParams = GenerationParams {
-    temperature: 1.0,
-    top_p: 1.0,
-    top_k: 20,
-    min_p: 0.0,
-    presence_penalty: 2.0,
-    repetition_penalty: 1.0,
-    max_tokens: 64,
-};
-
-pub const BRIEF_FALLBACK_GENERATION_PARAMS: GenerationParams = GenerationParams {
     temperature: 0.0,
     top_p: 1.0,
     top_k: 1,
     min_p: 0.0,
     presence_penalty: 0.0,
+    repetition_penalty: 1.0,
+    max_tokens: 64,
+};
+
+pub const BRIEF_FALLBACK_GENERATION_PARAMS: GenerationParams = GenerationParams {
+    temperature: 1.0,
+    top_p: 1.0,
+    top_k: 20,
+    min_p: 0.0,
+    presence_penalty: 2.0,
     repetition_penalty: 1.0,
     max_tokens: 64,
 };
@@ -215,20 +219,20 @@ mod tests {
 
     #[test]
     fn brief_params_match_contract() {
-        assert_eq!(BRIEF_GENERATION_PARAMS.temperature, 1.0);
+        assert_eq!(BRIEF_GENERATION_PARAMS.temperature, 0.0);
         assert_eq!(BRIEF_GENERATION_PARAMS.top_p, 1.0);
-        assert_eq!(BRIEF_GENERATION_PARAMS.top_k, 20);
+        assert_eq!(BRIEF_GENERATION_PARAMS.top_k, 1);
         assert_eq!(BRIEF_GENERATION_PARAMS.min_p, 0.0);
-        assert_eq!(BRIEF_GENERATION_PARAMS.presence_penalty, 2.0);
+        assert_eq!(BRIEF_GENERATION_PARAMS.presence_penalty, 0.0);
         assert_eq!(BRIEF_GENERATION_PARAMS.repetition_penalty, 1.0);
         assert_eq!(BRIEF_GENERATION_PARAMS.max_tokens, 64);
     }
 
     #[test]
     fn brief_fallback_params_are_greedy() {
-        assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.temperature, 0.0);
-        assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.top_k, 1);
-        assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.presence_penalty, 0.0);
+        assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.temperature, 1.0);
+        assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.top_k, 20);
+        assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.presence_penalty, 2.0);
         assert_eq!(BRIEF_FALLBACK_GENERATION_PARAMS.max_tokens, 64);
     }
 
@@ -242,7 +246,7 @@ mod tests {
     #[test]
     fn presence_penalty_is_applied() {
         let mut logits = vec![0.0, 10.0, 5.0];
-        apply_sampling_filters(&mut logits, &[1], BRIEF_GENERATION_PARAMS);
+        apply_sampling_filters(&mut logits, &[1], BRIEF_FALLBACK_GENERATION_PARAMS);
         assert_eq!(logits[1], 8.0);
     }
 

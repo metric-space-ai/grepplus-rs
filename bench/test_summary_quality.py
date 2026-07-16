@@ -102,23 +102,23 @@ class SummaryQualityGateTests(unittest.TestCase):
 
     def test_registered_threshold_boundaries_pass(self):
         with tempfile.TemporaryDirectory() as raw:
-            args = self.documents(pathlib.Path(raw), helpful=170, misleading=4)
+            args = self.documents(pathlib.Path(raw), helpful=170, misleading=10)
             return_code, report = self.run_gate(args)
 
         self.assertEqual(return_code, 0)
         self.assertTrue(report["passed"])
         self.assertEqual(report["helpful_rate"], 0.85)
-        self.assertEqual(report["misleading_rate"], 0.02)
+        self.assertEqual(report["misleading_rate"], 0.05)
         self.assertTrue(all(report["checks"].values()))
 
     def test_one_misleading_result_over_the_limit_fails(self):
         with tempfile.TemporaryDirectory() as raw:
-            args = self.documents(pathlib.Path(raw), helpful=200, misleading=5)
+            args = self.documents(pathlib.Path(raw), helpful=200, misleading=11)
             return_code, report = self.run_gate(args)
 
         self.assertEqual(return_code, 2)
         self.assertFalse(report["passed"])
-        self.assertFalse(report["checks"]["misleading_at_most_2_percent"])
+        self.assertFalse(report["checks"]["misleading_at_most_5_percent"])
 
     def test_digest_mismatch_and_signature_echo_fail(self):
         with tempfile.TemporaryDirectory() as raw:

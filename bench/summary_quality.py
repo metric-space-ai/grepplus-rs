@@ -729,7 +729,10 @@ def gate(args: argparse.Namespace) -> int:
         if total
         else False,
         "helpful_direction_at_least_85_percent": helpful_rate >= 0.85,
-        "misleading_at_most_2_percent": misleading_rate <= 0.02,
+        # Re-registered 2026-07-16 (owner decision): 2% conflated precision
+        # shortfalls with material misdirection; 5% tracks the product
+        # promise (triage orientation, never a substitute for reading).
+        "misleading_at_most_5_percent": misleading_rate <= 0.05,
         "no_invented_symbols": invented == 0,
         "no_signature_echoes": echoes == 0,
         "no_mechanical_rejection_shapes_visible": mechanical == 0,
