@@ -1200,7 +1200,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if all((task["id"], arm) in completed for arm in ARMS):
             continue
         print(f"[{task['id']}] preparing pinned repository", flush=True)
-        with tempfile.TemporaryDirectory(prefix=f"greppy-agent-coding-{task['id']}-") as tmp_name:
+        # ignore_cleanup_errors: the greppy daemon may still be flushing into
+        # the worktree when the context exits; a leaked temp dir on an
+        # ephemeral runner is harmless, a crashed 2.5h benchmark run is not.
+        with tempfile.TemporaryDirectory(
+            prefix=f"greppy-agent-coding-{task['id']}-", ignore_cleanup_errors=True
+        ) as tmp_name:
             task_tmp = pathlib.Path(tmp_name)
             try:
                 backing = clone_pinned_repository(task, task_tmp)
