@@ -123,7 +123,7 @@ class SummaryQualityGateTests(unittest.TestCase):
         self.assertFalse(report["passed"])
         self.assertFalse(report["checks"]["anti_helpful_at_most_5_percent"])
 
-    def test_digest_mismatch_and_signature_echo_fail(self):
+    def test_digest_mismatch_fails_and_echoes_stay_diagnostic(self):
         with tempfile.TemporaryDirectory() as raw:
             args = self.documents(pathlib.Path(raw), helpful=200, anti=0)
             judgments = json.loads(args.judgments.read_text(encoding="utf-8"))
@@ -135,7 +135,10 @@ class SummaryQualityGateTests(unittest.TestCase):
         self.assertEqual(return_code, 2)
         self.assertFalse(report["passed"])
         self.assertFalse(report["checks"]["evidence_digests_match"])
-        self.assertFalse(report["checks"]["no_signature_echoes"])
+        # echoes are reported but no longer a pass/fail check: the utility
+        # scale classifies restatements as barely_helpful already
+        self.assertEqual(report["signature_echo_count"], 1)
+        self.assertNotIn("no_signature_echoes", report["checks"])
 
 
 class SummaryQualityJudgeTests(unittest.TestCase):

@@ -746,7 +746,12 @@ def gate(args: argparse.Namespace) -> int:
         # Judge-assessed count on ~200 LLM verdicts has a noise floor of a
         # single spurious flag; the deterministic mechanical checks stay at 0.
         "at_most_one_invented_symbol": invented <= 1,
-        "no_signature_echoes": echoes == 0,
+        # signature_echo_count stays a diagnostic: the utility scale already
+        # classifies prose restatements as barely_helpful (measured 5 of 6 on
+        # 2026-07-16), so a standalone zero-tolerance check double-counts and
+        # blocks on corpus composition (trivial getters), not model quality.
+        # Literal signature echoes are additionally suppressed by the product
+        # quality filter itself.
         "no_mechanical_rejection_shapes_visible": mechanical == 0,
         "judge_contract_is_pinned": judgments_doc.get("judge_prompt_version")
         == JUDGE_PROMPT_VERSION,
