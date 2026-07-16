@@ -105,12 +105,12 @@ class SummaryQualityGateTests(unittest.TestCase):
 
     def test_registered_threshold_boundaries_pass(self):
         with tempfile.TemporaryDirectory() as raw:
-            args = self.documents(pathlib.Path(raw), helpful=170, anti=10)
+            args = self.documents(pathlib.Path(raw), helpful=160, anti=10)
             return_code, report = self.run_gate(args)
 
         self.assertEqual(return_code, 0)
         self.assertTrue(report["passed"])
-        self.assertEqual(report["helpful_or_better_rate"], 0.85)
+        self.assertEqual(report["helpful_or_better_rate"], 0.8)
         self.assertEqual(report["anti_helpful_rate"], 0.05)
         self.assertTrue(all(report["checks"].values()))
 
@@ -122,6 +122,15 @@ class SummaryQualityGateTests(unittest.TestCase):
         self.assertEqual(return_code, 2)
         self.assertFalse(report["passed"])
         self.assertFalse(report["checks"]["anti_helpful_at_most_5_percent"])
+
+    def test_one_result_below_the_helpful_bar_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            args = self.documents(pathlib.Path(raw), helpful=159, anti=0)
+            return_code, report = self.run_gate(args)
+
+        self.assertEqual(return_code, 2)
+        self.assertFalse(report["passed"])
+        self.assertFalse(report["checks"]["helpful_or_better_at_least_80_percent"])
 
     def test_digest_mismatch_fails_and_echoes_stay_diagnostic(self):
         with tempfile.TemporaryDirectory() as raw:

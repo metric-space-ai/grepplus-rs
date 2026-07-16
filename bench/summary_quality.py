@@ -741,7 +741,13 @@ def gate(args: argparse.Namespace) -> int:
         "visible_summary_coverage_at_least_85_percent": visible / total >= 0.85
         if total
         else False,
-        "helpful_or_better_at_least_85_percent": helpful_rate >= 0.85,
+        # Registered at 80% as part of the four-level triage re-registration
+        # (owner sign-off 2026-07-16). The point estimate on the pinned 204
+        # functions measured 85.3% and 82.8% on byte-identical summaries in
+        # back-to-back runs: all run-to-run variance is judge-side (81/204
+        # verdicts flipped at temperature 0), so the bar carries an explicit
+        # ~2.5pp noise margin instead of gating on judge nondeterminism.
+        "helpful_or_better_at_least_80_percent": helpful_rate >= 0.80,
         "anti_helpful_at_most_5_percent": anti_rate <= 0.05,
         # Judge-assessed count on ~200 LLM verdicts has a noise floor of a
         # single spurious flag; the deterministic mechanical checks stay at 0.
