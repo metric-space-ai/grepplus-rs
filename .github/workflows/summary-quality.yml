@@ -92,7 +92,7 @@ jobs:
           judgments_sha="$(shasum -a 256 "$RUN_DIR/judgments.json" | awk '{print $1}')"
           gate_sha="$(shasum -a 256 "$RUN_DIR/gate.json" | awk '{print $1}')"
 
-          test "$(jq -r .schema_version "$RUN_DIR/gate.json")" = greppy.summary-quality-gate.v1
+          test "$(jq -r .schema_version "$RUN_DIR/gate.json")" = greppy.summary-quality-gate.v2-triage
           test "$(jq -r .binary_sha256 "$RUN_DIR/results.json")" = "$binary_sha"
           test "$(jq -r .cases_sha256 "$RUN_DIR/results.json")" = "$cases_sha"
           test "$(jq -r .cases_sha256 "$RUN_DIR/judgments.json")" = "$cases_sha"
