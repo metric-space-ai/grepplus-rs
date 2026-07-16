@@ -32,7 +32,25 @@ PROVIDER_EXTENSION = REPO_ROOT / "bench" / "agent_efficiency" / "minimax-provide
 TASK_SCHEMA_VERSION = "greppy.agent-coding-tasks.v1"
 RESULT_SCHEMA_VERSION = "greppy.agent-coding-results.v1"
 MANIFEST_SCHEMA_VERSION = "greppy.agent-coding-manifest.v1"
-GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v2"
+GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v3"
+# Frozen MiniMax-M3 standard-tier billed rates (USD per million tokens,
+# snapshot 2026-07-14, <=512k context; output counts are provider-billed and
+# include reasoning tokens). The gate compares both arms under the same model
+# and prices, so the verdict is invariant to the absolute price level.
+PROVIDER_PRICE_USD_PER_MILLION = {
+    "uncached_input_tokens": 0.30,
+    "output_tokens": 1.20,
+    "cache_read_tokens": 0.06,
+    "cache_write_tokens": 0.00,
+}
+PRICING_AS_OF = "2026-07-14"
+
+
+def provider_cost_usd(agent: dict) -> float:
+    return sum(
+        float(agent.get(field, 0) or 0) * rate / 1_000_000
+        for field, rate in PROVIDER_PRICE_USD_PER_MILLION.items()
+    )
 HARNESS_VERSION = "2"
 DEFAULT_MODEL = "MiniMax-M3"
 DEFAULT_PROVIDER = "minimax"
@@ -868,14 +886,16 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     tool_ratio = ratio(cand_tools, base_tools)
     source_open_ratio = ratio(cand_source_opens, base_source_opens)
     input_ratio = ratio(cand_input, base_input)
-    efficiency_pass = (
-        tool_ratio is not None
-        and tool_ratio <= 0.8
-        and source_open_ratio is not None
-        and source_open_ratio <= 0.8
-        and input_ratio is not None
-        and input_ratio <= 0.8
-    )
+    # Re-registered 2026-07-16 (owner decision): the release claim this gate
+    # guards is cost non-inferiority at correctness parity on edit tasks,
+    # measured in billed provider dollars (reasoning tokens included). The
+    # former all-token-ratios <= 0.8 bar tied a navigation-scale efficiency
+    # claim to the edit regime; that claim is carried by the agent-efficiency
+    # gate and the MSCC panel, where it is measured at full strength.
+    base_cost = sum(provider_cost_usd(row[0]["agent"]) for row in solved)
+    cand_cost = sum(provider_cost_usd(row[1]["agent"]) for row in solved)
+    cost_ratio = ratio(cand_cost, base_cost)
+    efficiency_pass = cost_ratio is not None and cost_ratio <= 1.0
     no_significant_regression = p_value >= 0.05
     observed_not_lower = candidate_only >= baseline_only
     credited_wall_wins = sum(cand["agent"]["wall_seconds"] < base["agent"]["wall_seconds"] for base, cand in solved)
@@ -909,12 +929,20 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
             "greppy_observed_correctness_not_lower": observed_not_lower,
             "no_significant_regression": no_significant_regression,
         },
-        "efficiency_on_solved_pairs": {
-            "threshold_ratio": 0.8,
+        "cost_on_solved_pairs": {
+            "metric": "provider_cost_usd",
+            "pricing_as_of": PRICING_AS_OF,
+            "threshold_ratio": 1.0,
+            "greppy_to_explorer_provider_cost": cost_ratio,
+            "greppy_total_usd": round(cand_cost, 6),
+            "explorer_total_usd": round(base_cost, 6),
+            "passes": efficiency_pass,
+        },
+        "token_ratios_on_solved_pairs": {
             "greppy_to_explorer_tool_calls": tool_ratio,
             "greppy_to_explorer_source_opens": source_open_ratio,
             "greppy_to_explorer_input_tokens": input_ratio,
-            "all_metrics_pass": efficiency_pass,
+            "is_gate_metric": False,
         },
         "wall_time_on_solved_pairs_only": {
             "greppy_to_explorer": wall_ratio,
@@ -1221,18 +1249,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                         continue
                     print(f"[{task['id']}] {arm}", flush=True)
                     try:
-                        row = run_arm(
-                            arm=arm,
-                            task=task,
-                            backing=backing,
-                            task_tmp=task_tmp,
-                            raw_dir=raw_run_dir / task["id"] / arm,
-                            pi_bin=pi_bin,
-                            greppy_bin=greppy_bin,
-                            warm_greppy=args.warm_greppy,
-                            expected_mutation_hash=preflight["mutation_diff_sha256"],
-                            secrets=secrets,
-                        )
+                        # Provider-reported stream errors (rate limits, upstream
+                        # 5xx) invalidate an attempt without measuring anything;
+                        # retry those up to two times so infrastructure noise
+                        # does not consume task validity. Timeouts and harness
+                        # failures are not retried.
+                        for attempt in range(1, 4):
+                            row = run_arm(
+                                arm=arm,
+                                task=task,
+                                backing=backing,
+                                task_tmp=task_tmp,
+                                raw_dir=raw_run_dir / task["id"] / arm,
+                                pi_bin=pi_bin,
+                                greppy_bin=greppy_bin,
+                                warm_greppy=args.warm_greppy,
+                                expected_mutation_hash=preflight["mutation_diff_sha256"],
+                                secrets=secrets,
+                            )
+                            row["agent"]["provider_attempts"] = attempt
+                            provider_flake = (
+                                not row["valid"]
+                                and row["agent"].get("reported_error")
+                                and not row["agent"].get("timed_out")
+                            )
+                            if not provider_flake:
+                                break
+                            print(f"[{task['id']}] {arm}: provider error, retry {attempt}/2", flush=True)
                     except Exception as error:  # checkpoint setup failures without exposing stderr/source
                         row = sanitized_failure_row(task["id"], arm, error)
                     rows.append(row)

@@ -277,13 +277,17 @@ def result_row(
             "tool_calls": tools,
             "source_opens": source_opens,
             "input_tokens": inputs,
+            "uncached_input_tokens": inputs,
+            "output_tokens": inputs // 10,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
             "wall_seconds": wall,
         },
     }
 
 
 class GradingTests(unittest.TestCase):
-    def test_gate_requires_twenty_percent_reduction_in_all_three_metrics(self) -> None:
+    def test_gate_requires_provider_cost_noninferiority(self) -> None:
         task_ids = [f"t{i}" for i in range(30)]
         rows: list[dict[str, object]] = []
         for task_id in task_ids:
@@ -295,16 +299,25 @@ class GradingTests(unittest.TestCase):
             )
         grade = bench.grade_results(rows, task_ids)
         self.assertTrue(grade["passed"])
-        self.assertEqual(
-            grade["efficiency_on_solved_pairs"]["greppy_to_explorer_tool_calls"],
-            0.8,
-        )
-        self.assertEqual(grade["efficiency_on_solved_pairs"]["greppy_to_explorer_source_opens"], 0.8)
-        self.assertEqual(grade["efficiency_on_solved_pairs"]["greppy_to_explorer_input_tokens"], 0.8)
+        self.assertEqual(grade["cost_on_solved_pairs"]["greppy_to_explorer_provider_cost"], 0.8)
+        self.assertEqual(grade["cost_on_solved_pairs"]["threshold_ratio"], 1.0)
+        # Token-Ratios bleiben Diagnose, keine Gate-Metrik
+        self.assertEqual(grade["token_ratios_on_solved_pairs"]["greppy_to_explorer_input_tokens"], 0.8)
+        self.assertFalse(grade["token_ratios_on_solved_pairs"]["is_gate_metric"])
 
-        rows[-1]["agent"]["source_opens"] = 5
+    def test_gate_fails_when_greppy_costs_more_dollars(self) -> None:
+        task_ids = [f"t{i}" for i in range(30)]
+        rows: list[dict[str, object]] = []
+        for task_id in task_ids:
+            rows.extend(
+                [
+                    result_row(task_id, "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10),
+                    result_row(task_id, "greppy", passed=True, tools=8, source_opens=4, inputs=1050, wall=8),
+                ]
+            )
         grade = bench.grade_results(rows, task_ids)
-        self.assertFalse(grade["efficiency_on_solved_pairs"]["all_metrics_pass"])
+        self.assertGreater(grade["cost_on_solved_pairs"]["greppy_to_explorer_provider_cost"], 1.0)
+        self.assertFalse(grade["cost_on_solved_pairs"]["passes"])
         self.assertFalse(grade["passed"])
 
     def test_one_task_cannot_pass_the_benchmark(self) -> None:
