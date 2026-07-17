@@ -513,10 +513,11 @@ pub fn delete_span(
     // also swallow ONE preceding blank line so deletions do not accumulate
     // double blank lines between the neighbours
     let mut start = def_range.0;
-    if start >= 1 && snapshot.content.get(start - 1) == Some(&b'\n') {
-        if start >= 2 && snapshot.content.get(start - 2) == Some(&b'\n') {
-            start -= 1;
-        }
+    if start >= 2
+        && snapshot.content.get(start - 1) == Some(&b'\n')
+        && snapshot.content.get(start - 2) == Some(&b'\n')
+    {
+        start -= 1;
     }
     let ops = vec![PlannedOp {
         id: "delete".into(),
@@ -539,6 +540,7 @@ pub fn delete_span(
 /// identifier-kind nodes are renamed, so strings and comments are never
 /// touched. `expect`: None = all occurrences (at least one), Some(n) =
 /// exactly n or refuse.
+#[allow(clippy::too_many_arguments)] // symbol verb surface mirrors the CLI contract
 pub fn rename_in_span(
     workspace_root: &Path,
     file: &Path,
@@ -664,10 +666,11 @@ fn identifier_sites(
         {
             out.push((node.start_byte(), node.end_byte()));
         }
-        if node.end_byte() >= def_range.0 && node.start_byte() <= def_range.1 {
-            if cursor.goto_first_child() {
-                continue;
-            }
+        if node.end_byte() >= def_range.0
+            && node.start_byte() <= def_range.1
+            && cursor.goto_first_child()
+        {
+            continue;
         }
         loop {
             if cursor.goto_next_sibling() {

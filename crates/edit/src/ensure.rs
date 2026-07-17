@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use crate::certificate::{Certificate, PublishMode, SelectorClass, SelectorEngine, Status};
+use crate::certificate::{Certificate, SelectorClass, SelectorEngine, Status};
 use crate::txn::{PlannedOp, Snapshot};
 use crate::verbs::{run_pipeline_public, single_refusal_certificate, VerbOptions};
 use greppy_core::Result;
