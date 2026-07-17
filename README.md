@@ -11,8 +11,12 @@
 `greppy` is a code-navigation tool that also accepts ordinary `grep`
 invocations. Those invocations execute the real system `grep` and forward its
 stdout, stderr, and exit code byte-for-byte; they do not open an index, load a
-model, or mutate a Greppy cache. Greppy is installed only as `greppy`, never as
-a global `grep` replacement.
+model, or mutate a Greppy cache. ripgrep-style invocations (`--smart-case`,
+`-t rust`, `-g '!target'`, …) are recognized too: they delegate byte-exactly
+to a real `rg` when one is installed, otherwise the common flag subset is
+mapped onto the grep passthrough, and anything grep cannot express fails
+loudly with the closest alternative — never a silently different search.
+Greppy is installed only as `greppy`, never as a global `grep` replacement.
 
 Its structured commands answer questions an agent otherwise spends several
 search-and-read rounds on: *who calls this function, what breaks if I change it,
