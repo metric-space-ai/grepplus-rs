@@ -747,6 +747,25 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Retarget identifier occurrences inside one definition (AST-based:
+    /// strings and comments are never touched). Without --expect, all
+    /// occurrences are renamed; with --expect N, exactly N or refusal.
+    #[command(name = "rename-call")]
+    RenameCall {
+        /// The definition to edit (resolved like `read`).
+        #[arg(long = "in")]
+        in_symbol: String,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        #[arg(long)]
+        expect: Option<usize>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Delete a definition (including its trailing newline; a doubled blank
     /// line is collapsed).
     #[command(name = "delete")]
@@ -5970,6 +5989,30 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 }
             }
         }
+        EditCommand::RenameCall {
+            in_symbol,
+            from,
+            to,
+            expect,
+            dry_run,
+            report,
+        } => match resolve_edit_target(Some(&in_symbol), None, root, &root_path)? {
+            EditTarget::Refusal(cert) => (*cert, report),
+            EditTarget::Resolved { rel_path, range } => {
+                let abs = root_path.join(&rel_path);
+                let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
+                let options = greppy_edit::verbs::VerbOptions {
+                    dry_run,
+                    with_diff: true,
+                };
+                (
+                    greppy_edit::verbs::rename_in_span(
+                        &root_path, &abs, range, &from, &to, expect, language, &options,
+                    )?,
+                    report,
+                )
+            }
+        },
         EditCommand::Delete {
             symbol,
             target,

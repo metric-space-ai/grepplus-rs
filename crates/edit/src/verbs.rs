@@ -343,6 +343,154 @@ pub fn delete_span(
     )
 }
 
+/// `greppy edit rename-call --in SYM --from A --to B`: retarget identifier
+/// occurrences of `from` inside one definition span. AST-based: only
+/// identifier-kind nodes are renamed, so strings and comments are never
+/// touched. `expect`: None = all occurrences (at least one), Some(n) =
+/// exactly n or refuse.
+pub fn rename_in_span(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    from: &str,
+    to: &str,
+    expect: Option<usize>,
+    language: Language,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let sites = identifier_sites(language, &snapshot.content, def_range, from.as_bytes());
+    let Some(sites) = sites else {
+        return Ok(single_op_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::NotFound,
+            0,
+            &[],
+            None,
+            None,
+            options,
+            PublishMode::Atomic,
+        ));
+    };
+    if from == to {
+        return Ok(single_op_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            Status::AlreadySatisfied,
+            sites.len(),
+            &[],
+            None,
+            None,
+            options,
+            PublishMode::Atomic,
+        ));
+    }
+    if sites.is_empty() {
+        // idempotency: if `to` already appears where `from` is gone, report
+        // already-satisfied instead of not-found
+        let to_sites = identifier_sites(language, &snapshot.content, def_range, to.as_bytes())
+            .unwrap_or_default();
+        let status = if to_sites.is_empty() {
+            Status::NotFound
+        } else {
+            Status::AlreadySatisfied
+        };
+        return Ok(single_op_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::TreeSitter,
+            SelectorClass::Structural,
+            status,
+            0,
+            &[],
+            None,
+            None,
+            options,
+            PublishMode::Atomic,
+        ));
+    }
+    if let Some(n) = expect {
+        if sites.len() != n {
+            return Ok(single_op_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::TreeSitter,
+                SelectorClass::Structural,
+                Status::Ambiguous,
+                sites.len(),
+                &[],
+                None,
+                None,
+                options,
+                PublishMode::Atomic,
+            ));
+        }
+    }
+    let ops: Vec<PlannedOp> = sites
+        .iter()
+        .enumerate()
+        .map(|(i, &(start, end))| PlannedOp {
+            id: format!("rename-{i}"),
+            range: (start, end),
+            replacement: to.as_bytes().to_vec(),
+        })
+        .collect();
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::TreeSitter,
+        SelectorClass::Structural,
+        Some(language),
+        options,
+    )
+}
+
+/// Byte ranges of identifier-kind leaf nodes whose text equals `name`,
+/// restricted to `def_range`. None when the language cannot be parsed.
+fn identifier_sites(
+    language: Language,
+    content: &[u8],
+    def_range: (usize, usize),
+    name: &[u8],
+) -> Option<Vec<(usize, usize)>> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        if node.start_byte() >= def_range.0
+            && node.end_byte() <= def_range.1
+            && node.child_count() == 0
+            && node.kind().contains("identifier")
+            && &content[node.start_byte()..node.end_byte()] == name
+        {
+            out.push((node.start_byte(), node.end_byte()));
+        }
+        if node.end_byte() >= def_range.0 && node.start_byte() <= def_range.1 {
+            if cursor.goto_first_child() {
+                continue;
+            }
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    Some(out)
+}
+
 /// Locate the byte range of the `body` field of the smallest named node
 /// covering `def_range`. None when the language has no tree-sitter grammar
 /// or the node has no body field (e.g. a struct without one).
@@ -785,6 +933,71 @@ mod tests {
         assert_eq!(cert.status, Status::Stale);
         assert_eq!(cert.exit_code(), 12);
         assert_eq!(std::fs::read(&f).unwrap(), b"fn a() { changed(); }\n");
+    }
+
+    #[test]
+    fn rename_call_renames_only_identifiers() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        let content =
+            b"def run():\n    legacy_auth()\n    print(\"legacy_auth\")\n    x = legacy_auth\n";
+        std::fs::write(&f, content).unwrap();
+        let cert = rename_in_span(
+            dir.path(),
+            &f,
+            (0, content.len()),
+            "legacy_auth",
+            "validate",
+            None,
+            Language::Python,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert!(out.contains("validate()"), "{out}");
+        // string literal untouched
+        assert!(out.contains("print(\"legacy_auth\")"), "{out}");
+        assert!(out.contains("x = validate"), "{out}");
+    }
+
+    #[test]
+    fn rename_call_expect_mismatch_refuses() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        std::fs::write(&f, b"def run():\n    a()\n    a()\n").unwrap();
+        let cert = rename_in_span(
+            dir.path(),
+            &f,
+            (0, 24),
+            "a",
+            "b",
+            Some(1),
+            Language::Python,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Ambiguous);
+        assert!(std::fs::read_to_string(&f).unwrap().contains("a()"));
+    }
+
+    #[test]
+    fn rename_call_idempotent_second_run() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        std::fs::write(&f, b"def run():\n    b()\n").unwrap();
+        let cert = rename_in_span(
+            dir.path(),
+            &f,
+            (0, 19),
+            "a",
+            "b",
+            None,
+            Language::Python,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::AlreadySatisfied);
     }
 
     #[test]
