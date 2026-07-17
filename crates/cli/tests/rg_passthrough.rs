@@ -87,10 +87,12 @@ fn untranslatable_flag_refuses_loudly() {
     let d = fixture_dir();
     let out = run_translated(&["--files"], &d);
     assert_ne!(out.status.code(), Some(0));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("--files"), "stderr: {stderr}");
-    assert!(stderr.contains("find PATH -type f"), "stderr: {stderr}");
-    assert!(out.stdout.is_empty(), "refusal must not emit matches");
+    // Refusals go to STDOUT: agents habitually append 2>/dev/null, and a
+    // lesson they never see teaches nothing. The nonzero exit code still
+    // marks the failure for scripts.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--files"), "stdout: {stdout}");
+    assert!(stdout.contains("find PATH -type f"), "stdout: {stdout}");
 }
 
 #[test]
@@ -98,8 +100,8 @@ fn replace_flag_names_the_edit_alternative() {
     let d = fixture_dir();
     let out = run_translated(&["alpha", "--replace", "omega", "."], &d);
     assert_ne!(out.status.code(), Some(0));
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("greppy edit regex-cas"), "stderr: {stderr}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("greppy edit regex-cas"), "stdout: {stdout}");
 }
 
 #[test]
