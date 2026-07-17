@@ -1054,11 +1054,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
             Err(Error::Invalid(msg)) => {
-                eprintln!("{msg}");
+                // Agent-facing terminal errors go to STDOUT: trace forensics
+                // (2026-07-17) showed agents piping `2>/dev/null` and seeing
+                // "(no output)" where the refusal explained the retry. Exit
+                // code still signals failure to scripts.
+                println!("{msg}");
                 EXIT_USAGE
             }
             Err(other) => {
-                eprintln!("{other}");
+                println!("{other}");
                 EXIT_IO
             }
         };
@@ -1075,11 +1079,15 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
             Err(Error::Invalid(msg)) => {
-                eprintln!("{msg}");
+                // Agent-facing terminal errors go to STDOUT: trace forensics
+                // (2026-07-17) showed agents piping `2>/dev/null` and seeing
+                // "(no output)" where the refusal explained the retry. Exit
+                // code still signals failure to scripts.
+                println!("{msg}");
                 EXIT_USAGE
             }
             Err(other) => {
-                eprintln!("{other}");
+                println!("{other}");
                 EXIT_IO
             }
         };
@@ -1105,12 +1113,14 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
             let msg = e.to_string();
             let first = msg.lines().next().unwrap_or("invalid arguments");
-            eprintln!("{first}");
+            // STDOUT, not stderr: agents habitually append `2>/dev/null`,
+            // and a usage lesson they never see teaches nothing (P3).
+            println!("{first}");
             let sub = argv.get(1).and_then(|s| s.to_str()).unwrap_or("");
             if let Some(usage) = subcommand_usage(sub) {
-                eprintln!("usage: {usage}");
+                println!("usage: {usage}");
             } else {
-                eprintln!(
+                println!(
                     "usage: greppy <command> --help  (commands: index, trial, who-calls, callees, \
                      find-usages, impact, brief, semantic-search, search-code, search-symbols, \
                      path, index status)"

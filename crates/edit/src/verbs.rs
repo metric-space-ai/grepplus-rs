@@ -821,6 +821,21 @@ pub fn change_signature(
     Ok(cert)
 }
 
+/// Smallest node covering `def_range` with the range's leading whitespace
+/// skipped. Store spans are line-addressed and start at column 0, but the
+/// definition node starts after the indentation; querying tree-sitter with
+/// the padding included resolves to the PARENT node (for a method inside an
+/// impl: the declaration list), whose "body"/"parameters" fields then fail
+/// the containment check - an indented definition reported not-found while
+/// a top-level one worked (trace forensics 2026-07-17).
+fn padded_range_query_start(content: &[u8], def_range: (usize, usize)) -> usize {
+    content
+        .get(def_range.0..def_range.1)
+        .and_then(|span| span.iter().position(|b| !b.is_ascii_whitespace()))
+        .map(|off| def_range.0 + off)
+        .unwrap_or(def_range.0)
+}
+
 /// Byte range of the `parameters` field of the definition at `def_range`.
 fn parameters_range_within(
     language: Language,
@@ -828,9 +843,10 @@ fn parameters_range_within(
     def_range: (usize, usize),
 ) -> Option<(usize, usize)> {
     let tree = greppy_parser::parse(language, content).ok()?;
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(def_range.0, def_range.1.saturating_sub(1))?;
+    let mut node = tree.root_node().descendant_for_byte_range(
+        padded_range_query_start(content, def_range),
+        def_range.1.saturating_sub(1),
+    )?;
     loop {
         if let Some(params) = node.child_by_field_name("parameters") {
             if params.start_byte() >= def_range.0 && params.end_byte() <= def_range.1 {
@@ -851,9 +867,10 @@ pub fn signature_fingerprint(
     def_range: (usize, usize),
 ) -> Option<String> {
     let tree = greppy_parser::parse(language, content).ok()?;
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(def_range.0, def_range.1.saturating_sub(1))?;
+    let mut node = tree.root_node().descendant_for_byte_range(
+        padded_range_query_start(content, def_range),
+        def_range.1.saturating_sub(1),
+    )?;
     // climb to the smallest node with a name field covering the range
     loop {
         if node.child_by_field_name("name").is_some() {
@@ -1073,9 +1090,10 @@ fn body_range_within(
     def_range: (usize, usize),
 ) -> Option<(usize, usize)> {
     let tree = greppy_parser::parse(language, content).ok()?;
-    let mut node = tree
-        .root_node()
-        .descendant_for_byte_range(def_range.0, def_range.1.saturating_sub(1))?;
+    let mut node = tree.root_node().descendant_for_byte_range(
+        padded_range_query_start(content, def_range),
+        def_range.1.saturating_sub(1),
+    )?;
     loop {
         if let Some(body) = node.child_by_field_name("body") {
             // only accept a body that lies inside the addressed definition
@@ -1795,6 +1813,45 @@ timeout = 30
         let out = std::fs::read_to_string(&f).unwrap();
         assert!(out.starts_with("def add(a, b):"), "{out}");
         assert!(out.contains("return b + a"), "{out}");
+    }
+
+    #[test]
+    fn replace_body_resolves_indented_method_from_line_start_range() {
+        // Store spans are line-addressed: the range starts at column 0,
+        // BEFORE the method's indentation. The padded bytes used to make
+        // the node lookup land on the impl's declaration list, whose body
+        // starts before the range - reported not-found for every indented
+        // method while top-level functions worked (2026-07-17 forensics).
+        let dir = ws();
+        let f = dir.path().join("impls.rs");
+        let content: &[u8] = b"pub struct R { pub s: u32 }\nimpl R {\n    pub fn serialize(&self) -> String {\n        format!(\"begin={}\", self.s)\n    }\n}\n";
+        std::fs::write(&f, content).unwrap();
+        let text = std::str::from_utf8(content).unwrap();
+        let start = text.find("    pub fn serialize").unwrap();
+        let end = text.rfind("    }\n").unwrap() + "    }".len();
+        let cert = replace_body(
+            dir.path(),
+            &f,
+            (start, end),
+            b"{\n        format!(\"start={}\", self.s)\n    }",
+            Language::Rust,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied, "{cert:?}");
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert!(out.contains("start={}"), "{out}");
+        assert!(out.contains("pub fn serialize(&self) -> String"), "{out}");
+    }
+
+    #[test]
+    fn signature_fingerprint_works_for_indented_method() {
+        let content: &[u8] = b"impl R {\n    pub fn serialize(&self, n: u32) -> String {\n        format!(\"x\")\n    }\n}\n";
+        let text = std::str::from_utf8(content).unwrap();
+        let start = text.find("    pub fn").unwrap();
+        let end = text.rfind("    }").unwrap() + 5;
+        let fp = signature_fingerprint(Language::Rust, content, (start, end));
+        assert!(fp.is_some(), "indented method must fingerprint");
     }
 
     #[test]
