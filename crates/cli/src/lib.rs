@@ -2283,11 +2283,81 @@ fn suggestion_needles(query: &str) -> Vec<String> {
     needles
 }
 
+/// Split `file/path.ext::REST` into `(path, rest)` when the head segment is a
+/// file path. `search-symbols`/`read` PRINT qualified names as
+/// `path::Owner::name` or `path::Kind::name`, so agents naturally feed those
+/// forms — and their simplifications (`path::name`) — straight back in.
+/// Postel's law: the tool must accept every form it emits. The path only
+/// NARROWS; the last `::`/`.` segment is always the symbol name.
+fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
+    let idx = query.find("::")?;
+    let head = &query[..idx];
+    let looks_like_path = head.contains('/')
+        || std::path::Path::new(head)
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()));
+    looks_like_path.then(|| (head, &query[idx + 2..]))
+}
+
 fn resolve_symbol_nodes(store: &greppy_store::Store, symbol: Option<&str>) -> Result<Vec<i64>> {
     let Some(s) = symbol else {
         // No symbol: mirror resolve_symbol_id's "first node" behaviour.
         return Ok(resolve_symbol_id(store, None)?.into_iter().collect());
     };
+    // Path-qualified query (`path::name`, `path::Kind::name`, `path::Owner::name`
+    // — exactly what search-symbols/read print): the last segment is the name,
+    // the file path narrows, any middle Kind/Owner segment narrows further but
+    // is not required. This accepts every emitted form and its natural
+    // simplifications instead of only the one exact string.
+    if let Some((path, spec)) = split_path_qualified(s) {
+        let name = spec
+            .rsplit("::")
+            .next()
+            .and_then(|x| x.rsplit('.').next())
+            .unwrap_or(spec);
+        let middle = split_qualified(spec).map(|(owner, _)| {
+            owner
+                .rsplit("::")
+                .next()
+                .and_then(|o| o.rsplit('.').next())
+                .unwrap_or(owner)
+        });
+        let rows = symbol_candidate_rows(store, Some(name))?;
+        let in_path: Vec<&greppy_search::graph::SearchGraphRow> = rows
+            .iter()
+            .filter(|r| {
+                r.name == name
+                    && is_primary_label(&r.label)
+                    && r.qualified_name.starts_with(&format!("{path}::"))
+            })
+            .collect();
+        // If a middle segment was given (Kind label or owner), prefer the
+        // subset it disambiguates to; otherwise take all name+path matches.
+        let mut ids: Vec<i64> = match middle {
+            Some(m) => {
+                let narrowed: Vec<i64> = in_path
+                    .iter()
+                    .filter(|r| {
+                        qname_owner_segment(&r.qualified_name) == Some(m)
+                            || r.label.eq_ignore_ascii_case(m)
+                    })
+                    .map(|r| r.id)
+                    .collect();
+                if narrowed.is_empty() {
+                    in_path.iter().map(|r| r.id).collect()
+                } else {
+                    narrowed
+                }
+            }
+            None => in_path.iter().map(|r| r.id).collect(),
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+    }
     // Name filter pushed into SQL — see resolve_symbol_id for why the old
     // capped whole-project scan was wrong on large repos.
     let rows = symbol_candidate_rows(store, Some(s))?;
@@ -6006,41 +6076,77 @@ fn dispatch_read(
         }
     }
     if nodes.is_empty() {
-        // Dead ends must carry the next step (P3): both MiniMax and Kimi
-        // agents guess signature-shaped names ("impl Serialize for Range")
-        // and burned 4-5 turns each rediscovering the qualified form until
-        // the miss listed similar indexed names (trace forensics 2026-07-17).
+        // Exact/graph resolution missed. greppy has an EMBEDDING engine
+        // precisely so a reasonable-but-inexact reference still resolves —
+        // "_startsWith", "impl Serialize for Bound", "the fn that validates
+        // prefixes". Hard-failing here (as the old bare-name suggestion did)
+        // wastes the second engine and forces the agent to guess formats
+        // (trace forensics 2026-07-17: 12 read not-founds, 4-5 turns each).
         let query = symbol.unwrap_or("");
-        let mut similar = Vec::new();
-        for needle in suggestion_needles(query) {
-            similar = store
-                .similar_node_names(&project, &needle, 5)
-                .unwrap_or_default();
-            if !similar.is_empty() {
-                break;
+        let hits =
+            greppy_search::semantic_query(&store, query, None, Some(&project), 6).unwrap_or_default();
+        // A clearly dominant hit is safe to read directly (read mutates
+        // nothing); otherwise offer addressable candidates and let the agent
+        // pick. Dominance = single hit, or top score >= 1.4x the runner-up.
+        let dominant = match hits.as_slice() {
+            [only] => Some(only.node.id),
+            [top, second, ..] if top.score >= second.score * 1.4 => Some(top.node.id),
+            _ => None,
+        };
+        if let Some(id) = dominant {
+            if let Some(node) = store.get_node(id)? {
+                if !node.file_path.is_empty() && node.start_line >= 1 {
+                    if !json {
+                        println!(
+                            "read: `{query}` resolved semantically to `{}`",
+                            node.qualified_name
+                        );
+                    }
+                    nodes.push(node);
+                }
             }
         }
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "schema_version": READ_JSON_SCHEMA_VERSION,
-                    "command": "read",
-                    "status": "not-found",
-                    "query": query,
-                    "similar": similar,
-                }))
-                .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
-            );
-        } else if similar.is_empty() {
-            println!("read: no definition found for `{query}`");
-        } else {
-            println!(
-                "read: no definition found for `{query}`; similar indexed names: {} — retry with one of these",
-                similar.join(", ")
-            );
+        if nodes.is_empty() {
+            // No single confident match: hand back addressable candidates —
+            // the exact qualified name read accepts, plus location and kind —
+            // so the retry is copy-paste, not another guess.
+            let candidates: Vec<serde_json::Value> = hits
+                .iter()
+                .take(5)
+                .map(|h| {
+                    serde_json::json!({
+                        "qualified_name": h.node.qualified_name,
+                        "path": h.node.file_path,
+                        "line": h.node.start_line,
+                        "kind": h.node.label,
+                    })
+                })
+                .collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": READ_JSON_SCHEMA_VERSION,
+                        "command": "read",
+                        "status": "not-found",
+                        "query": query,
+                        "candidates": candidates,
+                    }))
+                    .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
+                );
+            } else if candidates.is_empty() {
+                println!("read: no definition found for `{query}`");
+            } else {
+                println!("read: no exact match for `{query}`; closest definitions:");
+                for h in hits.iter().take(5) {
+                    println!(
+                        "  {}  ({}:{}, {})",
+                        h.node.qualified_name, h.node.file_path, h.node.start_line, h.node.label
+                    );
+                }
+            }
+            return Ok(10);
         }
-        return Ok(10);
     }
     if nodes.len() > 1 {
         // distinct definition sites -> ambiguous, list candidates (exit 11);
