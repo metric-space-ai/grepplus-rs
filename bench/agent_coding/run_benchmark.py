@@ -69,6 +69,9 @@ def provider_cost_usd(agent: dict) -> float:
 HARNESS_VERSION = "2"
 DEFAULT_MODEL = os.environ.get("GREPPY_BENCH_MODEL", "MiniMax-M3")
 DEFAULT_PROVIDER = os.environ.get("GREPPY_BENCH_PROVIDER", "minimax")
+# "off" for the registered MiniMax gate; forensics runs set e.g. "medium" so
+# models that RETURN reasoning (Kimi K3) leave it in the recorded trace.
+DEFAULT_THINKING = os.environ.get("GREPPY_BENCH_THINKING", "off")
 RAW_ROOT = HERE / "raw_traces"
 ARMS = ("explorer", "greppy", "greppy-edit")
 MIN_COMPLETE_PAIRS = 30
@@ -648,7 +651,7 @@ def run_pi_agent(
         "json",
         "--no-session",
         "--thinking",
-        "off",
+        DEFAULT_THINKING,
         "--tools",
         ARM_TOOLS[arm],
         "--no-context-files",
@@ -1159,7 +1162,7 @@ def build_base_manifest(
         "created_at": utc_now(),
         "publishable": True,
         "contains_raw_traces": False,
-        "model": {"provider": DEFAULT_PROVIDER, "id": DEFAULT_MODEL, "thinking": "off"},
+        "model": {"provider": DEFAULT_PROVIDER, "id": DEFAULT_MODEL, "thinking": DEFAULT_THINKING},
         "tools_per_arm": {arm: ARM_TOOLS[arm].split(",") for arm in ARMS},
         "provider_extension": {
             "repository_path": "bench/agent_efficiency/minimax-provider.js",
