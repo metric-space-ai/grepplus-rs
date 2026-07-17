@@ -685,6 +685,194 @@ fn identifier_sites(
     Some(out)
 }
 
+/// Cross-file rename input: per file, the byte spans in which identifier
+/// occurrences of the old name are AST-verified and renamed. Spans of
+/// `(0, usize::MAX)` mean "the whole file" (definition file, import lines).
+pub struct RenameFileScope {
+    pub rel_path: String,
+    pub spans: Vec<(usize, usize)>,
+}
+
+/// Graph-backed `rename-symbol`: rename identifier occurrences of `from`
+/// inside the given per-file scopes, publish all files as one journal
+/// transaction. Every site is AST-verified (identifier-kind leaf nodes
+/// only). Returns the certificate with one operation report per file.
+pub fn rename_symbol_files(
+    workspace_root: &Path,
+    scopes: &[RenameFileScope],
+    from: &str,
+    to: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    use crate::journal::FilePublication;
+    let mut op_reports = Vec::new();
+    let mut publications = Vec::new();
+    let mut total_sites = 0usize;
+    for scope in scopes {
+        let abs = workspace_root.join(&scope.rel_path);
+        let snapshot = Snapshot::read(&abs)?;
+        let language = greppy_parser::language_for_path(&abs);
+        let mut sites: Vec<(usize, usize)> = Vec::new();
+        for &(start, end) in &scope.spans {
+            let end = end.min(snapshot.content.len());
+            if let Some(mut found) =
+                identifier_sites(language, &snapshot.content, (start, end), from.as_bytes())
+            {
+                sites.append(&mut found);
+            }
+        }
+        sites.sort_unstable();
+        sites.dedup();
+        if sites.is_empty() {
+            continue;
+        }
+        total_sites += sites.len();
+        let ops: Vec<PlannedOp> = sites
+            .iter()
+            .enumerate()
+            .map(|(i, &(start, end))| PlannedOp {
+                id: format!("rename-{}-{i}", scope.rel_path),
+                range: (start, end),
+                replacement: to.as_bytes().to_vec(),
+            })
+            .collect();
+        let applied = apply_in_memory(&snapshot, &ops)?;
+        let syntax_before = syntax_counts(language, &snapshot.content);
+        let syntax_after = syntax_counts(language, &applied.content);
+        let (syntax, applicable) = match (syntax_before, syntax_after) {
+            (Some(b), Some(a)) => (
+                SyntaxDelta {
+                    errors_before: b.errors,
+                    errors_after: a.errors,
+                    new_errors: a.errors.saturating_sub(b.errors),
+                    new_missing_nodes: a.missing.saturating_sub(b.missing),
+                },
+                true,
+            ),
+            _ => (
+                SyntaxDelta {
+                    errors_before: 0,
+                    errors_after: 0,
+                    new_errors: 0,
+                    new_missing_nodes: 0,
+                },
+                false,
+            ),
+        };
+        let syntax_ok = !applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
+        let isolation_ok = outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
+        if !syntax_ok || !isolation_ok {
+            return Ok(Certificate {
+                schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
+                status: Status::InvalidResult,
+                transaction_id: transaction_id(&snapshot.file_sha256, "rename"),
+                workspace: WorkspaceReport {
+                    root: workspace_root.to_string_lossy().into_owned(),
+                    git_head_before: None,
+                    git_head_after: None,
+                },
+                operations: op_reports,
+                validators: vec![],
+                published: false,
+                publish_mode: PublishMode::Journal,
+            });
+        }
+        op_reports.push(OperationReport {
+            id: format!("rename-{}", scope.rel_path),
+            file: scope.rel_path.clone(),
+            selector_engine: SelectorEngine::Symbol,
+            selector_class: SelectorClass::Resolved,
+            scope_matches: scope.spans.len(),
+            target_matches: sites.len(),
+            file_sha256_before: snapshot.file_sha256.clone(),
+            file_sha256_after: Some(applied.file_sha256.clone()),
+            target_sha256_before: String::new(),
+            target_sha256_after: None,
+            outside_declared_ranges_unchanged: isolation_ok,
+            changed_byte_ranges: applied.changed_ranges.clone(),
+            node_before: None,
+            node_after: None,
+            unified_diff: options
+                .with_diff
+                .then(|| unified_diff(&scope.rel_path, &snapshot.content, &applied.content)),
+            syntax,
+            postconditions_passed: true,
+            postconditions: vec![],
+            guarantees: Guarantees {
+                addressed_range: Guarantee::Proved,
+                no_clobber: Guarantee::Proved,
+                byte_isolation: Guarantee::Proved,
+                syntax: if applicable {
+                    Guarantee::Proved
+                } else {
+                    Guarantee::NotApplicable
+                },
+                validators: Guarantee::NotApplicable,
+            },
+            formatter_expanded_change_scope: false,
+            store_refreshed: false,
+            candidates: vec![],
+        });
+        publications.push(FilePublication {
+            rel_path: scope.rel_path.clone(),
+            expected_live_sha256: snapshot.file_sha256.clone(),
+            content: applied.content,
+        });
+    }
+    if total_sites == 0 {
+        // nothing found anywhere: not-found (or already renamed)
+        let dummy = Snapshot {
+            path: workspace_root.to_path_buf(),
+            content: Vec::new(),
+            file_sha256: String::new(),
+        };
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &dummy,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::NotFound,
+            options,
+        ));
+    }
+    let tx = format!(
+        "ge-rename-{}",
+        &crate::hash::sha256_hex(format!("{from}->{to}").as_bytes())[..12]
+    );
+    let mut status = Status::Applied;
+    let mut published = false;
+    if !options.dry_run {
+        match crate::journal::publish_journal(workspace_root, &tx, &publications) {
+            Ok(()) => published = true,
+            Err(e) => {
+                status = if format!("{e}").contains("stale") {
+                    Status::Stale
+                } else {
+                    Status::PublishFailed
+                };
+            }
+        }
+    }
+    Ok(Certificate {
+        schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
+        status,
+        transaction_id: tx,
+        workspace: WorkspaceReport {
+            root: workspace_root.to_string_lossy().into_owned(),
+            git_head_before: None,
+            git_head_after: None,
+        },
+        operations: op_reports,
+        validators: vec![],
+        published,
+        publish_mode: if options.dry_run {
+            PublishMode::DryRun
+        } else {
+            PublishMode::Journal
+        },
+    })
+}
+
 /// Locate the byte range of the `body` field of the smallest named node
 /// covering `def_range`. None when the language has no tree-sitter grammar
 /// or the node has no body field (e.g. a struct without one).

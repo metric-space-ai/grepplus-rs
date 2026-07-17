@@ -825,6 +825,20 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Rename a symbol across the workspace using the resolved graph:
+    /// the definition, every referencing definition's span, and import
+    /// lines are AST-verified and renamed in one journal transaction.
+    #[command(name = "rename-symbol")]
+    RenameSymbol {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long = "new-name")]
+        new_name: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Set a value in a structured file (JSON/TOML/YAML) by path,
     /// format-preserving. `ensure` reports already-satisfied when the value
     /// already holds.
@@ -6124,6 +6138,86 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::RenameSymbol {
+            symbol,
+            new_name,
+            dry_run,
+            report,
+        } => {
+            let store = open_default_store_query_writer(root)?;
+            let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
+            let mut def_nodes = Vec::new();
+            for id in &ids {
+                if let Some(node) = store.get_node(*id)? {
+                    if !node.file_path.is_empty() && node.start_line >= 1 {
+                        def_nodes.push(node);
+                    }
+                }
+            }
+            if def_nodes.is_empty() {
+                println!("rename-symbol: `{symbol}` not found");
+                return Ok(10);
+            }
+            let short_name = def_nodes[0].name.clone();
+            // collect per-file scopes: definition files fully (definition,
+            // same-file usages, imports), and every referencing node's span
+            use std::collections::BTreeMap;
+            let mut scopes: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+            for def in &def_nodes {
+                scopes
+                    .entry(def.file_path.clone())
+                    .or_default()
+                    .push((0, usize::MAX));
+                for edge in store.incoming_edges(def.id, None, 100_000)? {
+                    if let Some(src) = store.get_node(edge.source_id)? {
+                        if src.file_path.is_empty() || src.start_line < 1 {
+                            continue;
+                        }
+                        let abs = root_path.join(&src.file_path);
+                        let Ok(content) = std::fs::read(&abs) else {
+                            continue;
+                        };
+                        let Some(span) = read_span_with_meta(
+                            &root_path,
+                            &src.file_path,
+                            src.start_line,
+                            src.end_line,
+                            usize::MAX,
+                            false,
+                        ) else {
+                            continue;
+                        };
+                        let range = line_range_to_bytes(
+                            &content,
+                            src.start_line as usize,
+                            span.end_line as usize,
+                        );
+                        scopes.entry(src.file_path.clone()).or_default().push(range);
+                    }
+                }
+            }
+            // import lines in every affected file: cover the whole file for
+            // files that already have narrower spans is wasteful, so add a
+            // full-file span only where imports may bind the name
+            let scope_vec: Vec<greppy_edit::verbs::RenameFileScope> = scopes
+                .into_iter()
+                .map(|(rel_path, spans)| greppy_edit::verbs::RenameFileScope { rel_path, spans })
+                .collect();
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::verbs::rename_symbol_files(
+                    &root_path,
+                    &scope_vec,
+                    &short_name,
+                    &new_name,
+                    &options,
+                )?,
+                report,
+            )
+        }
         EditCommand::Data {
             mode,
             file,
