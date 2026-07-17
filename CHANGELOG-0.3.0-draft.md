@@ -4,6 +4,20 @@ greppy extends from navigation to the full agent loop: **read exactly the
 context you resolved, change exactly the context you read, trust the
 certificate instead of re-reading.**
 
+## Search — ripgrep-style invocations covered by the passthrough
+
+Agents habitually call `rg`. The passthrough now recognizes ripgrep-style
+invocations (`--smart-case`, `-t rust`, `-g '!target'`, a leading `rg`
+token, or an `rg`/`ripgrep` binary name) and routes them in order of
+fidelity: byte-exact delegation to a real ripgrep when one is installed
+(`GREPPY_REAL_RG` overrides discovery); otherwise translation of the
+common flag subset to the real-grep passthrough (ERE engine, recursive by
+default, smart-case resolved against the pattern, `--glob`/`--type` mapped
+to `--include`/`--exclude`, stdin mode preserved); otherwise a loud
+refusal naming the flag and the closest alternative (`--replace` points to
+`greppy edit regex-cas`). A missing ripgrep never silently changes search
+semantics. Plain grep invocations are untouched.
+
 ## Read
 
 - `greppy read SYMBOL [--handle]` returns the definition's byte-exact source

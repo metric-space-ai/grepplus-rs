@@ -1032,6 +1032,37 @@ const SUBCOMMANDS: &[&str] = &[
 /// grep byte-for-byte. All recognised subcommands still flow through
 /// clap unchanged.
 pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
+    // Invoked THROUGH a grep/rg filesystem name (symlink or shim to the
+    // greppy binary): the caller wanted that tool, verbatim — argv[1..]
+    // must never be parsed as greppy subcommands (`rg index .` is a
+    // ripgrep search for "index", not `greppy index`). Route the whole
+    // tail straight into the passthrough with the matching placeholder.
+    let argv0_base = argv
+        .first()
+        .map(std::path::Path::new)
+        .and_then(|p| p.file_stem())
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if matches!(
+        argv0_base,
+        "rg" | "ripgrep" | "grep" | "egrep" | "fgrep" | "rgrep"
+    ) {
+        let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len() + 1);
+        full.push(std::ffi::OsString::from("greppy"));
+        full.push(std::ffi::OsString::from(argv0_base));
+        full.extend_from_slice(&argv[1..]);
+        return match dispatch_grep_os(&full) {
+            Ok(code) => code.clamp(0, 255) as u8,
+            Err(Error::Invalid(msg)) => {
+                eprintln!("{msg}");
+                EXIT_USAGE
+            }
+            Err(other) => {
+                eprintln!("{other}");
+                EXIT_IO
+            }
+        };
+    }
     if is_grep_passthrough(&argv) {
         // argv[0] is the binary name; the rest are grep args. Build a
         // synthetic argv for the shared runner whose argv[0] is a
@@ -1043,8 +1074,14 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
         full.extend_from_slice(grep_passthrough_args(&argv));
         return match dispatch_grep_os(&full) {
             Ok(code) => code.clamp(0, 255) as u8,
-            Err(Error::Invalid(_)) => EXIT_USAGE,
-            Err(_) => EXIT_IO,
+            Err(Error::Invalid(msg)) => {
+                eprintln!("{msg}");
+                EXIT_USAGE
+            }
+            Err(other) => {
+                eprintln!("{other}");
+                EXIT_IO
+            }
         };
     }
     // Structured Greppy commands perform throttled cache maintenance. This
@@ -14240,27 +14277,12 @@ fn try_auto_index_inline(root: Option<&str>) -> bool {
 
 fn dispatch_grep(argv: &[String]) -> Result<i32> {
     // clap's `trailing_var_arg` captures everything after `greppy`
-    // (or `greppy <unknown_subcmd>`). For the `greppy grep …`
-    // invocation, argv[0] is the placeholder "grep" which real grep
-    // would otherwise see as a positional file argument — so we strip
-    // a leading grep-family placeholder before forwarding.
-    //
-    // After stripping, argv contains only real grep arguments. We
-    // build a synthetic argv where argv[0] is a binary-name placeholder
-    // and argv[1..] is the user's args, then forward it byte-exactly to
-    // real grep. Semantic behavior is available only through explicit greppy
-    // subcommands and never changes ordinary grep output.
-    let stripped: &[String] = match argv.first().map(|s| s.as_str()) {
-        Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => &argv[1..],
-        _ => argv,
-    };
-
-    let mut full = Vec::with_capacity(stripped.len() + 1);
-    full.push("greppy".to_string());
-    full.extend_from_slice(stripped);
-
-    let real = greppy_passthrough::discover_grep()?;
-    greppy_passthrough::run_grep(&real, &full)
+    // (or `greppy <unknown_subcmd>`). Delegate to the `OsString`
+    // dispatcher so grep- and rg-style routing live in exactly one place.
+    let mut full: Vec<std::ffi::OsString> = Vec::with_capacity(argv.len() + 1);
+    full.push(std::ffi::OsString::from("greppy"));
+    full.extend(argv.iter().map(std::ffi::OsString::from));
+    dispatch_grep_os(&full)
 }
 
 /// `OsString` argv variant of [`dispatch_grep`].
@@ -14274,19 +14296,53 @@ fn dispatch_grep(argv: &[String]) -> Result<i32> {
 /// `grep`/`egrep`/… token defensively to match [`dispatch_grep`].
 fn dispatch_grep_os(full: &[std::ffi::OsString]) -> Result<i32> {
     // full[0] is the "greppy" placeholder. Strip a leading
-    // grep-family placeholder in full[1] if present (mirrors the String
-    // dispatch_grep behaviour) so `greppy grep -R foo .` and
-    // `greppy -R foo .` agree.
+    // grep-family (or rg-family) placeholder in full[1] if present so
+    // `greppy grep -R foo .`, `greppy rg -S foo` and `greppy -R foo .`
+    // all agree.
     let args: &[std::ffi::OsString] = &full[1..];
-    let stripped: &[std::ffi::OsString] = match args.first().and_then(|s| s.to_str()) {
-        Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => &args[1..],
-        _ => args,
-    };
+    let (stripped, named_rg): (&[std::ffi::OsString], bool) =
+        match args.first().and_then(|s| s.to_str()) {
+            Some("grep") | Some("egrep") | Some("fgrep") | Some("rgrep") => (&args[1..], false),
+            Some("rg") | Some("ripgrep") => (&args[1..], true),
+            _ => (args, false),
+        };
+
+    // rg-style invocations (named, or carrying rg-only flags such as
+    // --smart-case / -t / --glob) get their own routing: real ripgrep if
+    // installed, otherwise a grep translation, otherwise a loud refusal.
+    // Blindly forwarding them to real grep would be a usage error at
+    // best and a silently different search at worst.
+    if named_rg || greppy_passthrough::is_rg_style(stripped) {
+        return dispatch_rg_os(stripped);
+    }
 
     let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(stripped.len() + 1);
     rebuilt.push(std::ffi::OsString::from("greppy"));
     rebuilt.extend_from_slice(stripped);
 
+    let real = greppy_passthrough::discover_grep()?;
+    greppy_passthrough::run_grep_os(&real, &rebuilt)
+}
+
+/// Route a ripgrep-style invocation: byte-exact delegation to real
+/// ripgrep when one exists, otherwise translate the safe flag subset to a
+/// real-grep call, otherwise fail loudly naming the flag and the closest
+/// alternative. Absence of ripgrep must never silently change search
+/// semantics.
+fn dispatch_rg_os(args: &[std::ffi::OsString]) -> Result<i32> {
+    if let Some(real_rg) = greppy_passthrough::discover_ripgrep()? {
+        let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(args.len() + 1);
+        rebuilt.push(std::ffi::OsString::from("rg"));
+        rebuilt.extend_from_slice(args);
+        return greppy_passthrough::run_grep_os(&real_rg, &rebuilt);
+    }
+    use std::io::IsTerminal;
+    let stdin_piped = !std::io::stdin().is_terminal();
+    let grep_args =
+        greppy_passthrough::translate_to_grep(args, stdin_piped).map_err(Error::Invalid)?;
+    let mut rebuilt: Vec<std::ffi::OsString> = Vec::with_capacity(grep_args.len() + 1);
+    rebuilt.push(std::ffi::OsString::from("greppy"));
+    rebuilt.extend(grep_args);
     let real = greppy_passthrough::discover_grep()?;
     greppy_passthrough::run_grep_os(&real, &rebuilt)
 }

@@ -4,8 +4,11 @@ source files. `greppy` replaces all of them, and it is strictly better:
 - SEARCH: `greppy` is the search tool on this system. If you ever need
   original grep behavior, call greppy exactly like grep - ordinary grep
   invocations are delegated byte-for-byte to a real grep (100% compatible
-  passthrough). greppy must not be installed or invoked as a global grep
-  alias.
+  passthrough). ripgrep-style invocations (`--smart-case`, `-t rust`,
+  `-g '!target'`, ...) are equally understood: they are delegated
+  byte-for-byte to a real ripgrep when one is installed, and otherwise
+  mapped onto the grep passthrough. greppy must not be installed or
+  invoked as a global grep alias.
 - READ: code on this system is read by symbol, not by opening files.
 - EDIT: source files on this system are changed transactionally through
   greppy; there is no apply_patch and no manual patching of source files.

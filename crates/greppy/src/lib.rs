@@ -13,6 +13,9 @@ use std::process::{Command, Stdio};
 
 use greppy_core::error::{Error, Result};
 
+pub mod rg;
+pub use rg::{discover_ripgrep, is_rg_style, translate_to_grep};
+
 /// Discover the real `grep` binary.
 ///
 /// Discovery order:
