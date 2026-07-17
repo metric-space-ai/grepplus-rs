@@ -439,10 +439,11 @@ fn call_argument_spans(
                 }
             }
         }
-        if node.end_byte() >= def_range.0 && node.start_byte() <= def_range.1 {
-            if cursor.goto_first_child() {
-                continue;
-            }
+        if node.end_byte() >= def_range.0
+            && node.start_byte() <= def_range.1
+            && cursor.goto_first_child()
+        {
+            continue;
         }
         loop {
             if cursor.goto_next_sibling() {
