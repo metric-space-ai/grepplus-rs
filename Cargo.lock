@@ -641,6 +641,7 @@ dependencies = [
  "clap",
  "greppy-core",
  "greppy-discover",
+ "greppy-edit",
  "greppy-embed-native",
  "greppy-freshness",
  "greppy-indexer",

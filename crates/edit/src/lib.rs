@@ -23,4 +23,5 @@ pub(crate) mod hash {
 }
 
 pub use certificate::{Certificate, PublishMode, Status};
+pub use greppy_parser::{language_for_path, Language};
 pub use handle::EditHandle;

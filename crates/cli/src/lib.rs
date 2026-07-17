@@ -328,6 +328,26 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Read a symbol's exact definition span (byte-precise source). With
+    /// --handle, also returns an edit handle that pins the file, byte range,
+    /// and content hashes — pass it to `greppy edit` commands. Prefer this
+    /// over opening whole files: it returns exactly the code that matters.
+    Read {
+        symbol: Option<String>,
+        /// Also return an edit handle for the definition span.
+        #[arg(long)]
+        handle: bool,
+        /// Emit machine-readable JSON (source, span, handle, candidates).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Transactional, hash-guarded, all-or-nothing edits. Every command
+    /// verifies its own result and emits a certificate; on failure nothing
+    /// is written and the error names the next step.
+    Edit {
+        #[command(subcommand)]
+        command: EditCommand,
+    },
     /// Print deterministic graph statistics for the workspace project:
     /// file count, node counts by label, edge counts by type, and the
     /// node/edge totals.
@@ -648,6 +668,58 @@ pub enum CacheCommand {
     },
 }
 
+/// Subcommands of `greppy edit`. Exit codes are the registered contract
+/// (docs/contracts/EDIT_CONTRACT.md): 0 applied/already-satisfied,
+/// 10 not found, 11 ambiguous, 12 stale, 13 syntax/postcondition,
+/// 14 validator, 15 concurrent change, 16 publish, 17 unsafe path,
+/// 20 invalid spec.
+#[derive(clap::Subcommand, Debug)]
+pub enum EditCommand {
+    /// Exact-once text replacement, hash-gated: OLD must occur exactly
+    /// --expect times (default 1); the file must be unchanged since
+    /// planning. No regex, no fuzz. Re-running after success reports
+    /// already-satisfied.
+    #[command(name = "text-cas")]
+    TextCas {
+        /// File to edit (workspace-relative or absolute).
+        #[arg(long)]
+        file: String,
+        /// File containing the exact old text.
+        #[arg(long = "old-file")]
+        old_file: String,
+        /// File containing the replacement text.
+        #[arg(long = "new-file")]
+        new_file: String,
+        /// Exact number of occurrences OLD must have.
+        #[arg(long, default_value_t = 1)]
+        expect: usize,
+        /// Plan and verify everything, write nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Write the certificate JSON to FILE (also printed to stdout).
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Replace exactly the span a previous `greppy read --handle` returned.
+    /// The handle's hashes are re-verified immediately before writing; a
+    /// changed file fails stale (exit 12) and writes nothing.
+    #[command(name = "replace-span")]
+    ReplaceSpan {
+        /// Edit handle from `greppy read SYMBOL --handle`.
+        #[arg(long)]
+        target: String,
+        /// File containing the replacement source.
+        #[arg(long = "source-file")]
+        source_file: String,
+        /// Plan and verify everything, write nothing.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        /// Write the certificate JSON to FILE (also printed to stdout).
+        #[arg(long)]
+        report: Option<String>,
+    },
+}
+
 impl Cli {
     pub fn parse() -> Self {
         <Self as Parser>::parse()
@@ -672,6 +744,8 @@ const SUBCOMMANDS: &[&str] = &[
     "impact",
     "brief",
     "expand",
+    "read",
+    "edit",
     "who-calls",
     "callees",
     "find-usages",
@@ -797,6 +871,8 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
         "brief" => "greppy brief SYMBOL [--root DIR]",
+        "read" => "greppy read SYMBOL [--handle] [--json] [--root DIR]",
+        "edit" => "greppy edit <text-cas|replace-span> --help",
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "semantic-search" | "semantic" => "greppy semantic-search \"QUERY\" [--root DIR]",
         "context" => "greppy context \"QUERY\" [--root DIR]",
@@ -1379,6 +1455,12 @@ fn dispatch_subcommand(
             json,
         } => dispatch_brief(symbol.as_deref(), json, root),
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
+        Command::Read {
+            symbol,
+            handle,
+            json,
+        } => dispatch_read(symbol.as_deref(), handle, json, root),
+        Command::Edit { command } => dispatch_edit(command, root),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
         Command::Doctor { json } => dispatch_doctor(json, root),
@@ -5520,6 +5602,281 @@ fn summarize_definition_span(file_path: &str, source_span: &str) -> Option<Vec<S
 /// SINGLE call instead of three, which is exactly where the benchmark showed
 /// research-task iteration eating the token/time savings.
 const BRIEF_JSON_SCHEMA_VERSION: &str = "greppy.brief.v1";
+
+/// `greppy read`: a symbol's exact definition span, optionally with an edit
+/// handle. Resolution mirrors `brief`; the returned bytes come from the LIVE
+/// file (the store addresses, the live file decides), so the handle's hashes
+/// always describe what the agent actually saw.
+fn dispatch_read(
+    symbol: Option<&str>,
+    with_handle: bool,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    const READ_JSON_SCHEMA_VERSION: &str = "greppy.read.v1";
+    let store = open_default_store_query_writer(root)?;
+    let project = project_for(root)?;
+    if let Some(code) = graph_stale_gate(
+        &store,
+        root,
+        &project,
+        "read",
+        json,
+        serde_json::json!({"schema_version": READ_JSON_SCHEMA_VERSION}),
+        "definitions",
+    )? {
+        return Ok(code);
+    }
+    let ids = resolve_symbol_nodes(&store, symbol)?;
+    let root_path = resolve_root(root)?;
+    let mut nodes = Vec::new();
+    for id in &ids {
+        if let Some(node) = store.get_node(*id)? {
+            if !node.file_path.is_empty() && node.start_line >= 1 {
+                nodes.push(node);
+            }
+        }
+    }
+    if nodes.is_empty() {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": READ_JSON_SCHEMA_VERSION,
+                    "command": "read",
+                    "status": "not-found",
+                    "query": symbol.unwrap_or(""),
+                }))
+                .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
+            );
+        } else {
+            println!("read: no definition found for `{}`", symbol.unwrap_or(""));
+        }
+        return Ok(10);
+    }
+    if nodes.len() > 1 {
+        // distinct definition sites -> ambiguous, list candidates (exit 11);
+        // multiple store nodes on ONE site (Struct + Impl) are not ambiguity
+        let mut sites: Vec<(String, i64)> = nodes
+            .iter()
+            .map(|n| (n.file_path.clone(), n.start_line))
+            .collect();
+        sites.sort();
+        sites.dedup();
+        if sites.len() > 1 {
+            let candidates: Vec<serde_json::Value> = nodes
+                .iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "qualified_name": n.qualified_name,
+                        "path": n.file_path,
+                        "line": n.start_line,
+                    })
+                })
+                .collect();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": READ_JSON_SCHEMA_VERSION,
+                        "command": "read",
+                        "status": "ambiguous",
+                        "query": symbol.unwrap_or(""),
+                        "candidates": candidates,
+                    }))
+                    .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
+                );
+            } else {
+                println!(
+                    "read: `{}` is ambiguous; qualify it (Owner.method) or use one of:",
+                    symbol.unwrap_or("")
+                );
+                for n in &nodes {
+                    println!("  {} {}:{}", n.qualified_name, n.file_path, n.start_line);
+                }
+            }
+            return Ok(11);
+        }
+    }
+    let node = &nodes[0];
+    let abs = root_path.join(&node.file_path);
+    let content = std::fs::read(&abs).map_err(|source| Error::Io {
+        context: format!("read {}", abs.display()),
+        source,
+    })?;
+    let Some(span) = read_span_with_meta(
+        &root_path,
+        &node.file_path,
+        node.start_line,
+        node.end_line,
+        usize::MAX,
+        false,
+    ) else {
+        println!(
+            "read: definition span for `{}` is stale; re-index and retry",
+            node.qualified_name
+        );
+        return Ok(12);
+    };
+    // line range -> byte range against the SAME live bytes
+    let (byte_start, byte_end) =
+        line_range_to_bytes(&content, node.start_line as usize, span.end_line as usize);
+    let handle_token = if with_handle {
+        Some(
+            greppy_edit::EditHandle::for_range(
+                &root_path,
+                std::path::Path::new(&node.file_path),
+                &content,
+                byte_start,
+                byte_end,
+            )?
+            .encode(),
+        )
+    } else {
+        None
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": READ_JSON_SCHEMA_VERSION,
+                "command": "read",
+                "status": "ok",
+                "qualified_name": node.qualified_name,
+                "path": node.file_path,
+                "start_line": node.start_line,
+                "end_line": span.end_line,
+                "byte_start": byte_start,
+                "byte_end": byte_end,
+                "source": span.text,
+                "handle": handle_token,
+            }))
+            .map_err(|e| Error::Invalid(format!("serialize read JSON: {e}")))?
+        );
+    } else {
+        println!(
+            "{} {}:{}-{}",
+            node.qualified_name, node.file_path, node.start_line, span.end_line
+        );
+        println!("{}", span.text);
+        if let Some(token) = &handle_token {
+            println!("handle: {token}");
+        }
+    }
+    Ok(0)
+}
+
+/// Byte offsets of an inclusive 1-based line range within `content`.
+fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut start = 0usize;
+    let mut idx = 0usize;
+    let mut end = content.len();
+    if start_line <= 1 {
+        start = 0;
+    }
+    while idx < content.len() {
+        if line == start_line {
+            start = idx;
+        }
+        match content[idx..].iter().position(|&b| b == b'\n') {
+            Some(rel) => {
+                if line == end_line {
+                    end = idx + rel + 1;
+                    break;
+                }
+                idx += rel + 1;
+                line += 1;
+            }
+            None => {
+                end = content.len();
+                break;
+            }
+        }
+    }
+    (start, end)
+}
+
+/// `greppy edit`: dispatch to the transactional verbs; print the
+/// certificate; map its status to the registered exit code.
+fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
+    let root_path = resolve_root(root)?;
+    let (certificate, report_path) = match command {
+        EditCommand::TextCas {
+            file,
+            old_file,
+            new_file,
+            expect,
+            dry_run,
+            report,
+        } => {
+            let old = std::fs::read(&old_file).map_err(|source| Error::Io {
+                context: format!("read {old_file}"),
+                source,
+            })?;
+            let new = std::fs::read(&new_file).map_err(|source| Error::Io {
+                context: format!("read {new_file}"),
+                source,
+            })?;
+            let target = resolve_edit_file(&root_path, &file);
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::verbs::text_cas(&root_path, &target, &old, &new, expect, &options)?,
+                report,
+            )
+        }
+        EditCommand::ReplaceSpan {
+            target,
+            source_file,
+            dry_run,
+            report,
+        } => {
+            let handle = greppy_edit::EditHandle::decode(&target)?;
+            let new = std::fs::read(&source_file).map_err(|source| Error::Io {
+                context: format!("read {source_file}"),
+                source,
+            })?;
+            let language = greppy_edit::language_for_path(std::path::Path::new(&handle.path));
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::verbs::replace_span(
+                    &root_path,
+                    &handle,
+                    &new,
+                    Some(language),
+                    &options,
+                )?,
+                report,
+            )
+        }
+    };
+    let rendered = serde_json::to_string_pretty(&certificate)
+        .map_err(|e| Error::Invalid(format!("serialize certificate: {e}")))?;
+    println!("{rendered}");
+    if let Some(path) = report_path {
+        std::fs::write(&path, format!("{rendered}\n")).map_err(|source| Error::Io {
+            context: format!("write report {path}"),
+            source,
+        })?;
+    }
+    Ok(certificate.exit_code())
+}
+
+/// Edit targets may be workspace-relative or absolute.
+fn resolve_edit_file(root_path: &std::path::Path, file: &str) -> std::path::PathBuf {
+    let p = std::path::Path::new(file);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        root_path.join(p)
+    }
+}
 
 fn dispatch_brief(symbol: Option<&str>, json: bool, root: Option<&str>) -> Result<i32> {
     let store = open_default_store_query_writer(root)?;
