@@ -825,6 +825,39 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Replace the parameter list of a definition. Call sites are NOT
+    /// rewritten by the graph backend; the certificate lists them as a
+    /// review checklist in `candidates`.
+    #[command(name = "change-signature")]
+    ChangeSignature {
+        #[arg(long)]
+        symbol: String,
+        /// The new parameter list including parentheses, e.g. "(a, b, *, timeout=30)"
+        #[arg(long)]
+        parameters: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Append a method to a class body when absent; present reports
+    /// already-satisfied.
+    #[command(name = "ensure-method")]
+    EnsureMethod {
+        /// The class (resolved like read).
+        #[arg(long)]
+        symbol: String,
+        /// The new method's name (idempotency key).
+        #[arg(long)]
+        name: String,
+        /// File containing the full method source (indented for the class body).
+        #[arg(long = "source-file")]
+        source_file: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Idempotent decorator/attribute line directly above a definition.
     #[command(name = "ensure-annotation")]
     EnsureAnnotation {
@@ -6168,6 +6201,86 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::ChangeSignature {
+            symbol,
+            parameters,
+            dry_run,
+            report,
+        } => {
+            match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
+                EditTarget::Refusal(cert) => (*cert, report),
+                EditTarget::Resolved { rel_path, range } => {
+                    // call-site-checkliste aus dem graphen
+                    let store = open_default_store_query_writer(root)?;
+                    let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
+                    let mut call_sites = Vec::new();
+                    for id in &ids {
+                        for edge in store.incoming_edges(*id, None, 10_000)? {
+                            if let Some(src) = store.get_node(edge.source_id)? {
+                                if !src.file_path.is_empty() && src.start_line >= 1 {
+                                    call_sites.push(greppy_edit::certificate::Candidate {
+                                        qualified_name: src.qualified_name.clone(),
+                                        path: src.file_path.clone(),
+                                        line: src.start_line as usize,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    call_sites
+                        .sort_by(|a, b| (a.path.clone(), a.line).cmp(&(b.path.clone(), b.line)));
+                    call_sites.dedup_by(|a, b| a.path == b.path && a.line == b.line);
+                    let abs = root_path.join(&rel_path);
+                    let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
+                    let options = greppy_edit::verbs::VerbOptions {
+                        dry_run,
+                        with_diff: true,
+                        ..Default::default()
+                    };
+                    (
+                        greppy_edit::verbs::change_signature(
+                            &root_path,
+                            &abs,
+                            range,
+                            &parameters,
+                            call_sites,
+                            language,
+                            &options,
+                        )?,
+                        report,
+                    )
+                }
+            }
+        }
+        EditCommand::EnsureMethod {
+            symbol,
+            name,
+            source_file,
+            dry_run,
+            report,
+        } => {
+            let source = std::fs::read_to_string(&source_file).map_err(|source| Error::Io {
+                context: format!("read {source_file}"),
+                source,
+            })?;
+            match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
+                EditTarget::Refusal(cert) => (*cert, report),
+                EditTarget::Resolved { rel_path, range } => {
+                    let abs = root_path.join(&rel_path);
+                    let options = greppy_edit::verbs::VerbOptions {
+                        dry_run,
+                        with_diff: true,
+                        ..Default::default()
+                    };
+                    (
+                        greppy_edit::ensure::ensure_method(
+                            &root_path, &abs, range, &name, &source, &options,
+                        )?,
+                        report,
+                    )
+                }
+            }
+        }
         EditCommand::EnsureAnnotation {
             symbol,
             annotation,

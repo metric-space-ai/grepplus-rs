@@ -271,6 +271,68 @@ pub fn ensure_annotation(
     )
 }
 
+/// `greppy edit ensure-method --symbol CLASS`: append a method to a class
+/// body when no method of that name exists; present -> already-satisfied.
+pub fn ensure_method(
+    workspace_root: &Path,
+    file: &Path,
+    class_range: (usize, usize),
+    method_name: &str,
+    method_source: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let language = greppy_parser::language_for_path(file);
+    // existiert eine methode dieses namens in der klasse?
+    let existing = crate::verbs::identifier_sites_public(
+        language,
+        &snapshot.content,
+        class_range,
+        method_name.as_bytes(),
+    )
+    .unwrap_or_default();
+    // grobe aber ehrliche pruefung: ein identifier-vorkommen mit
+    // definitionskontext (naechstes non-ws zeichen ist "(") direkt nach
+    // "def "/"fn " zaehlt als vorhandene methode
+    let text = String::from_utf8_lossy(&snapshot.content);
+    for (start, _end) in &existing {
+        let before = &text[..*start];
+        if before.trim_end().ends_with("def") || before.trim_end().ends_with("fn") {
+            return Ok(single_refusal_certificate(
+                workspace_root,
+                &snapshot,
+                SelectorEngine::Symbol,
+                SelectorClass::Resolved,
+                Status::AlreadySatisfied,
+                options,
+            ));
+        }
+    }
+    // einfuegen am ende des klassenkoerpers (vor dem schliessenden ende),
+    // eingerueckt wie die letzte zeile des koerpers
+    let insert_at = class_range.1.min(snapshot.content.len());
+    let mut block = Vec::new();
+    block.push(b'\n');
+    block.extend_from_slice(method_source.as_bytes());
+    if !method_source.ends_with('\n') {
+        block.push(b'\n');
+    }
+    let ops = vec![PlannedOp {
+        id: "ensure-method".into(),
+        range: (insert_at, insert_at),
+        replacement: block,
+    }];
+    run_pipeline_public(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        Some(language),
+        options,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

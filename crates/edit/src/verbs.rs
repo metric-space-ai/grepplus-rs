@@ -713,6 +713,16 @@ pub fn rename_in_span(
     )
 }
 
+/// Public wrapper for sibling modules.
+pub(crate) fn identifier_sites_public(
+    language: Language,
+    content: &[u8],
+    range: (usize, usize),
+    name: &[u8],
+) -> Option<Vec<(usize, usize)>> {
+    identifier_sites(language, content, range, name)
+}
+
 /// Byte ranges of identifier-kind leaf nodes whose text equals `name`,
 /// restricted to `def_range`. None when the language cannot be parsed.
 fn identifier_sites(
@@ -752,6 +762,83 @@ fn identifier_sites(
         }
     }
     Some(out)
+}
+
+/// Graph-backed `change-signature` v1: replace the parameter list of the
+/// resolved definition. Call sites are NOT rewritten by the graph backend -
+/// they are returned as a checklist in `candidates` so the agent addresses
+/// each one deliberately (rename-call / patch-span). The LSP backend is the
+/// planned engine for coupled call-site rewriting.
+pub fn change_signature(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    new_parameters: &str,
+    call_sites: Vec<crate::certificate::Candidate>,
+    language: Language,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let Some(param_range) = parameters_range_within(language, &snapshot.content, def_range) else {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::NotFound,
+            options,
+        ));
+    };
+    if &snapshot.content[param_range.0..param_range.1] == new_parameters.as_bytes() {
+        return Ok(single_refusal_certificate(
+            workspace_root,
+            &snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Resolved,
+            Status::AlreadySatisfied,
+            options,
+        ));
+    }
+    let ops = vec![PlannedOp {
+        id: "change-signature".into(),
+        range: param_range,
+        replacement: new_parameters.as_bytes().to_vec(),
+    }];
+    let mut cert = run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        Some(language),
+        options,
+    )?;
+    // the call-site checklist rides in candidates: every entry is a place
+    // the agent must review, because the graph backend does not rewrite them
+    if let Some(op) = cert.operations.first_mut() {
+        op.candidates = call_sites;
+    }
+    Ok(cert)
+}
+
+/// Byte range of the `parameters` field of the definition at `def_range`.
+fn parameters_range_within(
+    language: Language,
+    content: &[u8],
+    def_range: (usize, usize),
+) -> Option<(usize, usize)> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(def_range.0, def_range.1.saturating_sub(1))?;
+    loop {
+        if let Some(params) = node.child_by_field_name("parameters") {
+            if params.start_byte() >= def_range.0 && params.end_byte() <= def_range.1 {
+                return Some((params.start_byte(), params.end_byte()));
+            }
+        }
+        node = node.parent()?;
+    }
 }
 
 /// Structural signature fingerprint of the definition at `def_range`:
