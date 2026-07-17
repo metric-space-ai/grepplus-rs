@@ -32,7 +32,14 @@ PROVIDER_EXTENSION = REPO_ROOT / "bench" / "agent_efficiency" / "minimax-provide
 TASK_SCHEMA_VERSION = "greppy.agent-coding-tasks.v1"
 RESULT_SCHEMA_VERSION = "greppy.agent-coding-results.v1"
 MANIFEST_SCHEMA_VERSION = "greppy.agent-coding-manifest.v1"
-GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v3"
+GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v4"
+# v4 (registered in docs/contracts/EDIT_CONTRACT.md): the greppy-edit arm
+# must beat the explorer on billed provider dollars (<= 0.80), keep post-
+# edit re-reads at <= 0.1 per edit, and hold exact-McNemar correctness
+# parity. The v3 contrast (greppy vs explorer, cost <= 1.0) stays as a
+# reported check so the navigation arm's non-inferiority remains visible.
+EDIT_COST_RATIO_MAX = 0.80
+POST_EDIT_REREADS_MAX = 0.1
 # Frozen MiniMax-M3 standard-tier billed rates (USD per million tokens,
 # snapshot 2026-07-14, <=512k context; output counts are provider-billed and
 # include reasoning tokens). The gate compares both arms under the same model
@@ -55,7 +62,7 @@ HARNESS_VERSION = "2"
 DEFAULT_MODEL = "MiniMax-M3"
 DEFAULT_PROVIDER = "minimax"
 RAW_ROOT = HERE / "raw_traces"
-ARMS = ("explorer", "greppy")
+ARMS = ("explorer", "greppy", "greppy-edit")
 MIN_COMPLETE_PAIRS = 30
 MIN_SOLVED_PAIRS = 20
 PROMPT_USAGE_KEYS = ("input", "cacheRead", "cacheWrite", "cacheWrite1h", "cacheWrite5m")
@@ -73,6 +80,24 @@ SHARED_SYSTEM_PROMPT = (
 EXPLORER_POLICY = (
     "Explore the repository as needed with the normal shell and file-reading tools "
     "available to you, then implement and verify the fix."
+)
+
+GREPPY_EDIT_POLICY_TEMPLATE = (
+    "Use Greppy as the primary navigation AND editing surface. The executable is {greppy}. "
+    "Always pass `--root .`. NAVIGATE: `semantic-search QUERY` for behavior questions, "
+    "`brief SYMBOL` / `who-calls` / `callees` / `find-usages` for known symbols. "
+    "READ: `read SYMBOL --handle --json` returns the definition's exact source span plus a "
+    "HANDLE - prefer it over opening whole files. "
+    "EDIT: transactional, hash-guarded, all-or-nothing - never patch files by hand when a "
+    "verb fits: `edit replace-body --symbol SYM --source-file F`, "
+    "`edit replace-span --target HANDLE --source-file F`, "
+    "`edit rename-call --in SYM --from A --to B`, `edit ensure-import --file P --module M --name N`, "
+    "`edit text-cas --file P --old-file F --new-file F` for non-code files. "
+    "Every edit prints a certificate: matched exactly once, hashes before/after, a unified "
+    "diff, and syntax verification. TRUST THE CERTIFICATE - do not re-read a file to check "
+    "an edit the certificate already proves. Exit codes: 0 ok/already-satisfied, 10 not "
+    "found, 11 ambiguous (candidates listed), 12 stale (re-read the span), 13 syntax. "
+    "Verify the final result with the supplied verification command."
 )
 
 GREPPY_POLICY_TEMPLATE = (
@@ -467,6 +492,9 @@ def capture_binary_diff(worktree: pathlib.Path, base_commit: str, timeout_second
 def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
+    edit_calls = 0
+    post_edit_source_opens = 0
+    edited_files: set[str] = set()
     error: str | None = None
     last_error_text: str | None = None
     for line in raw.decode("utf-8", "replace").splitlines():
@@ -490,12 +518,25 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
             if not isinstance(item, dict) or item.get("type") != "toolCall":
                 continue
             name = item.get("name")
+            opened_file = None
             if name == "read":
                 source_opens += 1
+                opened_file = str((item.get("arguments") or {}).get("path", ""))
             elif name == "bash":
                 command = str((item.get("arguments") or {}).get("command", ""))
                 if re.search(r"(^|[;&|]\s*)(cat|head|tail|sed\s+-n)\s", command):
                     source_opens += 1
+                    m = re.search(r"(?:cat|head|tail|sed\s+-n\s+\S+)\s+([\w./-]+)", command)
+                    opened_file = m.group(1) if m else None
+                if re.search(r"greppy[^\n]*\bedit\b", command):
+                    edit_calls += 1
+                    m = re.search(r"--file\s+([\w./-]+)", command)
+                    if m:
+                        edited_files.add(m.group(1))
+                    # symbol-adressierte edits: datei unbekannt bis zertifikat;
+                    # konservativ nicht zaehlen
+            if opened_file and opened_file in edited_files:
+                post_edit_source_opens += 1
         if message.get("errorMessage"):
             error = str(message["errorMessage"])
             last_error_text = error[:300]
@@ -509,6 +550,8 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         "source_opens": source_opens,
         "turns": turns,
         "reported_error": bool(error),
+        "edit_calls": edit_calls,
+        "post_edit_source_opens": post_edit_source_opens,
         # provider error text, redacted upstream with the rest of stdout;
         # 10 consecutive identical failures on one task are invisible
         # without it (2026-07-17: serde-range-start-field, both arms)
@@ -526,6 +569,8 @@ def system_prompt(arm: str, greppy_bin: pathlib.Path) -> str:
         policy = EXPLORER_POLICY
     elif arm == "greppy":
         policy = GREPPY_POLICY_TEMPLATE.format(greppy=shlex.quote(str(greppy_bin)))
+    elif arm == "greppy-edit":
+        policy = GREPPY_EDIT_POLICY_TEMPLATE.format(greppy=shlex.quote(str(greppy_bin)))
     else:
         raise HarnessError(f"unknown arm: {arm}")
     return f"{SHARED_SYSTEM_PROMPT}\n\nNavigation treatment:\n{policy}"
@@ -870,13 +915,17 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     by_key = {(row.get("task_id"), row.get("arm")): row for row in rows}
     complete_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     invalid_or_missing: list[str] = []
+    nav_pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for task_id in expected_task_ids:
         baseline = by_key.get((task_id, "explorer"))
-        candidate = by_key.get((task_id, "greppy"))
+        candidate = by_key.get((task_id, "greppy-edit"))
+        nav = by_key.get((task_id, "greppy"))
         if not baseline or not candidate or not baseline.get("valid") or not candidate.get("valid"):
             invalid_or_missing.append(task_id)
             continue
         complete_pairs.append((baseline, candidate))
+        if nav and nav.get("valid") and baseline.get("valid"):
+            nav_pairs.append((baseline, nav))
 
     baseline_only = sum(bool(base["correctness"]) and not bool(cand["correctness"]) for base, cand in complete_pairs)
     candidate_only = sum(bool(cand["correctness"]) and not bool(base["correctness"]) for base, cand in complete_pairs)
@@ -901,7 +950,19 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
     base_cost = sum(provider_cost_usd(row[0]["agent"]) for row in solved)
     cand_cost = sum(provider_cost_usd(row[1]["agent"]) for row in solved)
     cost_ratio = ratio(cand_cost, base_cost)
-    efficiency_pass = cost_ratio is not None and cost_ratio <= 1.0
+    # v4: the edit arm must be decisively cheaper, not merely non-inferior
+    efficiency_pass = cost_ratio is not None and cost_ratio <= EDIT_COST_RATIO_MAX
+    # edit-loop metrics over the edit arm's solved rows
+    edit_calls_total = sum(row[1]["agent"].get("edit_calls", 0) for row in solved)
+    post_edit_rereads = sum(row[1]["agent"].get("post_edit_source_opens", 0) for row in solved)
+    reread_rate = post_edit_rereads / edit_calls_total if edit_calls_total else 0.0
+    reread_pass = reread_rate <= POST_EDIT_REREADS_MAX
+    # navigation arm (v3 semantics) stays visible as a reported check
+    nav_solved = [(b, n) for b, n in nav_pairs if b["correctness"] and n["correctness"]]
+    nav_cost_ratio = ratio(
+        sum(provider_cost_usd(row[1]["agent"]) for row in nav_solved),
+        sum(provider_cost_usd(row[0]["agent"]) for row in nav_solved),
+    ) if nav_solved else None
     no_significant_regression = p_value >= 0.05
     observed_not_lower = candidate_only >= baseline_only
     credited_wall_wins = sum(cand["agent"]["wall_seconds"] < base["agent"]["wall_seconds"] for base, cand in solved)
@@ -917,7 +978,8 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
         and sample_size_pass
         and observed_not_lower
         and no_significant_regression
-        and efficiency_pass,
+        and efficiency_pass
+        and reread_pass,
         "complete": complete,
         "sample_size": {
             "minimum_complete_pairs": MIN_COMPLETE_PAIRS,
@@ -935,11 +997,23 @@ def grade_results(rows: Sequence[dict[str, Any]], expected_task_ids: Sequence[st
             "greppy_observed_correctness_not_lower": observed_not_lower,
             "no_significant_regression": no_significant_regression,
         },
+        "edit_loop": {
+            "edit_calls_total": edit_calls_total,
+            "post_edit_source_opens": post_edit_rereads,
+            "post_edit_reread_rate": round(reread_rate, 4),
+            "threshold": POST_EDIT_REREADS_MAX,
+            "passes": reread_pass,
+        },
+        "navigation_arm_v3_check": {
+            "greppy_to_explorer_provider_cost": nav_cost_ratio,
+            "threshold_ratio": 1.0,
+            "is_gate_metric": False,
+        },
         "cost_on_solved_pairs": {
             "metric": "provider_cost_usd",
             "pricing_as_of": PRICING_AS_OF,
-            "threshold_ratio": 1.0,
-            "greppy_to_explorer_provider_cost": cost_ratio,
+            "threshold_ratio": EDIT_COST_RATIO_MAX,
+            "greppy_edit_to_explorer_provider_cost": cost_ratio,
             "greppy_total_usd": round(cand_cost, 6),
             "explorer_total_usd": round(base_cost, 6),
             "passes": efficiency_pass,

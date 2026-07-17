@@ -282,6 +282,8 @@ def result_row(
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
             "wall_seconds": wall,
+            "edit_calls": 2,
+            "post_edit_source_opens": 0,
         },
     }
 
@@ -295,12 +297,13 @@ class GradingTests(unittest.TestCase):
                 [
                     result_row(task_id, "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10),
                     result_row(task_id, "greppy", passed=True, tools=8, source_opens=4, inputs=800, wall=8),
+                    result_row(task_id, "greppy-edit", passed=True, tools=8, source_opens=4, inputs=800, wall=8),
                 ]
             )
         grade = bench.grade_results(rows, task_ids)
         self.assertTrue(grade["passed"])
-        self.assertEqual(grade["cost_on_solved_pairs"]["greppy_to_explorer_provider_cost"], 0.8)
-        self.assertEqual(grade["cost_on_solved_pairs"]["threshold_ratio"], 1.0)
+        self.assertEqual(grade["cost_on_solved_pairs"]["greppy_edit_to_explorer_provider_cost"], 0.8)
+        self.assertEqual(grade["cost_on_solved_pairs"]["threshold_ratio"], 0.80)
         # Token-Ratios bleiben Diagnose, keine Gate-Metrik
         self.assertEqual(grade["token_ratios_on_solved_pairs"]["greppy_to_explorer_input_tokens"], 0.8)
         self.assertFalse(grade["token_ratios_on_solved_pairs"]["is_gate_metric"])
@@ -313,10 +316,11 @@ class GradingTests(unittest.TestCase):
                 [
                     result_row(task_id, "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10),
                     result_row(task_id, "greppy", passed=True, tools=8, source_opens=4, inputs=1050, wall=8),
+                    result_row(task_id, "greppy-edit", passed=True, tools=8, source_opens=4, inputs=1050, wall=8),
                 ]
             )
         grade = bench.grade_results(rows, task_ids)
-        self.assertGreater(grade["cost_on_solved_pairs"]["greppy_to_explorer_provider_cost"], 1.0)
+        self.assertGreater(grade["cost_on_solved_pairs"]["greppy_edit_to_explorer_provider_cost"], 1.0)
         self.assertFalse(grade["cost_on_solved_pairs"]["passes"])
         self.assertFalse(grade["passed"])
 
@@ -324,6 +328,7 @@ class GradingTests(unittest.TestCase):
         rows = [
             result_row("t1", "explorer", passed=True, tools=10, source_opens=5, inputs=1000, wall=10),
             result_row("t1", "greppy", passed=True, tools=1, source_opens=1, inputs=100, wall=1),
+            result_row("t1", "greppy-edit", passed=True, tools=1, source_opens=1, inputs=100, wall=1),
         ]
         grade = bench.grade_results(rows, ["t1"])
         self.assertFalse(grade["sample_size"]["passes"])
@@ -338,6 +343,7 @@ class GradingTests(unittest.TestCase):
                 [
                     result_row(task_id, "explorer", passed=passed, tools=10, source_opens=5, inputs=1000, wall=10),
                     result_row(task_id, "greppy", passed=passed, tools=8, source_opens=4, inputs=800, wall=8),
+                    result_row(task_id, "greppy-edit", passed=passed, tools=8, source_opens=4, inputs=800, wall=8),
                 ]
             )
         grade = bench.grade_results(rows, task_ids)
@@ -354,6 +360,7 @@ class GradingTests(unittest.TestCase):
                 [
                     result_row(task_id, "explorer", passed=True, tools=2, inputs=100, wall=1),
                     result_row(task_id, "greppy", passed=False, tools=1, inputs=50, wall=0.1),
+                    result_row(task_id, "greppy-edit", passed=False, tools=1, inputs=50, wall=0.1),
                 ]
             )
         grade = bench.grade_results(rows, task_ids)
@@ -377,6 +384,15 @@ class GradingTests(unittest.TestCase):
                         inputs=800,
                         wall=8,
                     ),
+                    result_row(
+                        task_id,
+                        "greppy-edit",
+                        passed=index != 0,
+                        tools=8,
+                        source_opens=4,
+                        inputs=800,
+                        wall=8,
+                    ),
                 ]
             )
         grade = bench.grade_results(rows, task_ids)
@@ -389,8 +405,10 @@ class GradingTests(unittest.TestCase):
         rows = [
             result_row("solved", "explorer", passed=True, tools=10, inputs=100, wall=1),
             result_row("solved", "greppy", passed=True, tools=8, inputs=100, wall=2),
+            result_row("solved", "greppy-edit", passed=True, tools=8, inputs=100, wall=2),
             result_row("failed", "explorer", passed=True, tools=100, inputs=1000, wall=100),
             result_row("failed", "greppy", passed=False, tools=1, inputs=10, wall=0.01),
+            result_row("failed", "greppy-edit", passed=False, tools=1, inputs=10, wall=0.01),
         ]
         grade = bench.grade_results(rows, ["solved", "failed"])
         self.assertEqual(grade["solved_pair_count"], 1)
