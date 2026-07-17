@@ -779,6 +779,22 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Idempotent import: absent -> inserted at the canonical position;
+    /// present -> already-satisfied (exit 0, nothing written); the same
+    /// name bound from a different module -> refusal, nothing written.
+    #[command(name = "ensure-import")]
+    EnsureImport {
+        #[arg(long)]
+        file: String,
+        #[arg(long)]
+        module: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     #[command(name = "replace-span")]
     ReplaceSpan {
         /// Edit handle from `greppy read SYMBOL --handle`.
@@ -6039,6 +6055,29 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::EnsureImport {
+            file,
+            module,
+            name,
+            dry_run,
+            report,
+        } => {
+            let target = resolve_edit_file(&root_path, &file);
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::ensure::ensure_import(
+                    &root_path,
+                    &target,
+                    &module,
+                    name.as_deref(),
+                    &options,
+                )?,
+                report,
+            )
+        }
         EditCommand::ReplaceSpan {
             target,
             source_file,

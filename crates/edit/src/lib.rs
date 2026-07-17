@@ -7,6 +7,7 @@
 //! failure is a next step; idempotent `ensure-*` verbs.
 
 pub mod certificate;
+pub mod ensure;
 pub mod handle;
 pub mod publish;
 pub mod txn;

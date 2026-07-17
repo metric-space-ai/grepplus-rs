@@ -532,6 +532,53 @@ fn body_range_within(
     }
 }
 
+/// Public pipeline entry for sibling modules (`ensure`, future engines).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_pipeline_public(
+    workspace_root: &Path,
+    snapshot: Snapshot,
+    ops: Vec<PlannedOp>,
+    engine: SelectorEngine,
+    class: SelectorClass,
+    language: Option<Language>,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    run_pipeline(
+        workspace_root,
+        snapshot,
+        ops,
+        engine,
+        class,
+        language,
+        options,
+    )
+}
+
+/// Public refusal certificate for sibling modules: a status-only report
+/// with no candidates and no node text.
+pub(crate) fn single_refusal_certificate(
+    workspace_root: &Path,
+    snapshot: &Snapshot,
+    engine: SelectorEngine,
+    class: SelectorClass,
+    status: Status,
+    options: &VerbOptions,
+) -> Certificate {
+    single_op_certificate(
+        workspace_root,
+        snapshot,
+        engine,
+        class,
+        status,
+        0,
+        &[],
+        None,
+        None,
+        options,
+        PublishMode::Atomic,
+    )
+}
+
 /// The shared transaction pipeline for single-file verbs.
 fn run_pipeline(
     workspace_root: &Path,
