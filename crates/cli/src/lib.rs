@@ -825,6 +825,28 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Idempotent decorator/attribute line directly above a definition.
+    #[command(name = "ensure-annotation")]
+    EnsureAnnotation {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long)]
+        annotation: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
+    /// Delete a definition when present; absent reports already-satisfied.
+    #[command(name = "remove-if-present")]
+    RemoveIfPresent {
+        #[arg(long)]
+        symbol: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Rename a symbol across the workspace using the resolved graph:
     /// the definition, every referencing definition's span, and import
     /// lines are AST-verified and renamed in one journal transaction.
@@ -6138,6 +6160,52 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::EnsureAnnotation {
+            symbol,
+            annotation,
+            dry_run,
+            report,
+        } => match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
+            EditTarget::Refusal(cert) => (*cert, report),
+            EditTarget::Resolved { rel_path, range } => {
+                let abs = root_path.join(&rel_path);
+                let options = greppy_edit::verbs::VerbOptions {
+                    dry_run,
+                    with_diff: true,
+                };
+                (
+                    greppy_edit::ensure::ensure_annotation(
+                        &root_path,
+                        &abs,
+                        range,
+                        &annotation,
+                        &options,
+                    )?,
+                    report,
+                )
+            }
+        },
+        EditCommand::RemoveIfPresent {
+            symbol,
+            dry_run,
+            report,
+        } => {
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            let resolved = match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
+                EditTarget::Resolved { rel_path, range } => {
+                    Some((root_path.join(&rel_path), range))
+                }
+                EditTarget::Refusal(cert) if cert.status == greppy_edit::Status::NotFound => None,
+                EditTarget::Refusal(cert) => return finish_edit(*cert, report, root, &root_path),
+            };
+            (
+                greppy_edit::ensure::remove_if_present(&root_path, resolved, &options)?,
+                report,
+            )
+        }
         EditCommand::RenameSymbol {
             symbol,
             new_name,
@@ -6384,6 +6452,18 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             )
         }
     };
+    finish_edit(certificate, report_path, root, &root_path)
+}
+
+/// Shared tail of every edit command: refresh the store after a published
+/// edit, render the certificate, honour --report, map the exit code.
+fn finish_edit(
+    certificate: greppy_edit::Certificate,
+    report_path: Option<String>,
+    root: Option<&str>,
+    root_path: &std::path::Path,
+) -> Result<i32> {
+    let _ = root;
     let mut certificate = certificate;
     if certificate.published {
         // close the read->edit->read loop: refresh the store so the next
@@ -6399,9 +6479,9 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             .and_then(|exe| {
                 std::process::Command::new(exe)
                     .arg("--root")
-                    .arg(&root_path)
+                    .arg(root_path)
                     .arg("index")
-                    .arg(&root_path)
+                    .arg(root_path)
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()

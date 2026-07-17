@@ -169,12 +169,146 @@ pub fn ensure_import(
     )
 }
 
+/// `greppy edit remove-if-present --symbol SYM`: delete when present,
+/// already-satisfied when absent - never an error for a missing target.
+pub fn remove_if_present(
+    workspace_root: &Path,
+    resolved: Option<(std::path::PathBuf, (usize, usize))>,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    match resolved {
+        None => {
+            let dummy = Snapshot {
+                path: workspace_root.to_path_buf(),
+                content: Vec::new(),
+                file_sha256: String::new(),
+            };
+            Ok(single_refusal_certificate(
+                workspace_root,
+                &dummy,
+                SelectorEngine::Symbol,
+                SelectorClass::Resolved,
+                Status::AlreadySatisfied,
+                options,
+            ))
+        }
+        Some((file, range)) => {
+            let language = greppy_parser::language_for_path(&file);
+            crate::verbs::delete_span(workspace_root, &file, range, Some(language), options)
+        }
+    }
+}
+
+/// `greppy edit ensure-annotation --symbol SYM --annotation A`: idempotent
+/// decorator/attribute line directly above a definition.
+pub fn ensure_annotation(
+    workspace_root: &Path,
+    file: &Path,
+    def_range: (usize, usize),
+    annotation: &str,
+    options: &VerbOptions,
+) -> Result<Certificate> {
+    let snapshot = Snapshot::read(file)?;
+    let language = greppy_parser::language_for_path(file);
+    let line = annotation.trim();
+    // indentation of the definition line
+    let def_line_start = snapshot.content[..def_range.0]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let indent: Vec<u8> = snapshot.content[def_line_start..def_range.0]
+        .iter()
+        .copied()
+        .take_while(|b| b.is_ascii_whitespace())
+        .collect();
+    // already present? scan the contiguous annotation block above
+    let mut scan_end = def_line_start;
+    loop {
+        if scan_end == 0 {
+            break;
+        }
+        let prev_start = snapshot.content[..scan_end - 1]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let prev_line = String::from_utf8_lossy(&snapshot.content[prev_start..scan_end - 1])
+            .trim()
+            .to_string();
+        if prev_line.starts_with('@') || prev_line.starts_with("#[") {
+            if prev_line == line {
+                return Ok(single_refusal_certificate(
+                    workspace_root,
+                    &snapshot,
+                    SelectorEngine::Symbol,
+                    SelectorClass::Resolved,
+                    Status::AlreadySatisfied,
+                    options,
+                ));
+            }
+            scan_end = prev_start;
+        } else {
+            break;
+        }
+    }
+    let mut block = indent.clone();
+    block.extend_from_slice(line.as_bytes());
+    block.push(b'\n');
+    let ops = vec![PlannedOp {
+        id: "ensure-annotation".into(),
+        range: (def_line_start, def_line_start),
+        replacement: block,
+    }];
+    run_pipeline_public(
+        workspace_root,
+        snapshot,
+        ops,
+        SelectorEngine::Symbol,
+        SelectorClass::Resolved,
+        Some(language),
+        options,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn ws() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn ensure_annotation_idempotent() {
+        let dir = ws();
+        let f = dir.path().join("m.py");
+        std::fs::write(&f, b"def run():\n    pass\n").unwrap();
+        let cert =
+            ensure_annotation(dir.path(), &f, (0, 19), "@retry", &VerbOptions::default()).unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        let out = std::fs::read_to_string(&f).unwrap();
+        assert!(out.starts_with("@retry\ndef run():"), "{out}");
+        // zweiter lauf: bereits vorhanden (def_range hat sich verschoben)
+        let content = std::fs::read(&f).unwrap();
+        let def_start = out.find("def run").unwrap();
+        let cert = ensure_annotation(
+            dir.path(),
+            &f,
+            (def_start, content.len() - 1),
+            "@retry",
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::AlreadySatisfied);
+    }
+
+    #[test]
+    fn remove_if_present_absent_is_satisfied() {
+        let dir = ws();
+        let cert = remove_if_present(dir.path(), None, &VerbOptions::default()).unwrap();
+        assert_eq!(cert.status, Status::AlreadySatisfied);
+        assert_eq!(cert.exit_code(), 0);
     }
 
     #[test]
