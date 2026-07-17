@@ -1,0 +1,332 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "greppy.edit-certificate.v1",
+  "title": "greppy edit certificate",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "status",
+    "transaction_id",
+    "workspace",
+    "operations",
+    "published"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "greppy.edit-certificate.v1"
+    },
+    "status": {
+      "enum": [
+        "applied",
+        "already-satisfied",
+        "not-found",
+        "ambiguous",
+        "stale",
+        "invalid-result",
+        "validation-failed",
+        "publish-failed"
+      ]
+    },
+    "transaction_id": {
+      "type": "string"
+    },
+    "workspace": {
+      "type": "object",
+      "required": [
+        "root",
+        "git_head_before",
+        "git_head_after"
+      ],
+      "properties": {
+        "root": {
+          "type": "string"
+        },
+        "git_head_before": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_head_after": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "operations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "file",
+          "selector_engine",
+          "selector_class",
+          "scope_matches",
+          "target_matches",
+          "file_sha256_before",
+          "file_sha256_after",
+          "target_sha256_before",
+          "target_sha256_after",
+          "outside_declared_ranges_unchanged",
+          "syntax",
+          "postconditions_passed",
+          "guarantees"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "selector_engine": {
+            "enum": [
+              "symbol",
+              "tree-sitter",
+              "text",
+              "regex",
+              "data-path",
+              "lsp"
+            ]
+          },
+          "selector_class": {
+            "enum": [
+              "resolved",
+              "structural",
+              "exact-text",
+              "regex-weak",
+              "structured-data",
+              "semantic"
+            ]
+          },
+          "scope_matches": {
+            "type": "integer"
+          },
+          "target_matches": {
+            "type": "integer"
+          },
+          "file_sha256_before": {
+            "type": "string"
+          },
+          "file_sha256_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target_sha256_before": {
+            "type": "string"
+          },
+          "target_sha256_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outside_declared_ranges_unchanged": {
+            "type": "boolean"
+          },
+          "changed_byte_ranges": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "prefixItems": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            }
+          },
+          "tree_sitter_changed_ranges": {
+            "type": "array"
+          },
+          "node_before": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_after": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "unified_diff": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "syntax": {
+            "type": "object",
+            "required": [
+              "errors_before",
+              "errors_after",
+              "new_errors",
+              "new_missing_nodes"
+            ],
+            "properties": {
+              "errors_before": {
+                "type": "integer"
+              },
+              "errors_after": {
+                "type": "integer"
+              },
+              "new_errors": {
+                "type": "integer"
+              },
+              "new_missing_nodes": {
+                "type": "integer"
+              }
+            }
+          },
+          "postconditions_passed": {
+            "type": "boolean"
+          },
+          "postconditions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name",
+                "passed"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "passed": {
+                  "type": "boolean"
+                },
+                "detail": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "guarantees": {
+            "type": "object",
+            "required": [
+              "addressed_range",
+              "no_clobber",
+              "byte_isolation",
+              "syntax",
+              "validators"
+            ],
+            "properties": {
+              "addressed_range": {
+                "enum": [
+                  "proved",
+                  "not-applicable",
+                  "waived-by-formatter",
+                  "failed"
+                ]
+              },
+              "no_clobber": {
+                "enum": [
+                  "proved",
+                  "not-applicable",
+                  "waived-by-formatter",
+                  "failed"
+                ]
+              },
+              "byte_isolation": {
+                "enum": [
+                  "proved",
+                  "not-applicable",
+                  "waived-by-formatter",
+                  "failed"
+                ]
+              },
+              "syntax": {
+                "enum": [
+                  "proved",
+                  "not-applicable",
+                  "waived-by-formatter",
+                  "failed"
+                ]
+              },
+              "validators": {
+                "enum": [
+                  "proved",
+                  "not-applicable",
+                  "waived-by-formatter",
+                  "failed"
+                ]
+              }
+            }
+          },
+          "formatter_expanded_change_scope": {
+            "type": "boolean"
+          },
+          "store_refreshed": {
+            "type": "boolean"
+          },
+          "candidates": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "qualified_name": {
+                  "type": "string"
+                },
+                "path": {
+                  "type": "string"
+                },
+                "line": {
+                  "type": "integer"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "validators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "argv",
+          "exit_code"
+        ],
+        "properties": {
+          "argv": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "exit_code": {
+            "type": "integer"
+          },
+          "timed_out": {
+            "type": "boolean"
+          },
+          "stdout_sha256": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "published": {
+      "type": "boolean"
+    },
+    "publish_mode": {
+      "enum": [
+        "atomic",
+        "journal",
+        "patch",
+        "shadow-worktree",
+        "dry-run"
+      ]
+    }
+  }
+}
