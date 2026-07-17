@@ -9,6 +9,7 @@
 pub mod certificate;
 pub mod ensure;
 pub mod handle;
+pub mod journal;
 pub mod publish;
 pub mod txn;
 pub mod verbs;
