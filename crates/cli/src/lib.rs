@@ -825,6 +825,27 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Set a value in a structured file (JSON/TOML/YAML) by path,
+    /// format-preserving. `ensure` reports already-satisfied when the value
+    /// already holds.
+    #[command(name = "data")]
+    Data {
+        /// set (always write) or ensure (idempotent)
+        #[arg(value_parser = ["set", "ensure"])]
+        mode: String,
+        #[arg(long)]
+        file: String,
+        /// Path like $.server.port or $.items[2].name
+        #[arg(long)]
+        path: String,
+        /// New value as JSON (strings quoted: '"text"')
+        #[arg(long = "value-json")]
+        value_json: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+    },
     /// Execute a multi-operation plan file (schema greppy.edit-plan.v1).
     /// Journal mode publishes all files or none; patch mode emits a
     /// unified diff without touching the workspace.
@@ -6103,6 +6124,31 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::Data {
+            mode,
+            file,
+            path,
+            value_json,
+            dry_run,
+            report,
+        } => {
+            let target = resolve_edit_file(&root_path, &file);
+            let options = greppy_edit::verbs::VerbOptions {
+                dry_run,
+                with_diff: true,
+            };
+            (
+                greppy_edit::data::data_set(
+                    &root_path,
+                    &target,
+                    &path,
+                    &value_json,
+                    mode == "ensure",
+                    &options,
+                )?,
+                report,
+            )
+        }
         EditCommand::Apply {
             plan,
             dry_run,
