@@ -1116,7 +1116,16 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             // STDOUT, not stderr: agents habitually append `2>/dev/null`,
             // and a usage lesson they never see teaches nothing (P3).
             println!("{first}");
-            let sub = argv.get(1).and_then(|s| s.to_str()).unwrap_or("");
+            // Skip greppy-owned global flags when picking the usage line:
+            // agents habitually write `greppy --root . read ...`, and argv[1]
+            // is then "--root", which used to fall through to the generic
+            // command list instead of the read usage (trace forensics
+            // 2026-07-17: 13/24 calls in one run were flag guesses that the
+            // generic list did nothing to correct).
+            let sub = grep_passthrough_args(&argv)
+                .first()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
             if let Some(usage) = subcommand_usage(sub) {
                 println!("usage: {usage}");
             } else {
@@ -1168,12 +1177,22 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
             "greppy impact SYMBOL [--direction incoming|outgoing] [--depth N] [--json] [--root DIR]"
         }
         "brief" => "greppy brief SYMBOL [--root DIR]",
-        "read" => "greppy read SYMBOL [--handle] [--json] [--root DIR]",
-        "edit" => "greppy edit <text-cas|replace-span> --help",
+        "read" => {
+            "greppy read SYMBOL [--handle] [--json] [--root DIR]  \
+             (SYMBOL is a definition name like Owner::method - not a file \
+             path; raw file bytes: use cat/sed via bash)"
+        }
+        "edit" => {
+            "greppy edit <replace-body|replace-span|patch-span|insert-after|insert-before|\
+             delete|rename-call|ensure-import|text-cas|regex-cas|apply> --help"
+        }
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "semantic-search" | "semantic" => "greppy semantic-search \"QUERY\" [--root DIR]",
         "context" => "greppy context \"QUERY\" [--root DIR]",
-        "search-code" => "greppy search-code QUERY [--json] [--root DIR]",
+        "search-code" => {
+            "greppy search-code QUERY [--json] [--root DIR]  \
+             (no path filter flags; to scope to a file, grep it: greppy PATTERN FILE)"
+        }
         "search-symbols" => {
             "greppy search-symbols NAME [--kind function|method|struct|class] [--json] [--root DIR]"
         }
