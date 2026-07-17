@@ -825,6 +825,24 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
+    /// Execute a multi-operation plan file (schema greppy.edit-plan.v1).
+    /// Journal mode publishes all files or none; patch mode emits a
+    /// unified diff without touching the workspace.
+    #[command(name = "apply")]
+    Apply {
+        #[arg(long)]
+        plan: String,
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+        #[arg(long)]
+        report: Option<String>,
+        /// Write the unified diff to FILE (patch mode).
+        #[arg(long)]
+        diff: Option<String>,
+    },
+    /// Restore pre-images from a crashed journal transaction.
+    #[command(name = "recover")]
+    Recover,
     #[command(name = "replace-span")]
     ReplaceSpan {
         /// Edit handle from `greppy read SYMBOL --handle`.
@@ -6085,6 +6103,44 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 )
             }
         },
+        EditCommand::Apply {
+            plan,
+            dry_run,
+            report,
+            diff: _,
+        } => {
+            let text = std::fs::read_to_string(&plan).map_err(|source| Error::Io {
+                context: format!("read {plan}"),
+                source,
+            })?;
+            let mut parsed: greppy_edit::plan::Plan = serde_json::from_str(&text)
+                .map_err(|e| Error::Invalid(format!("plan invalid: {e}")))?;
+            if parsed.workspace.root.is_empty() || parsed.workspace.root == "." {
+                parsed.workspace.root = root_path.to_string_lossy().into_owned();
+            }
+            (greppy_edit::plan::apply_plan(&parsed, dry_run)?, report)
+        }
+        EditCommand::Recover => {
+            let outcome = greppy_edit::journal::recover(&root_path)?;
+            let (msg, code) = match outcome {
+                greppy_edit::journal::Recovery::NothingToRecover => {
+                    ("nothing to recover".to_string(), 0)
+                }
+                greppy_edit::journal::Recovery::RolledBack {
+                    transaction_id,
+                    files,
+                } => (
+                    format!("rolled back transaction {transaction_id}: {files} file(s) restored"),
+                    0,
+                ),
+                greppy_edit::journal::Recovery::DiscardedUncommitted => (
+                    "discarded uncommitted journal; nothing had been published".to_string(),
+                    0,
+                ),
+            };
+            println!("{msg}");
+            return Ok(code);
+        }
         EditCommand::PatchSpan {
             target,
             patch_file,

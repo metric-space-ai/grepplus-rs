@@ -1017,6 +1017,10 @@ fn transaction_id(before: &str, after: &str) -> String {
 
 /// Minimal unified diff (line-based) for the certificate. Precise byte
 /// ranges are reported separately; this is the human/agent-readable view.
+pub(crate) fn unified_diff_public(path: &str, before: &[u8], after: &[u8]) -> String {
+    unified_diff(path, before, after)
+}
+
 fn unified_diff(path: &str, before: &[u8], after: &[u8]) -> String {
     let before = String::from_utf8_lossy(before);
     let after = String::from_utf8_lossy(after);
