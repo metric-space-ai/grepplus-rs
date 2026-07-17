@@ -5919,16 +5919,19 @@ fn dispatch_read(
     let (byte_start, byte_end) =
         line_range_to_bytes(&content, node.start_line as usize, span.end_line as usize);
     let handle_token = if with_handle {
-        Some(
-            greppy_edit::EditHandle::for_range(
-                &root_path,
-                std::path::Path::new(&node.file_path),
-                &content,
-                byte_start,
-                byte_end,
-            )?
-            .encode(),
-        )
+        let mut handle = greppy_edit::EditHandle::for_range(
+            &root_path,
+            std::path::Path::new(&node.file_path),
+            &content,
+            byte_start,
+            byte_end,
+        )?;
+        let language = greppy_edit::language_for_path(std::path::Path::new(&node.file_path));
+        handle.signature_fingerprint =
+            greppy_edit::verbs::signature_fingerprint(language, &content, (byte_start, byte_end));
+        handle.grammar_id = Some(format!("{language:?}"));
+        handle.grammar_version = Some(env!("CARGO_PKG_VERSION").to_string());
+        Some(handle.encode())
     } else {
         None
     };
@@ -6028,6 +6031,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::verbs::text_cas(&root_path, &target, &old, &new, expect, &options)?,
@@ -6053,6 +6057,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                     let options = greppy_edit::verbs::VerbOptions {
                         dry_run,
                         with_diff: true,
+                        ..Default::default()
                     };
                     (
                         greppy_edit::verbs::replace_body(
@@ -6094,6 +6099,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                     let options = greppy_edit::verbs::VerbOptions {
                         dry_run,
                         with_diff: true,
+                        ..Default::default()
                     };
                     (
                         greppy_edit::verbs::insert_adjacent(
@@ -6125,6 +6131,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 let options = greppy_edit::verbs::VerbOptions {
                     dry_run,
                     with_diff: true,
+                    ..Default::default()
                 };
                 (
                     greppy_edit::verbs::rename_in_span(
@@ -6147,6 +6154,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 let options = greppy_edit::verbs::VerbOptions {
                     dry_run,
                     with_diff: true,
+                    ..Default::default()
                 };
                 (
                     greppy_edit::verbs::delete_span(
@@ -6172,6 +6180,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                 let options = greppy_edit::verbs::VerbOptions {
                     dry_run,
                     with_diff: true,
+                    ..Default::default()
                 };
                 (
                     greppy_edit::ensure::ensure_annotation(
@@ -6193,6 +6202,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             let resolved = match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
                 EditTarget::Resolved { rel_path, range } => {
@@ -6274,6 +6284,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::verbs::rename_symbol_files(
@@ -6298,6 +6309,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::data::data_set(
@@ -6364,6 +6376,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::verbs::patch_span(
@@ -6388,6 +6401,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::verbs::regex_cas(
@@ -6412,6 +6426,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::ensure::ensure_import(
@@ -6439,6 +6454,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             let options = greppy_edit::verbs::VerbOptions {
                 dry_run,
                 with_diff: true,
+                ..Default::default()
             };
             (
                 greppy_edit::verbs::replace_span(

@@ -15,12 +15,29 @@ use crate::txn::{apply_in_memory, outside_ranges_unchanged, syntax_counts, Plann
 use greppy_core::Result;
 use greppy_parser::Language;
 
+/// Formatter policy for an edit. `SelectedRange` pipes only the replaced
+/// span through the formatter; `File` formats the whole result and must be
+/// explicitly permitted to change bytes outside the declared ranges (the
+/// certificate flags the widened scope either way).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FormatPolicy {
+    None,
+    SelectedRange {
+        argv: Vec<String>,
+    },
+    File {
+        argv: Vec<String>,
+        permit_outside: bool,
+    },
+}
+
 /// Common options for single-operation verbs.
 #[derive(Debug, Clone)]
 pub struct VerbOptions {
     pub dry_run: bool,
     /// Emit the unified diff inline in the certificate.
     pub with_diff: bool,
+    pub format: FormatPolicy,
 }
 
 impl Default for VerbOptions {
@@ -28,8 +45,60 @@ impl Default for VerbOptions {
         Self {
             dry_run: false,
             with_diff: true,
+            format: FormatPolicy::None,
         }
     }
+}
+
+/// Run `argv` on a temp file containing `content`; return the formatted
+/// bytes. The literal `{}` in argv is replaced by the temp path; without a
+/// placeholder the path is appended.
+fn run_formatter(argv: &[String], content: &[u8], extension: &str) -> Result<Vec<u8>> {
+    let tmp = tempfile::Builder::new()
+        .suffix(&format!(".{extension}"))
+        .tempfile()
+        .map_err(|source| greppy_core::Error::Io {
+            context: "formatter tempfile".into(),
+            source,
+        })?;
+    std::fs::write(tmp.path(), content).map_err(|source| greppy_core::Error::Io {
+        context: "write formatter input".into(),
+        source,
+    })?;
+    let mut cmd_args: Vec<String> = Vec::new();
+    let mut placed = false;
+    for a in &argv[1..] {
+        if a == "{}" {
+            cmd_args.push(tmp.path().to_string_lossy().into_owned());
+            placed = true;
+        } else {
+            cmd_args.push(a.clone());
+        }
+    }
+    if !placed {
+        cmd_args.push(tmp.path().to_string_lossy().into_owned());
+    }
+    let status = std::process::Command::new(&argv[0])
+        .args(&cmd_args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|source| greppy_core::Error::Io {
+            context: format!("spawn formatter {}", argv[0]),
+            source,
+        })?;
+    if !status.success() {
+        return Err(greppy_core::Error::Invalid(format!(
+            "formatter {} exited with {}",
+            argv[0],
+            status.code().unwrap_or(-1)
+        )));
+    }
+    std::fs::read(tmp.path()).map_err(|source| greppy_core::Error::Io {
+        context: "read formatter output".into(),
+        source,
+    })
 }
 
 /// `greppy edit text-cas`: exact-once (or `--expect N`) text replacement,
@@ -685,6 +754,41 @@ fn identifier_sites(
     Some(out)
 }
 
+/// Structural signature fingerprint of the definition at `def_range`:
+/// node kind, name, and parameter list text - the body is excluded, so the
+/// fingerprint is stable across body edits and changes when the signature
+/// changes. None when the language cannot be parsed.
+pub fn signature_fingerprint(
+    language: Language,
+    content: &[u8],
+    def_range: (usize, usize),
+) -> Option<String> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(def_range.0, def_range.1.saturating_sub(1))?;
+    // climb to the smallest node with a name field covering the range
+    loop {
+        if node.child_by_field_name("name").is_some() {
+            break;
+        }
+        node = node.parent()?;
+    }
+    let field = |name: &str| {
+        node.child_by_field_name(name)
+            .map(|n| String::from_utf8_lossy(&content[n.start_byte()..n.end_byte()]).into_owned())
+            .unwrap_or_default()
+    };
+    let material = format!(
+        "{}|{}|{}|{}",
+        node.kind(),
+        field("name"),
+        field("parameters"),
+        field("return_type"),
+    );
+    Some(crate::hash::sha256_hex(material.as_bytes())[..16].to_string())
+}
+
 /// Cross-file rename input: per file, the byte spans in which identifier
 /// occurrences of the old name are AST-verified and renamed. Spans of
 /// `(0, usize::MAX)` mean "the whole file" (definition file, import lines).
@@ -972,7 +1076,47 @@ fn run_pipeline(
     options: &VerbOptions,
 ) -> Result<Certificate> {
     let syntax_before = language.and_then(|l| syntax_counts(l, &snapshot.content));
-    let applied = apply_in_memory(&snapshot, &ops)?;
+    let mut applied = apply_in_memory(&snapshot, &ops)?;
+    let mut formatter_expanded = false;
+    let ext = snapshot
+        .path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("txt")
+        .to_string();
+    match &options.format {
+        FormatPolicy::None => {}
+        FormatPolicy::SelectedRange { argv } => {
+            // format each replacement in isolation, re-apply
+            let mut new_ops = Vec::with_capacity(ops.len());
+            for op in &ops {
+                let formatted = run_formatter(argv, &op.replacement, &ext)?;
+                new_ops.push(PlannedOp {
+                    id: op.id.clone(),
+                    range: op.range,
+                    replacement: formatted,
+                });
+            }
+            applied = apply_in_memory(&snapshot, &new_ops)?;
+        }
+        FormatPolicy::File {
+            argv,
+            permit_outside,
+        } => {
+            let formatted = run_formatter(argv, &applied.content, &ext)?;
+            if formatted != applied.content {
+                let expanded = !outside_ranges_unchanged(&snapshot.content, &formatted, &ops);
+                if expanded && !permit_outside {
+                    return Err(greppy_core::Error::Invalid(
+                        "formatter changed bytes outside the declared ranges; pass permit-outside to allow".into(),
+                    ));
+                }
+                formatter_expanded = expanded;
+                applied.file_sha256 = crate::hash::sha256_hex(&formatted);
+                applied.content = formatted;
+            }
+        }
+    }
     let syntax_after = language.and_then(|l| syntax_counts(l, &applied.content));
 
     let syntax = match (syntax_before, syntax_after) {
@@ -991,7 +1135,8 @@ fn run_pipeline(
     };
     let syntax_applicable = syntax_before.is_some() && syntax_after.is_some();
     let syntax_ok = !syntax_applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
-    let isolation_ok = outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
+    let isolation_ok =
+        formatter_expanded || outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
 
     let target_before = ops
         .first()
@@ -1085,7 +1230,7 @@ fn run_pipeline(
             },
             validators: Guarantee::NotApplicable,
         },
-        formatter_expanded_change_scope: false,
+        formatter_expanded_change_scope: formatter_expanded,
         store_refreshed: false,
         candidates: vec![],
     };
@@ -1366,6 +1511,39 @@ mod tests {
         assert_eq!(cert.status, Status::Stale);
         assert_eq!(cert.exit_code(), 12);
         assert_eq!(std::fs::read(&f).unwrap(), b"fn a() { changed(); }\n");
+    }
+
+    #[test]
+    fn file_formatter_without_permit_refuses_scope_expansion() {
+        let dir = ws();
+        let f = dir.path().join("conf.txt");
+        std::fs::write(&f, b"a = 1\nb =    2\n").unwrap();
+        // "formatter" der die ganze Datei normalisiert: sed als argv-tool
+        let opts = VerbOptions {
+            dry_run: false,
+            with_diff: false,
+            format: FormatPolicy::File {
+                argv: vec!["sed".into(), "-i".into(), "".into(), "s/ *= */ = /".into()],
+                permit_outside: false,
+            },
+        };
+        let err = text_cas(dir.path(), &f, b"a = 1", b"a = 9", 1, &opts);
+        // sed normalisiert auch zeile b -> scope-expansion ohne permit: Fehler,
+        // Datei unveraendert
+        assert!(err.is_err());
+        assert_eq!(std::fs::read(&f).unwrap(), b"a = 1\nb =    2\n");
+        // mit permit: durchgelassen und geflaggt
+        let opts = VerbOptions {
+            dry_run: false,
+            with_diff: false,
+            format: FormatPolicy::File {
+                argv: vec!["sed".into(), "-i".into(), "".into(), "s/ *= */ = /".into()],
+                permit_outside: true,
+            },
+        };
+        let cert = text_cas(dir.path(), &f, b"a = 1", b"a = 9", 1, &opts).unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        assert!(cert.operations[0].formatter_expanded_change_scope);
     }
 
     #[test]
