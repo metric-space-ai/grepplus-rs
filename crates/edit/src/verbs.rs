@@ -1600,6 +1600,17 @@ mod tests {
         assert_eq!(std::fs::read(&f).unwrap(), b"fn a() { changed(); }\n");
     }
 
+    /// A portable in-place "formatter" (GNU/BSD sed -i syntax differs):
+    /// normalizes ` = ` spacing across the whole file via python3.
+    fn portable_normalizer_argv() -> Vec<String> {
+        vec![
+            "python3".into(),
+            "-c".into(),
+            "import sys,re;p=sys.argv[1];s=open(p).read();open(p,'w').write(re.sub(r' *= *',' = ',s))".into(),
+            "{}".into(),
+        ]
+    }
+
     #[test]
     fn file_formatter_without_permit_refuses_scope_expansion() {
         let dir = ws();
