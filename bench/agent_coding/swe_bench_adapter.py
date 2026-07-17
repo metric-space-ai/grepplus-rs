@@ -372,16 +372,25 @@ def run_setup(repo: str, toolchain: str) -> bool:
         # for asgiref; without it the test errors on a missing dep, not the bug,
         # and never flips). This brings the pinned framework + all test deps.
         extras = set()
+        group_pkgs: list[str] = []
         pp = os.path.join(repo, "pyproject.toml")
         if os.path.exists(pp):
             import tomllib
             try:
                 data = tomllib.load(open(pp, "rb"))
                 extras |= set(data.get("project", {}).get("optional-dependencies", {}))
+                # PEP 735 dependency-groups (werkzeug puts ephemeral_port_reserve
+                # etc. here, NOT in optional-dependencies). Values are lists of
+                # requirement strings or {include-group: ...} refs; take the
+                # plain strings.
+                for deps in data.get("dependency-groups", {}).values():
+                    group_pkgs += [d for d in deps if isinstance(d, str)]
             except (tomllib.TOMLDecodeError, OSError):
                 pass
         extras |= {"test", "tests", "dev", "testing", "async"}
         got_extra = any(uvpip("-e", f".[{x}]") for x in sorted(extras))
+        if group_pkgs:
+            got_extra = uvpip(*group_pkgs) or got_extra
         for req in ("requirements/tests.txt", "requirements/test.txt",
                     "test-requirements.txt", "requirements-test.txt", "requirements-dev.txt"):
             if os.path.exists(os.path.join(repo, req)):
