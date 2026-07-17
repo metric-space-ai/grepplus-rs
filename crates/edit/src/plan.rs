@@ -115,6 +115,7 @@ pub enum PlanPublishMode {
     Atomic,
     Journal,
     Patch,
+    ShadowWorktree,
 }
 
 /// Execute a plan. `dry_run` runs everything through postconditions and
@@ -316,9 +317,31 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
 
     let mut status = refusal.unwrap_or(Status::Applied);
     let mut published = false;
-    if status == Status::Applied && !dry_run {
+    let mut validator_reports = Vec::new();
+    // validators without shadow mode still run - against the shadow copy,
+    // never against unpublished workspace state
+    if status == Status::Applied
+        && (!plan.validators.is_empty() || plan.publish.mode == PlanPublishMode::ShadowWorktree)
+    {
+        let do_publish = !dry_run && plan.publish.mode == PlanPublishMode::ShadowWorktree;
+        let (reports, did_publish) = crate::shadow::shadow_validate_and_publish(
+            root,
+            &tx,
+            &publications,
+            &plan.validators,
+            do_publish,
+        )?;
+        let all_ok = reports.iter().all(|r| r.exit_code == 0 && !r.timed_out);
+        validator_reports = reports;
+        if !all_ok {
+            status = Status::ValidationFailed;
+        } else if did_publish {
+            published = true;
+        }
+    }
+    if status == Status::Applied && !dry_run && !published {
         match plan.publish.mode {
-            PlanPublishMode::Patch => {}
+            PlanPublishMode::Patch | PlanPublishMode::ShadowWorktree => {}
             PlanPublishMode::Atomic => {
                 if publications.len() != 1 {
                     return Err(Error::Invalid(
@@ -359,7 +382,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             git_head_after: None,
         },
         operations: op_reports,
-        validators: vec![],
+        validators: validator_reports,
         published,
         publish_mode: if dry_run {
             PublishMode::DryRun
@@ -368,6 +391,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
                 PlanPublishMode::Atomic => PublishMode::Atomic,
                 PlanPublishMode::Journal => PublishMode::Journal,
                 PlanPublishMode::Patch => PublishMode::Patch,
+                PlanPublishMode::ShadowWorktree => PublishMode::ShadowWorktree,
             }
         },
     })
@@ -458,6 +482,47 @@ mod tests {
         let cert = apply_plan(&plan, false).unwrap();
         assert_eq!(cert.status, Status::Applied);
         assert!(!cert.published);
+        assert_eq!(
+            std::fs::read(dir.path().join("a.py")).unwrap(),
+            b"VALUE = 1\n"
+        );
+    }
+
+    #[test]
+    fn shadow_mode_validates_before_publishing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "shadow-worktree");
+        plan.validators = vec![super::PlanValidator {
+            argv: vec![
+                "grep".into(),
+                "-q".into(),
+                "VALUE = 2".into(),
+                "a.py".into(),
+            ],
+            timeout_seconds: 10,
+        }];
+        let cert = apply_plan(&plan, false).unwrap();
+        assert_eq!(cert.status, Status::Applied);
+        assert!(cert.published);
+        assert_eq!(cert.validators.len(), 1);
+        assert_eq!(
+            std::fs::read(dir.path().join("a.py")).unwrap(),
+            b"VALUE = 2\n"
+        );
+        // fehlschlagender Validator: nichts publiziert
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "shadow-worktree");
+        plan.validators = vec![super::PlanValidator {
+            argv: vec!["false".into()],
+            timeout_seconds: 10,
+        }];
+        let cert = apply_plan(&plan, false).unwrap();
+        assert_eq!(cert.status, Status::ValidationFailed);
+        assert!(!cert.published);
+        assert_eq!(cert.exit_code(), 14);
         assert_eq!(
             std::fs::read(dir.path().join("a.py")).unwrap(),
             b"VALUE = 1\n"

@@ -13,6 +13,7 @@ pub mod handle;
 pub mod journal;
 pub mod plan;
 pub mod publish;
+pub mod shadow;
 pub mod txn;
 pub mod verbs;
 
