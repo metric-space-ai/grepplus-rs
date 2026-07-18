@@ -639,6 +639,17 @@ def run_pi_agent(
     env = os.environ.copy()
     env["GREPPY_STORE_DIR"] = str(store_dir)
     env["PI_CODING_AGENT_DIR"] = str(pi_config_dir)
+    # Pin bare `greppy` on PATH to the binary under test. The system prompt
+    # gives the agent an absolute path, but agents drift to bare `greppy`;
+    # without this they silently hit a stale system/ctox shim whose passthrough
+    # routes unknown subcommands to grep -> contaminated measurement.
+    binshim = raw_dir / ".binshim"
+    binshim.mkdir(parents=True, exist_ok=True)
+    shim = binshim / "greppy"
+    if shim.is_symlink() or shim.exists():
+        shim.unlink()
+    shim.symlink_to(greppy_bin.resolve())
+    env["PATH"] = f"{binshim}{os.pathsep}{env.get('PATH', '')}"
     argv = [
         str(pi_bin),
         "-p",
