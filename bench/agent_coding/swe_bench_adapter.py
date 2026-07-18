@@ -426,14 +426,52 @@ def run_tests(repo: str, toolchain: str, test_files: list[str]) -> dict[str, boo
         return {t["nodeid"]: t["outcome"] == "passed" for t in data.get("tests", [])}
     if runner == "cargo":
         r = subprocess.run(["cargo", "test", "--no-fail-fast", "--", "--format=terse"],
-                           cwd=repo, capture_output=True, text=True, timeout=1800)
+                           cwd=repo, capture_output=True, text=True, timeout=2400)
         out = {}
         for line in (r.stdout + r.stderr).splitlines():
             m = re.match(r"test (\S+) \.\.\. (ok|FAILED)", line)
             if m:
                 out[m.group(1)] = m.group(2) == "ok"
         return out or None
-    return None  # gotest / maven / vitest: TODO, skip for now
+    if runner == "gotest":
+        # Run each changed test file's PACKAGE (its directory) verbosely; parse
+        # `--- PASS/FAIL: TestName`. -count=1 disables the test cache.
+        pkgs = sorted({os.path.dirname(f) for f in test_files})
+        out = {}
+        for pkg in pkgs:
+            r = subprocess.run(["go", "test", "-v", "-count=1", f"./{pkg}/"],
+                               cwd=repo, capture_output=True, text=True, timeout=1800)
+            for line in (r.stdout + r.stderr).splitlines():
+                m = re.match(r"\s*--- (PASS|FAIL): (\S+)", line)
+                if m:
+                    out[f"{pkg}::{m.group(2)}"] = m.group(1) == "PASS"
+            # a build failure yields no --- lines: treat as harness miss for
+            # this pkg only if we got nothing at all across all pkgs (below)
+        return out or None
+    if runner == "vitest":
+        # JSON reporter: per-assertion results. Run only the changed spec files.
+        rep = os.path.join(repo, ".vitest_report.json")
+        subprocess.run(
+            ["pnpm", "exec", "vitest", "run", "--reporter=json",
+             f"--outputFile={rep}", *test_files],
+            cwd=repo, capture_output=True, text=True, timeout=1800,
+        )
+        if not os.path.exists(rep):
+            return None
+        try:
+            data = json.load(open(rep))
+        except (json.JSONDecodeError, OSError):
+            return None
+        out = {}
+        for tf in data.get("testResults", []):
+            test_name = tf.get("name", "")
+            if test_name and os.path.isabs(test_name):
+                test_name = os.path.relpath(test_name, repo)
+            for a in tf.get("assertionResults", []):
+                key = f"{test_name}::{a.get('fullName') or a.get('title')}"
+                out[key] = a.get("status") == "passed"
+        return out or None
+    return None  # maven: TODO, skip for now
 
 
 def validate_candidate(cand: dict, workdir: str) -> dict | None:
