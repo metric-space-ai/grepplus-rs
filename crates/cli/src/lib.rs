@@ -16111,6 +16111,61 @@ mod tests {
     }
 
     #[test]
+    fn edit_symbol_replaces_indexed_typescript_and_kotlin_bodies() {
+        let _env = ENV_LOCK.lock().unwrap();
+        let restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
+        let store_root = test_tempdir("edit-symbol-ts-kt-store");
+        // SAFETY: env-mutating tests hold ENV_LOCK until `restore` is dropped.
+        unsafe { std::env::set_var("GREPPY_STORE_DIR", &store_root) };
+
+        for (label, extension, source, replacement) in [
+            (
+                "typescript",
+                "ts",
+                "export function computeTotal(items:number[]):number{ return items.reduce((a,b)=>a+b,0); }\n",
+                "{ return Math.max(...items); }\n",
+            ),
+            (
+                "kotlin",
+                "kt",
+                "fun computeTotal(items:IntArray):Int{ return items.sum() }\n",
+                "{ return items.maxOrNull() ?: 0 }\n",
+            ),
+        ] {
+            let root = test_tempdir(&format!("edit-symbol-{label}"));
+            std::fs::create_dir(root.join(".git")).unwrap();
+            std::fs::write(root.join(format!("a.{extension}")), source).unwrap();
+            let replacement_path = root.join("new-body.txt");
+            std::fs::write(&replacement_path, replacement).unwrap();
+
+            let store_path = workspace_locator::store_path(&root);
+            std::fs::create_dir_all(store_path.parent().unwrap()).unwrap();
+            let mut store = greppy_store::Store::open(&store_path).unwrap();
+            let project = workspace_locator::project_identity(&root);
+            let report = greppy_indexer::index(&mut store, &root, &project).unwrap();
+            assert!(report.is_clean(), "{label} index report: {report:?}");
+            drop(store);
+
+            let code = dispatch_edit(
+                EditCommand::ReplaceBody {
+                    symbol: Some("computeTotal".into()),
+                    target: None,
+                    source_file: replacement_path.to_string_lossy().into_owned(),
+                    dry_run: true,
+                    report: None,
+                },
+                root.to_str(),
+            )
+            .unwrap();
+            assert_eq!(code, 0, "indexed {label} edit --symbol must apply");
+
+            std::fs::remove_dir_all(root).unwrap();
+        }
+        drop(restore);
+        std::fs::remove_dir_all(store_root).unwrap();
+    }
+
+    #[test]
     fn embedding_eta_uses_backend_prior_then_measured_throughput() {
         assert_eq!(initial_embedding_eta_seconds(1_200, "cpu"), Some(1_200));
         assert_eq!(initial_embedding_eta_seconds(1_200, "metal"), Some(150));

@@ -1104,7 +1104,23 @@ fn body_range_within(
         def_range.1.saturating_sub(1),
     )?;
     loop {
-        if let Some(body) = node.child_by_field_name("body") {
+        let body = node.child_by_field_name("body").or_else(|| {
+            let mut cursor = node.walk();
+            if matches!(language, Language::TypeScript { .. }) && node.kind() == "export_statement"
+            {
+                // TypeScript wraps `export function ...` in an export node;
+                // the declaration (and its body field) is the direct child.
+                node.named_children(&mut cursor)
+                    .find_map(|child| child.child_by_field_name("body"))
+            } else if language == Language::Kotlin && node.kind() == "function_declaration" {
+                // tree-sitter-kotlin-ng does not field-label function bodies.
+                node.named_children(&mut cursor)
+                    .find(|child| matches!(child.kind(), "function_body" | "block"))
+            } else {
+                None
+            }
+        });
+        if let Some(body) = body {
             // only accept a body that lies inside the addressed definition
             if body.start_byte() >= def_range.0 && body.end_byte() <= def_range.1 {
                 // extend back to the start of the line when only indentation
