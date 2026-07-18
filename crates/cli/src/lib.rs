@@ -306,6 +306,15 @@ pub enum Command {
     /// call, instead of iterating semantic-search + who-calls + callees separately.
     Brief {
         symbol: Option<String>,
+        /// Optional file to disambiguate SYMBOL when it resolves in several
+        /// files. Agents reach for `brief open src/flask/testing.py` or
+        /// `brief open --path src/flask/testing.py`; both narrow resolution to
+        /// that file (equivalent to the `path::SYMBOL` form). Serving this
+        /// reasonable call is cheaper than punishing it with a parse error.
+        path: Option<String>,
+        /// Same disambiguation as the positional path, in flag form.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opt: Option<String>,
         /// Accepted for agent ergonomics: brief already prints the
         /// definition's source, so --code is a no-op — but agents
         /// carrying the flag over from the nav commands must not be
@@ -334,9 +343,21 @@ pub enum Command {
     /// over opening whole files: it returns exactly the code that matters.
     Read {
         symbol: Option<String>,
+        /// Optional file to disambiguate SYMBOL when it resolves in several
+        /// files: `read open src/flask/testing.py` or `read open --path FILE`
+        /// (equivalent to the `path::SYMBOL` form).
+        path: Option<String>,
+        /// Same disambiguation as the positional path, in flag form.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opt: Option<String>,
         /// Also return an edit handle for the definition span.
         #[arg(long)]
         handle: bool,
+        /// Accepted for agent ergonomics: read already prints the definition's
+        /// source, so --code is a no-op — agents carrying it over from the nav
+        /// commands must not lose the call to a parse error.
+        #[arg(long)]
+        code: bool,
         /// Emit machine-readable JSON (source, span, handle, candidates).
         #[arg(long)]
         json: bool,
@@ -559,6 +580,11 @@ pub enum Command {
     #[command(name = "semantic-search", alias = "semantic")]
     Semantic {
         query: Option<String>,
+        /// Accepted for agent ergonomics — semantic-search ranks across the
+        /// whole workspace, so --path is advisory only and does not restrict
+        /// results; it must not turn a reasonable call into a parse error.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opt: Option<String>,
         /// Emit machine-readable JSON.
         #[arg(long)]
         json: bool,
@@ -692,10 +718,11 @@ pub enum EditCommand {
         new_file: Option<String>,
         /// Exact old text inline (for short replacements; K3/M3 agents
         /// reach for this form first and only then create temp files).
-        #[arg(long)]
+        /// allow_hyphen_values: real diffs/RST/markdown lines begin with `-`.
+        #[arg(long, allow_hyphen_values = true)]
         old: Option<String>,
         /// Replacement text inline.
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         new: Option<String>,
         /// Exact number of occurrences OLD must have.
         #[arg(long, default_value_t = 1)]
@@ -805,9 +832,9 @@ pub enum EditCommand {
     RegexCas {
         #[arg(long)]
         file: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         pattern: String,
-        #[arg(long)]
+        #[arg(long, allow_hyphen_values = true)]
         replacement: String,
         #[arg(long, default_value_t = 1)]
         expect: usize,
@@ -1773,16 +1800,33 @@ fn dispatch_subcommand(
         ),
         Command::Brief {
             symbol,
+            path,
+            path_opt,
             code: _,
             all: _,
             json,
-        } => dispatch_brief(symbol.as_deref(), json, root),
+        } => {
+            let folded = qualify_symbol_with_path(
+                symbol.as_deref(),
+                path.as_deref().or(path_opt.as_deref()),
+            );
+            dispatch_brief(folded.as_deref().or(symbol.as_deref()), json, root)
+        }
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             symbol,
+            path,
+            path_opt,
             handle,
+            code: _,
             json,
-        } => dispatch_read(symbol.as_deref(), handle, json, root),
+        } => {
+            let folded = qualify_symbol_with_path(
+                symbol.as_deref(),
+                path.as_deref().or(path_opt.as_deref()),
+            );
+            dispatch_read(folded.as_deref().or(symbol.as_deref()), handle, json, root)
+        }
         Command::Edit { command } => dispatch_edit(command, root),
         Command::Stats => dispatch_stats(root),
         Command::Diagnostics { json } => dispatch_diagnostics(json, root),
@@ -1871,7 +1915,11 @@ fn dispatch_subcommand(
             EmbeddingCliArgs { device, no_gpu },
             root,
         ),
-        Command::Semantic { query, json } => dispatch_semantic(
+        Command::Semantic {
+            query,
+            path_opt: _,
+            json,
+        } => dispatch_semantic(
             query.as_deref(),
             json,
             EmbeddingCliArgs { device, no_gpu },
@@ -2298,6 +2346,28 @@ fn split_path_qualified(query: &str) -> Option<(&str, &str)> {
             .and_then(|e| e.to_str())
             .is_some_and(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()));
     looks_like_path.then(|| (head, &query[idx + 2..]))
+}
+
+/// Fold an optional disambiguating file path into a `path::SYMBOL` query so the
+/// existing path-qualified resolver ([`resolve_symbol_nodes`]) narrows SYMBOL to
+/// that file. Opt-in: returns None (leave the query unchanged) unless a symbol
+/// and a file-like path are both present and the symbol is not already
+/// path-qualified. Agents type `brief open src/flask/testing.py` to break a tie;
+/// serving that is cheaper than punishing it with a parse error.
+fn qualify_symbol_with_path(symbol: Option<&str>, path: Option<&str>) -> Option<String> {
+    let s = symbol?;
+    let p = path?;
+    if p.is_empty() || s.contains("::") {
+        return None;
+    }
+    // Require a file-like path (a basename carrying an extension) so
+    // split_path_qualified recognises the `path.ext::` boundary; otherwise the
+    // fold would only manufacture an unresolvable query.
+    let basename = p.rsplit(['/', '\\']).next().unwrap_or(p);
+    if !basename.contains('.') {
+        return None;
+    }
+    Some(format!("{p}::{s}"))
 }
 
 fn resolve_symbol_nodes(store: &greppy_store::Store, symbol: Option<&str>) -> Result<Vec<i64>> {
@@ -16571,7 +16641,7 @@ mod tests {
         let cli =
             Cli::try_parse_from(["greppy", "semantic-search", "--json", "retry handler"]).unwrap();
         match cli.command {
-            Some(Command::Semantic { query, json }) => {
+            Some(Command::Semantic { query, json, .. }) => {
                 assert_eq!(query.as_deref(), Some("retry handler"));
                 assert!(json);
             }
@@ -16598,6 +16668,72 @@ mod tests {
             }
             other => panic!("unexpected command for semantic alias: {other:?}"),
         }
+
+        // Postel: --path is an advisory no-op on semantic-search, not a parse error.
+        assert!(
+            Cli::try_parse_from(["greppy", "semantic-search", "merge", "--path", "src/x.ts"])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn parse_path_disambiguation_and_hyphen_values() {
+        // brief/read accept a disambiguating file both positionally and via --path.
+        for (posp, flagp) in [
+            (Some("src/flask/testing.py"), None),
+            (None, Some("src/flask/testing.py")),
+        ] {
+            let mut argv = vec!["greppy", "brief", "open"];
+            if let Some(p) = posp {
+                argv.push(p);
+            }
+            if let Some(p) = flagp {
+                argv.push("--path");
+                argv.push(p);
+            }
+            match Cli::try_parse_from(argv).unwrap().command {
+                Some(Command::Brief {
+                    symbol,
+                    path,
+                    path_opt,
+                    ..
+                }) => {
+                    assert_eq!(symbol.as_deref(), Some("open"));
+                    let scope = path.as_deref().or(path_opt.as_deref());
+                    assert_eq!(scope, Some("src/flask/testing.py"));
+                    assert_eq!(
+                        qualify_symbol_with_path(symbol.as_deref(), scope).as_deref(),
+                        Some("src/flask/testing.py::open"),
+                    );
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+
+        // read carries the nav commands' --code flag as an accepted no-op.
+        assert!(
+            Cli::try_parse_from(["greppy", "read", "open", "a/mod.py", "--code"]).is_ok()
+        );
+
+        // An already-qualified symbol is not double-qualified.
+        assert_eq!(
+            qualify_symbol_with_path(Some("a.py::open"), Some("b.py")),
+            None
+        );
+        // A non-file path (no extension) is not folded into an unresolvable query.
+        assert_eq!(qualify_symbol_with_path(Some("open"), Some("src")), None);
+
+        // text-cas / regex-cas accept values beginning with '-' (real diff/RST lines).
+        assert!(Cli::try_parse_from([
+            "greppy", "edit", "text-cas", "--file", "CHANGES.rst", "--old", "-   Fix how",
+            "--new", "-   Fix what",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "greppy", "edit", "regex-cas", "--file", "f.py", "--pattern", "-x", "--replacement",
+            "-y",
+        ])
+        .is_ok());
     }
 
     #[test]
