@@ -162,66 +162,55 @@ instruction (Appendix A) — the 2×2 experiment shows it is a null control that
 adds cost without measurable benefit. The tool surface carries the effect; the
 extra prompt does not.
 
-### Try it without committing to it
+## CLI reference
 
-`greppy trial` runs one mechanically graded, own-project A/B observation. The
-v1 protocol supports a `who-calls` check through Pi:
+Every command runs on the current repository, or pass `--root DIR`. Structured
+queries print `qualified_name file:line`; add `--code` to include each result's
+source, `--all` to lift the default result cap, and `--json` for machine-readable
+output with exact counts. The first structured query builds the index; ordinary
+`grep` invocations pass straight through to the system `grep`.
 
-```bash
-greppy trial \
-  --root . \
-  --question "Who calls parse_config, and from where?" \
-  --check who-calls \
-  --symbol parse_config \
-  --expect load_application \
-  --forbid legacy_loader \
-  --runner pi \
-  --provider minimax \
-  --model MiniMax-M3
-```
+**Navigate the symbol graph**
 
-`--expect` and `--forbid` are repeatable, case-sensitive final-answer literal
-checks. The command requires `--root` to be the exact top level of a clean Git
-repository with a committed `HEAD`. Commit or remove staged, unstaged, and
-untracked files first.
+| Command | Answers |
+|---|---|
+| `greppy who-calls SYMBOL` | the callers of `SYMBOL` (incoming calls) |
+| `greppy callees SYMBOL` | the functions `SYMBOL` calls (outgoing calls) |
+| `greppy find-usages SYMBOL` | every reference — calls, uses, imports |
+| `greppy references SYMBOL` | every incoming graph reference, without content-search fallback noise |
+| `greppy impact SYMBOL` | the transitive blast-radius in one call — `--direction incoming` (what breaks if I change it, default) or `outgoing` (what it reaches); tune with `--depth N`, `--since REV`, `--base BRANCH` |
+| `greppy brief SYMBOL` | definition + direct callers + callees, in a single call |
+| `greppy path --from A --to B` | a call chain from `A` to `B` (`--edge CALLS\|USES\|TYPE_REF\|IMPORTS`) |
+| `greppy graph-locate FILE:LINE` | the innermost symbol enclosing a `file:line` location |
+| `greppy fan-in` / `greppy fan-out` | the most-called / most-calling symbols in the project |
+| `greppy trace SYMBOL` | a call-graph trace |
+| `greppy search-graph …` | a structured graph query |
 
-The harness creates two private detached worktrees outside the target
-repository, at the same commit and tree. Each arm gets its own
-`GREPPY_STORE_DIR`, Pi config directory, and session directory. Pi context
-files, skills, prompt templates, extensions, themes, and session persistence
-are disabled. Complete versioned system prompts are supplied with
-`--system-prompt`; the Greppy prompt contains the exact requested symbol.
-Only the Greppy worktree is indexed, before either measured arm. Arms then run
-in deterministic `baseline`, `greppy` order and both worktrees must remain
-clean at the pinned commit. Disposable worktrees and stores are removed after
-the run.
+**Search**
 
-Stdout is one `greppy.project-trial.v1` JSON object identified by
-`schema_version`. It records commit and tree IDs; Pi and Greppy executable
-paths, versions, and SHA-256 digests; exact normalized tool and source-open
-calls; tool-result character counts; first-turn, later-turn, and aggregate Pi
-token counters when reported; turns; wall time; answers; mechanical grades;
-and trace SHA-256 digests. Raw Pi traces remain private and are deleted with
-the disposable trial directory.
+| Command | Finds |
+|---|---|
+| `greppy semantic-search "PLAIN ENGLISH"` | code by meaning (EmbeddingGemma + Qwen hints) — use when you don't know the symbol name |
+| `greppy search-symbols NAME` | definitions by name or fragment (`--kind function\|struct\|trait\|…`) |
+| `greppy search-code QUERY` | full-text code search |
+| `greppy plus QUERY` | fused ranking: literal + symbol + semantic + graph-neighbour signals |
+| `greppy expand ID` | the prepared evidence pack a prior query offered (`Expand: greppy expand <id>`) |
 
-The only statuses are:
+**Workspace & health**
 
-- `valid_observation` (exit 0): both valid arms passed the mechanical check.
-- `quality_regression` (exit 1): the valid baseline passed and the valid Greppy arm failed.
-- `inconclusive` (exit 2): setup, execution, contamination, cleanliness, or baseline-quality failure prevented that comparison.
+| Command | Does |
+|---|---|
+| `greppy index [PATH]` | build or refresh the index; `greppy index status` reports progress |
+| `greppy stats` | node and edge counts for the project graph |
+| `greppy diagnostics` | schema health, integrity, workspace state, provider completeness |
+| `greppy doctor` | end-to-end health check of the active index |
+| `greppy cache status\|gc\|clear` | inspect or reclaim greppy-managed cache and stores |
+| `greppy trial …` | run one isolated, mechanically-graded baseline-vs-greppy A/B on your own repository and print a `greppy.project-trial.v1` JSON record |
 
-A baseline trace that invokes Greppy is rejected. The `comparison` object gives
-the observed quality relationship and Greppy-minus-baseline deltas and ratios
-for this single pair. These are descriptive measurements, never a generalized
-efficiency result or release claim.
-
-The trial's disposable stores are removed automatically. To remove any Greppy
-cache created during normal use and uninstall the binary:
-
-```bash
-greppy cache clear --root . --yes
-sudo rm /usr/local/bin/greppy
-```
+**Global flags** — accepted before or after the subcommand: `--root DIR`,
+`--device auto\|cpu\|metal\|cuda[:INDEX]` (or `GREPPY_DEVICE`), `--json`,
+`--code`, `--all`. `greppy --version`, `greppy --help`, and
+`greppy <command> --help` print the full detail for any command.
 
 ---
 
