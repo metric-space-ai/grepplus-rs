@@ -7,6 +7,16 @@ unreleased `main` branch is tested continuously but is not a supported release
 channel. Pin production installations to an immutable tag and verify the
 published checksum and build provenance.
 
+## Release scope
+
+A release is cut only when, on the exact release commit, all of the following
+pass: CI, CodeQL, the Rust dependency security audit, the task-bank
+reproducibility audit, the navigation-regime agent benchmark, and the
+summary-quality gate — plus code signing and notarization. Greppy's claim is
+structural code navigation, and the navigation benchmark is a hard, per-commit
+release gate that must be green on the released binary. The remaining
+benchmarks run continuously and their verdicts are published with each commit.
+
 ## Verifying a release
 
 The expected provenance identity is the repository

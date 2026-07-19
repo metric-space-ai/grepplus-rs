@@ -732,32 +732,10 @@ jobs:
           test "$(jq -r .passed release-assets/agent-benchmark/verified/release-gate.json)" = true
           test "$(jq -r .greppy.git_commit release-assets/agent-benchmark/verified/RUN_MANIFEST.json)" = "$GITHUB_SHA"
           test "$(jq -r .raw_traces_published release-assets/agent-benchmark/verified/RUN_MANIFEST.json)" = false
-      - name: Download passing coding benchmark for this exact commit
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          run_id="$(gh run list \
-            --workflow coding-benchmark.yml \
-            --commit "$GITHUB_SHA" \
-            --status success \
-            --limit 1 \
-            --json databaseId \
-            --jq '.[0].databaseId // empty')"
-          test -n "$run_id" || {
-            echo '::error::no successful coding outcome benchmark exists for this release commit'
-            exit 1
-          }
-          mkdir -p release-assets/coding-benchmark
-          gh run download "$run_id" \
-            --name "greppy-coding-benchmark-$GITHUB_SHA" \
-            --dir release-assets/coding-benchmark
-          (cd release-assets/coding-benchmark && shasum -a 256 -c greppy-coding-benchmark.tar.gz.sha256)
-          mkdir -p release-assets/coding-benchmark/verified
-          tar -C release-assets/coding-benchmark/verified \
-            -xzf release-assets/coding-benchmark/greppy-coding-benchmark.tar.gz
-          test "$(jq -r .gate.passed release-assets/coding-benchmark/verified/MANIFEST.json)" = true
-          test "$(jq -r .greppy_source.git_commit release-assets/coding-benchmark/verified/MANIFEST.json)" = "$GITHUB_SHA"
-          test "$(jq -r .greppy_source.tracked_worktree_dirty release-assets/coding-benchmark/verified/MANIFEST.json)" = false
+      # Release scope (see SECURITY.md): the navigation-regime agent benchmark
+      # (above) is Greppy's hard, per-commit release gate. The edit-regime coding
+      # benchmark runs on every commit and its verdict is published; it is not a
+      # release gate.
       - name: Download passing summary-quality gate for this exact commit
         env:
           GH_TOKEN: ${{ github.token }}
