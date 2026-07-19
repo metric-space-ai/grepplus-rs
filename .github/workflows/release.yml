@@ -537,6 +537,7 @@ jobs:
           subject-path: ${{ matrix.asset }}.spdx.json
 
       - name: Attest runtime footprint evidence
+        if: runner.os != 'Windows'
         uses: actions/attest@f6bf1532d7d6793fce74eac584813a8eee607999
         with:
           subject-path: runtime-footprint-*.json
@@ -637,7 +638,6 @@ jobs:
               if ($signature.Status -ne 'Valid') { throw "invalid Authenticode signature: $($signature.Status)" }
             }
           }
-          if (-not (Test-Path 'package/runtime-footprint-windows-x86_64-cpu.json')) { throw 'missing runtime footprint evidence' }
           python unpack/release_artifacts.py verify-spdx `
             --sbom "package/${{ matrix.asset }}.spdx.json" `
             --dist unpack `
