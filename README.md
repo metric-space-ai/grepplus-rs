@@ -6,7 +6,7 @@
 
 [![CI](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/ci.yml?query=branch%3Amain)
 [![CodeQL](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml?query=branch%3Amain)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 `greppy` is a code-navigation tool that also accepts ordinary `grep`
 invocations. Those invocations execute the real system `grep` and forward its
@@ -149,6 +149,13 @@ Treat returned source paths, exact spans, signatures, and graph relations as
 evidence. The indented English sentence below a function signature is a local
 Qwen navigation hint. Read the source and verify changes with builds and tests.
 ```
+
+That block *is* the prompt: it names the commands, explains the semantic index,
+and tells the agent to verify against source. It is the only instruction greppy
+needs. Do **not** also paste the paper's *minimum-sufficient-context* method
+instruction (Appendix A) — the 2×2 experiment shows it is a null control that
+adds cost without measurable benefit. The tool surface carries the effect; the
+extra prompt does not.
 
 ### Try it without committing to it
 
@@ -342,8 +349,11 @@ the exact software artifact through [CITATION.cff](CITATION.cff).
 
 ## License
 
-Greppy source code is MIT-licensed; embedded model weights have separate terms.
-The binding terms for the embedded model files are in
-[`licenses/EMBEDDED-MODEL-TERMS.md`](licenses/EMBEDDED-MODEL-TERMS.md).
-See [LICENSE](LICENSE), [THIRD_PARTY.md](THIRD_PARTY.md), and the model notices
-under [`licenses/`](licenses/).
+Greppy source code is Apache-2.0-licensed. The embedded model weights are **not**
+covered by that license and carry their own terms — in particular EmbeddingGemma
+is under Google's [Gemma Terms of Use](licenses/GEMMA-TERMS.html) (use
+restrictions plus redistribution conditions); Qwen3.5 is Apache-2.0. Before
+shipping greppy inside a product, read the binding
+[`licenses/EMBEDDED-MODEL-TERMS.md`](licenses/EMBEDDED-MODEL-TERMS.md). See
+[LICENSE](LICENSE), [THIRD_PARTY.md](THIRD_PARTY.md), and the model notices under
+[`licenses/`](licenses/).
