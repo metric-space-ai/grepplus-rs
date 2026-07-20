@@ -400,7 +400,6 @@ fn graph_grid_ruby_graph_survives_reindex() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "ruby graph gap: freshness behavior differs from certified languages"]
 fn graph_grid_ruby_stale_edit_detected() {
     let (repo, store) = index_fixture("stale");
 
@@ -411,29 +410,24 @@ fn graph_grid_ruby_stale_edit_detected() {
     )
     .unwrap();
 
-    // The freshness gate must refuse to serve stale rows on the FIRST JSON
-    // request after a small drift, exactly like the proven Rust/Python/Go/
-    // TS/Java fixtures in `graph_nav.rs`.
+    // Heal-in-band contract (1b7135b): a healable drift is reindexed in-band
+    // and served fresh against the updated graph.
     let (code, out, err) = run(&["who-calls", "do_it", "--json"], &repo, &store);
     assert_eq!(
-        code, 75,
-        "small-stale drift must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
-    );
-    assert!(
-        err.is_empty(),
-        "JSON freshness refusal must stay on stdout; stderr={err:?}"
+        code, 0,
+        "healable stale edit must be healed in-band and served; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value = serde_json::from_str(&out)
         .unwrap_or_else(|e| panic!("invalid who-calls stale json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "who-calls");
     assert_eq!(
-        v["status"], "skipped_stale_index",
-        "stale who-calls must be skipped: {v:?}"
+        v["fresh"], true,
+        "the healed response must prove freshness; got: {v:?}"
     );
-    assert_eq!(v["fresh"], false, "stale nav must not claim fresh: {v:?}");
-    assert_eq!(v["freshness"]["state"], "refreshing");
-    let hits = v["hits"].as_array().expect("hits array");
-    assert!(hits.is_empty(), "stale rows must not escape: {v:?}");
+    assert_eq!(
+        v["symbol_found"], true,
+        "the symbol must resolve against the healed graph; got: {v:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
