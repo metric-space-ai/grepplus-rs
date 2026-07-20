@@ -994,7 +994,11 @@ pub enum EditCommand {
     },
     /// Restore pre-images from a crashed journal transaction.
     #[command(name = "recover")]
-    Recover,
+    Recover {
+        /// Write the full recovery report as JSON to FILE.
+        #[arg(long)]
+        report: Option<String>,
+    },
     #[command(name = "replace-span")]
     ReplaceSpan {
         /// Edit handle from `greppy read SYMBOL --handle`.
@@ -7040,26 +7044,31 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             }
             (greppy_edit::plan::apply_plan(&parsed, dry_run)?, report)
         }
-        EditCommand::Recover => {
-            let outcome = greppy_edit::journal::recover(&root_path)?;
-            let (msg, code) = match outcome {
-                greppy_edit::journal::Recovery::NothingToRecover => {
-                    ("nothing to recover".to_string(), 0)
+        EditCommand::Recover { report } => {
+            let outcome = greppy_edit::journal::recover_with_report(&root_path)?;
+            let msg = match outcome.action {
+                greppy_edit::journal::RecoveryAction::NothingToRecover => {
+                    "nothing to recover".to_string()
                 }
-                greppy_edit::journal::Recovery::RolledBack {
-                    transaction_id,
-                    files,
-                } => (
-                    format!("rolled back transaction {transaction_id}: {files} file(s) restored"),
-                    0,
+                greppy_edit::journal::RecoveryAction::RolledBack => format!(
+                    "rolled back transaction {}: {} file(s) restored",
+                    outcome.transaction_id.as_deref().unwrap_or_default(),
+                    outcome.files_restored
                 ),
-                greppy_edit::journal::Recovery::DiscardedUncommitted => (
-                    "discarded uncommitted journal; nothing had been published".to_string(),
-                    0,
-                ),
+                greppy_edit::journal::RecoveryAction::DiscardedUncommitted => {
+                    "discarded uncommitted journal; nothing had been published".to_string()
+                }
             };
+            if let Some(path) = report {
+                let json = serde_json::to_string_pretty(&outcome)
+                    .map_err(|e| Error::Invalid(format!("serialize recovery report: {e}")))?;
+                std::fs::write(&path, json).map_err(|source| Error::Io {
+                    context: format!("write {path}"),
+                    source,
+                })?;
+            }
             println!("{msg}");
-            return Ok(code);
+            return Ok(0);
         }
         EditCommand::PatchSpan {
             target,
