@@ -14,7 +14,7 @@
 //!
 //! Fixture shape (three files):
 //!
-//! * `app.rb`        -- `caller()` calls `Helper.do_it` and uses `Widget` (TYPE_REF)
+//! * `app.rb`        -- `caller()` calls `Helper.do_it` and constructs `Widget` (TYPE_REF)
 //!   plus references the constant `Helper::LIMIT`.
 //! * `helper.rb`     -- defines the `Helper` module with `do_it()` and a
 //!   top-level `LIMIT` constant.
@@ -49,7 +49,7 @@ fn fresh_dir(tag: &str) -> PathBuf {
 
 /// Build a Ruby repo exercising all four cross-file edge kinds:
 /// * caller()         --CALLS-->    Helper.do_it()       (helper.rb)
-/// * render(w)        --USAGE-->    types::Widget        (types.rb)
+/// * render(w)        --TYPE_REF--> types::Widget        (types.rb)
 /// * build()          --USAGE-->    types::Marker        (types.rb)
 /// * top of file      --IMPORTS-->  helper.rb / types.rb (require)
 fn make_ruby_graph_repo(tag: &str) -> (PathBuf, PathBuf) {
@@ -69,8 +69,8 @@ def caller
   Helper.do_it
 end
 
-def render(w)
-  return w.width
+def render(_w)
+  Widget.new
 end
 
 def build
@@ -245,19 +245,18 @@ fn graph_grid_ruby_find_usages_covers_call_and_import() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "ruby graph gap: cross-file TYPE_REF usage not resolved"]
 fn graph_grid_ruby_find_usages_type_reference() {
     let (repo, store) = index_fixture("usages-type");
 
-    // `Widget` is used by `render`'s parameter (USAGE / TYPE_REF).
+    // `Widget` is the statically named receiver of `Widget.new` in `render`.
     let (code, out, err) = run(&["find-usages", "Widget"], &repo, &store);
     assert_eq!(
         code, 0,
         "find-usages should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
-        out.contains("USAGE") && out.contains("render"),
-        "find-usages Widget must include the USAGE referrer `render`; got: {out:?}"
+        out.contains("TYPE_REF") && out.contains("render"),
+        "find-usages Widget must include the TYPE_REF referrer `render`; got: {out:?}"
     );
     assert!(
         out.contains("app.rb:"),

@@ -3461,12 +3461,10 @@ fn extract_go(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionR
 // Edges, on top of the spec's CALLS / IMPORTS:
 //   * **DEFINES_METHOD** — one per owned method, from the owning class/module
 //     node to the method node.
-//   * **USAGE** — every Ruby
-//     `identifier` reference that is not a definition name, not inside a
-//     call/command_call, and not a keyword, sourced from its enclosing
-//     method/module qname. Ruby's reference set is only `identifier`
-//     (constants / instance_variables are not reference nodes), so
-//     only bare identifiers emit usages.
+//   * **USES** — every Ruby bare `identifier` read that is not a definition,
+//     call endpoint, assignment target, or keyword;
+//   * **TYPE_REF** — statically named constant receivers such as `Widget.new`
+//     and `Helper.do_it`, sourced from the enclosing method/module qname.
 //
 // The spec path already labels a `module` decl "Module"; we relabel those to
 // "Class" here (leaving the indexer's synthetic per-file Module untouched, since
@@ -3512,9 +3510,9 @@ fn extract_ruby(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     // def C double-counts, plus the class/module → method DEFINES_METHOD edge.
     ruby_defs_pass(source, root, file_path, &mut result);
 
-    // (3) USAGE pass.
+    // (3) TYPE_REF / USES pass.
     let file_module_qname = format!("{file_path}::__file__");
-    ruby_emit_usages(source, root, file_path, &file_module_qname, &mut result);
+    ruby_emit_references(source, root, file_path, &file_module_qname, &mut result);
 
     Ok(result)
 }
@@ -3786,45 +3784,78 @@ fn ruby_emit_body_variables(
     }
 }
 
-/// Recursively emit `USAGE` edges for Ruby `identifier` references. Ruby
-/// recognises only the common `identifier` as a reference (`constant` /
-/// `instance_variable` are NOT
-/// references). A reference emits a usage unless it is a definition *name*, sits
-/// inside a `call` / `command_call` (`call_node_types`, already a CALLS edge and
-/// suppressing every nested argument reference), or is a Ruby keyword. The
-/// `ref_name` is resolved project-wide by the indexer, so the target qname is a
-/// placeholder that never resolves directly.
-fn ruby_emit_usages(
+/// Recursively classify Ruby references. Bare identifier reads become `USES`;
+/// a constant used as the receiver of a call (`Widget.new`, `Helper.do_it`)
+/// becomes `TYPE_REF` because Ruby constants are the grammar's statically named
+/// class/module surface. Scope-resolution constants are handled separately as
+/// value references. Certified Ruby references preserve these logical labels
+/// when persisted instead of folding them into the compatibility `USAGE` kind.
+fn ruby_emit_references(
     source: &[u8],
     node: Node<'_>,
     file_path: &str,
     file_module_qname: &str,
     result: &mut ExtractionResult,
 ) {
-    if node.kind() == "identifier"
+    let is_identifier_use = node.kind() == "identifier"
         && !is_inside_kind(node, &["call", "command_call"])
         && !is_definition_name(node)
-    {
+        && !ruby_is_assignment_lhs(node);
+    let is_type_ref = node.kind() == "constant" && ruby_is_constant_call_receiver(node);
+    if is_identifier_use || is_type_ref {
         let text = node_text(source, node);
         if !text.is_empty() && !is_ruby_usage_keyword(text) {
             let source_qname = ruby_enclosing_qname(source, node, file_path)
                 .unwrap_or_else(|| file_module_qname.to_string());
             result.edges.push(ExtractedEdge {
-                edge_type: "USAGE".into(),
+                edge_type: if is_type_ref { "TYPE_REF" } else { "USES" }.into(),
                 source_qualified_name: source_qname,
-                target_qualified_name: format!("{file_path}::__ref__::{text}"),
+                target_qualified_name: if is_type_ref {
+                    format!("{file_path}::Class::{text}")
+                } else {
+                    format!("{file_path}::__ref__::{text}")
+                },
                 file_path: file_path.to_string(),
                 line: node.start_position().row as u32 + 1,
-                properties: serde_json::json!({
-                    "ref_name": text,
-                }),
+                properties: if is_type_ref {
+                    serde_json::json!({
+                        "type_name": text,
+                        "preserve_reference_kind": true,
+                    })
+                } else {
+                    serde_json::json!({
+                        "ref_name": text,
+                        "preserve_reference_kind": true,
+                    })
+                },
             });
         }
     }
     let mut c = node.walk();
     for child in node.named_children(&mut c) {
-        ruby_emit_usages(source, child, file_path, file_module_qname, result);
+        ruby_emit_references(source, child, file_path, file_module_qname, result);
     }
+}
+
+fn ruby_is_assignment_lhs(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "assignment"
+            && parent.child_by_field_name("left").is_some_and(|left| {
+                left.start_byte() == node.start_byte() && left.end_byte() == node.end_byte()
+            })
+    })
+}
+
+fn ruby_is_constant_call_receiver(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "call"
+            && parent
+                .child_by_field_name("receiver")
+                .is_some_and(|receiver| {
+                    receiver.start_byte() == node.start_byte()
+                        && receiver.end_byte() == node.end_byte()
+                })
+    })
 }
 
 /// Ruby keyword / literal filter. References whose text is one of these never
@@ -17221,6 +17252,45 @@ end
                 .get("receiver_owner")
                 .and_then(|v| v.as_str()),
             Some("Helper")
+        );
+    }
+
+    #[test]
+    fn ruby_classifies_constant_receiver_type_refs_and_identifier_uses() {
+        let r = rb(
+            "def render(input)\n  widget = Widget.new\n  widget\nend\n",
+            "app.rb",
+        );
+        let has_ref = |kind: &str, property: &str, name: &str| {
+            r.edges.iter().any(|edge| {
+                edge.edge_type == kind
+                    && edge.source_qualified_name == "app.rb::Function::render"
+                    && edge
+                        .properties
+                        .get(property)
+                        .and_then(|value| value.as_str())
+                        == Some(name)
+                    && edge
+                        .properties
+                        .get("preserve_reference_kind")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+            })
+        };
+        assert!(
+            has_ref("TYPE_REF", "type_name", "Widget"),
+            "Widget.new receiver must classify as TYPE_REF: {:?}",
+            r.edges
+        );
+        assert!(
+            has_ref("USES", "ref_name", "widget"),
+            "returned local must classify as USES: {:?}",
+            r.edges
+        );
+        assert!(
+            !r.edges.iter().any(|edge| edge.edge_type == "USAGE"),
+            "Ruby reference kinds must not collapse during extraction: {:?}",
+            r.edges
         );
     }
 
