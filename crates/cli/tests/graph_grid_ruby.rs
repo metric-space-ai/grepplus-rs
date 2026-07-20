@@ -15,18 +15,18 @@
 //! Fixture shape (three files):
 //!
 //! * `app.rb`        -- `caller()` calls `Helper.do_it` and uses `Widget` (TYPE_REF)
-//!                       plus references the constant `Helper::LIMIT`.
+//!   plus references the constant `Helper::LIMIT`.
 //! * `helper.rb`     -- defines the `Helper` module with `do_it()` and a
-//!                       top-level `LIMIT` constant.
+//!   top-level `LIMIT` constant.
 //! * `types.rb`      -- defines the `Widget` class and the `Marker` struct
-//!                       (labelled Class by the Ruby extractor).
+//!   (labelled Class by the Ruby extractor).
 //!
 //! Edge shape asserted by these tests:
 //!   - CALLS      : `app.rb::caller`  -> `helper.rb::Helper::do_it`
 //!   - USAGE/TYPE : `app.rb::render`  -> `types.rb::Widget`
 //!   - USAGE      : `app.rb::build`   -> `types.rb::Marker`
 //!   - IMPORTS    : `app.rb::__file__` -> `helper.rb::__file__` / `types.rb::__file__`
-//!                 (Ruby `require`/`require_relative` pass)
+//!     (Ruby `require`/`require_relative` pass)
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -48,10 +48,10 @@ fn fresh_dir(tag: &str) -> PathBuf {
 }
 
 /// Build a Ruby repo exercising all four cross-file edge kinds:
-///   * caller()         --CALLS-->    Helper.do_it()       (helper.rb)
-///   * render(w)        --USAGE-->    types::Widget        (types.rb)
-///   * build()          --USAGE-->    types::Marker        (types.rb)
-///   * top of file      --IMPORTS-->  helper.rb / types.rb (require)
+/// * caller()         --CALLS-->    Helper.do_it()       (helper.rb)
+/// * render(w)        --USAGE-->    types::Widget        (types.rb)
+/// * build()          --USAGE-->    types::Marker        (types.rb)
+/// * top of file      --IMPORTS-->  helper.rb / types.rb (require)
 fn make_ruby_graph_repo(tag: &str) -> (PathBuf, PathBuf) {
     let root = fresh_dir(tag);
     let repo = root.join("repo");

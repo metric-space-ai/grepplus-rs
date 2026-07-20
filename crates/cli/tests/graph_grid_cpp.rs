@@ -8,19 +8,19 @@
 //! liefert vs. was das Grid erwartet.
 //!
 //! Fixture-Repo (`src/`):
-//!   * `main.cpp`    — `caller()`, `render(::Widget)`, `other_caller()`,
-//!                     inkl. `#include "helper.hpp"` / `"types.hpp"`.
-//!   * `helper.hpp`  — inline-definierter Helfer `app::do_it()` +
-//!                     Konstante `app::kMarker`.
-//!   * `types.hpp`   — Typdefinition `struct Widget`.
+//! * `main.cpp`    — `caller()`, `render(::Widget)`, `other_caller()`,
+//!   inkl. `#include "helper.hpp"` / `"types.hpp"`.
+//! * `helper.hpp`  — inline-definierter Helfer `app::do_it()` +
+//!   Konstante `app::kMarker`.
+//! * `types.hpp`   — Typdefinition `struct Widget`.
 //!
 //! Soll-Kanten über Dateigrenzen:
-//!   * `caller()`            --CALLS-->   `do_it()`                  (helper.hpp)
-//!   * `other_caller()`      --CALLS-->   `app::do_it()` (qualified) (helper.hpp)
-//!   * `render(::Widget w)`  --USAGE-->   `Widget`                   (types.hpp)
-//!   * `main.cpp`            --IMPORTS--> `helper.hpp` / `types.hpp`
-//!   * `render()`            --USAGE-->   `kMarker`                  (Konstante,
-//!                                Ziel-Symbol aber NICHT extrahiert → Lücke)
+//! * `caller()`            --CALLS-->   `do_it()`                  (helper.hpp)
+//! * `other_caller()`      --CALLS-->   `app::do_it()` (qualified) (helper.hpp)
+//! * `render(::Widget w)`  --USAGE-->   `Widget`                   (types.hpp)
+//! * `main.cpp`            --IMPORTS--> `helper.hpp` / `types.hpp`
+//! * `render()`            --USAGE-->   `kMarker`                  (Konstante,
+//!   Ziel-Symbol aber NICHT extrahiert → Lücke)
 //!
 //! Hinweis: Die C++-Queries (`crates/parser/src/query.rs::cpp_queries`)
 //! emittieren Definitions, Calls und Imports. Sie haben **kein**
@@ -48,12 +48,12 @@ fn fresh_dir(tag: &str) -> PathBuf {
 
 /// Build a git-rooted C++ repo with three files exercising all four
 /// cross-file edge shapes:
-///   * CALLS:   `caller()` -> `do_it()` (header inline definition)
-///   * CALLS:   `other_caller()` -> `app::do_it()` (qualified call)
-///   * USAGE:   `render(::Widget)` parameter type -> Widget (TYPE_REF parity)
-///   * USAGE:   `render(w.w + kMarker)` constant reference -> kMarker
-///                                                  (NOT a definition; gap)
-///   * IMPORTS: `#include "helper.hpp"` / `#include "types.hpp"`
+/// * CALLS:   `caller()` -> `do_it()` (header inline definition)
+/// * CALLS:   `other_caller()` -> `app::do_it()` (qualified call)
+/// * USAGE:   `render(::Widget)` parameter type -> Widget (TYPE_REF parity)
+/// * USAGE:   `render(w.w + kMarker)` constant reference -> kMarker
+///   (NOT a definition; gap)
+/// * IMPORTS: `#include "helper.hpp"` / `#include "types.hpp"`
 fn make_cpp_repo(tag: &str) -> (PathBuf, PathBuf) {
     let root = fresh_dir(tag);
     let repo = root.join("repo");
