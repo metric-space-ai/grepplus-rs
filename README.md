@@ -8,11 +8,12 @@
 [![CodeQL](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/metric-space-ai/greppy/actions/workflows/codeql.yml?query=branch%3Amain)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-> In a four-model benchmark (MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3), an
-> agent with greppy answered 6–50 percentage points more questions correctly
-> than the same agent with `grep`, and matched the grep agent's best quality
-> at 37–80 % lower API cost.
-> Method and full results: [paper](docs/paper/mscc-greppy-paper.pdf).
+> In our 115-task, four-model benchmark (MiniMax-M3, GLM-5.2, Qwen3.6-27B,
+> Kimi-K3), an agent with greppy answered 6–50 percentage points more
+> questions correctly than the same agent with `grep`, and matched the grep
+> agent's best quality at 37–80 % lower API cost.
+> Method and full results: [paper](docs/paper/mscc-greppy-paper.pdf); the
+> benchmark suites are in this repo.
 
 `greppy` is a code-navigation tool that also accepts ordinary `grep`
 invocations. Those invocations execute the real system `grep` and forward its
@@ -63,18 +64,34 @@ and reached the grep agent's best quality at 37–80 % lower billed API cost.
 **1. Install.** Both install paths produce a binary with the two models
 embedded.
 
-*Prebuilt binary.* Download the archive for your platform from the
-[releases page](https://github.com/metric-space-ai/greppy/releases)
-(`greppy-macos-arm64.tar.gz`, `greppy-linux-x86_64.tar.gz`,
-`greppy-windows-x86_64.zip`), unpack it, and put `greppy` on your `PATH`. The
-models are already baked in — nothing else to fetch.
-
-*Build from source.* One command fetches the SHA-256-pinned model assets and
-compiles them into the binary:
+*Prebuilt binary* (macOS arm64, Linux x86_64, Windows x86_64 — see
+[SUPPORT.md](SUPPORT.md) for the exact target list):
 
 ```bash
-./tools/fetch_model_assets.sh && cargo build --release --bin greppy
-sudo install -m 0755 target/release/greppy /usr/local/bin/greppy
+version=v0.2.1
+asset=greppy-macos-arm64.tar.gz        # or greppy-linux-x86_64.tar.gz
+gh release download "$version" --repo metric-space-ai/greppy \
+  --pattern "$asset" --pattern SHA256SUMS
+shasum -a 256 --ignore-missing -c SHA256SUMS
+tar -xzf "$asset"
+install -m 0755 greppy "$HOME/.local/bin/greppy"   # no sudo needed
+```
+
+Windows: download `greppy-windows-x86_64.zip` from the
+[releases page](https://github.com/metric-space-ai/greppy/releases), verify it
+against `SHA256SUMS`, unzip, and put `greppy.exe` on `PATH`. Signature and
+provenance verification: [SECURITY.md](SECURITY.md). The models are already in
+the binary.
+
+*Build from source* (needs Rust ≥ 1.95, a C toolchain, `jq`, `curl`;
+downloads ~780 MB of model files):
+
+```bash
+git clone https://github.com/metric-space-ai/greppy && cd greppy
+git checkout v0.2.1
+./tools/fetch_model_assets.sh
+cargo build --locked --release --bin greppy
+install -m 0755 target/release/greppy "$HOME/.local/bin/greppy"
 ```
 
 `cargo build` fails if a model asset is missing or its SHA-256 does not match
@@ -94,12 +111,18 @@ pinned by SHA-256 in
 time — no token needed. Nothing is downloaded at runtime. Don't install the
 binary as `grep`.
 
-The first structured query builds the local workspace index once per source
-generation and reuses it across later agent sessions. `semantic-search` never
-exposes partial vectors: until that generation completes it returns
-`status: "indexing"` in JSON (exit 75) with the active CPU/Metal/CUDA backend,
-exact span progress, and an estimated completion time, while graph navigation
-stays available throughout.
+First run:
+
+```bash
+greppy --version
+greppy doctor --root . --json     # index + backend health
+greppy who-calls SOME_SYMBOL --root . --json   # first query builds the index
+```
+
+The index is built once per repository and reused across sessions. While
+embeddings are still building, `semantic-search --json` returns
+`status: "indexing"` with progress and an ETA (exit 75) — retry it later or
+poll `greppy index status`; graph commands work immediately.
 
 **2. Add the prompt to your agent.** That's the whole integration — no MCP
 server, no per-agent config, no API keys. Works in any agent that can run
@@ -200,7 +223,7 @@ output with exact counts. The first structured query builds the index; ordinary
 | `greppy search-symbols NAME` | definitions by name or fragment (`--kind function\|struct\|trait\|…`) |
 | `greppy search-code QUERY` | full-text code search |
 | `greppy plus QUERY` | fused ranking: literal + symbol + semantic + graph-neighbour signals |
-| `greppy expand ID` | the prepared evidence pack a prior query offered (`Expand: greppy expand <id>`) |
+| `greppy expand ID` | the full source of results from a previous query (`Expand: greppy expand <id>`) |
 
 **Workspace & health**
 
@@ -211,7 +234,7 @@ output with exact counts. The first structured query builds the index; ordinary
 | `greppy diagnostics` | schema health, integrity, workspace state, provider completeness |
 | `greppy doctor` | end-to-end health check of the active index |
 | `greppy cache status\|gc\|clear` | inspect or reclaim greppy-managed cache and stores |
-| `greppy trial …` | run one isolated, mechanically-graded baseline-vs-greppy A/B on your own repository and print a `greppy.project-trial.v1` JSON record |
+| `greppy trial …` | run a local baseline-vs-greppy comparison on your own repository and print a `greppy.project-trial.v1` JSON record |
 
 **Global flags** — accepted before or after the subcommand: `--root DIR`,
 `--device auto\|cpu\|metal\|cuda[:INDEX]` (or `GREPPY_DEVICE`), `--json`,
@@ -223,8 +246,9 @@ output with exact counts. The first structured query builds the index; ordinary
 ## What it saves
 
 Greppy replaces search-and-open loops with one structured query plus attached
-source evidence. Two pre-registered benchmark suites are checked in and gate
-every release:
+source evidence. Two pre-registered benchmark suites are checked in — the
+navigation suite gates every release, the coding suite runs and publishes with
+every commit ([SECURITY.md](SECURITY.md) has the release scope):
 
 - [`bench/agent_efficiency/`](bench/agent_efficiency/) contains 115 pinned
   navigation tasks across six real repositories plus deterministic controls.
@@ -259,7 +283,7 @@ separately with its break-even.
 
 ---
 
-## The research behind it
+## Paper
 
 The navigation problem greppy optimizes is formalized in an accompanying
 paper: **“The Minimum Sufficient Code Context Problem — Complexity, Discovery
@@ -274,15 +298,15 @@ relations, and states the measurable conditions under which the combined
 policy greppy implements is strictly cheaper without losing correctness.
 The pre-registered factorial study in the paper is the same evidence design
 this repository enforces as release gates; the paper ships the frozen protocol
-and the complete four-model panel evidence (MiniMax-M3, GLM-5.2, Qwen3.6-27B,
-Kimi-K3 — 23,000+ valid cells).
+and the four-model panels (115 tasks × 4 conditions × 5 budgets × 3
+repetitions per model: MiniMax-M3, GLM-5.2, Qwen3.6-27B, Kimi-K3).
 
 ---
 
 ## How it works
 
 - **Standard grep.** Any invocation that isn't one of the extra commands runs real `grep` and returns its output and exit code unchanged.
-- **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USES`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`find-usages`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches — collapsing several grep+read rounds into one call.
+- **A precomputed code graph.** An indexed, typed symbol graph (`CALLS`/`USES`/`TYPE_REF`/`IMPORTS`) answers `who-calls`/`callees`/`find-usages`/`impact`/`path` directly — resolved relationships with `file:line`, not text matches.
 - **Native semantic navigation.** `semantic-search` uses Google's embedded **EmbeddingGemma** to find code by meaning. A **Qwen3.5-0.8B (Q4_K_M, MTP) that greppy fine-tuned in-house** — trained by distillation specifically to write code-navigation hints — adds a short purpose hint under each returned function signature and to each definition printed by `brief`. Inference is local Rust plus vendored Metal/CUDA kernels: no llama.cpp runtime, Python, HTTP, or model server.
 - **Bounded warm daemons.** The embedding and summary engines use separate local daemons. A used model remains resident for five idle minutes; the process exits after 30 idle minutes. Failed inference never removes deterministic source or graph output.
 - **One native Rust binary.** Both model files and tokenizers are baked into every binary; tree-sitter parsers and SQLite are compiled in. CPU is universal, while release artifacts add the native GPU backend for their target platform.
