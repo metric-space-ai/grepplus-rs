@@ -859,16 +859,20 @@ pub enum EditCommand {
         #[arg(long)]
         report: Option<String>,
     },
-    /// Replace the parameter list of a definition. Call sites are NOT
-    /// rewritten by the graph backend; the certificate lists them as a
-    /// review checklist in `candidates`.
+    /// Change a definition signature and every graph-resolved call site in one
+    /// transaction, using the old/new parameter lists and call cardinality in
+    /// a JSON specification.
     #[command(name = "change-signature")]
     ChangeSignature {
         #[arg(long)]
         symbol: String,
-        /// The new parameter list including parentheses, e.g. "(a, b, *, timeout=30)"
+        /// JSON file containing old_parameters, new_parameters,
+        /// added_arguments, and expect_call_sites.
         #[arg(long)]
-        parameters: String,
+        spec: String,
+        /// graph (default) uses the resolved store; lsp is unavailable in this build.
+        #[arg(long, default_value = "graph", value_parser = ["graph", "lsp"])]
+        backend: String,
         #[arg(long = "expect-residual", default_value_t = 0)]
         expect_residual: usize,
         #[arg(long = "dry-run")]
@@ -6444,6 +6448,16 @@ fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
 }
 
 fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
+    match dispatch_edit_inner(command, root) {
+        Err(error @ Error::Invalid(_)) => {
+            eprintln!("greppy: {error}");
+            Ok(20)
+        }
+        result => result,
+    }
+}
+
+fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> {
     let root_path = resolve_root(root)?;
     #[derive(PartialEq)]
     enum EditCommandKind {
@@ -6520,11 +6534,11 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
+                    rel_path,
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                } => {
                     let abs = root_path.join(&rel_path);
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
                     let options = resolved_options(
@@ -6565,11 +6579,11 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
+                    rel_path,
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                } => {
                     let abs = root_path.join(&rel_path);
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
                     let options = resolved_options(
@@ -6659,39 +6673,84 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
         },
         EditCommand::ChangeSignature {
             symbol,
-            parameters,
+            spec,
+            backend,
             expect_residual,
             dry_run,
             report,
         } => {
+            greppy_edit::verbs::require_semantic_backend(&backend)?;
+            let spec_bytes = std::fs::read(&spec).map_err(|source| Error::Io {
+                context: format!("read change-signature spec {spec}"),
+                source,
+            })?;
+            let spec: greppy_edit::verbs::ChangeSignatureSpec = serde_json::from_slice(&spec_bytes)
+                .map_err(|error| {
+                    Error::Invalid(format!(
+                        "change-signature --spec {spec} is not valid JSON: {error}"
+                    ))
+                })?;
             match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
-                    // call-site-checkliste aus dem graphen
+                    rel_path,
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                } => {
                     let store = open_default_store_query_writer(root)?;
                     let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
-                    let mut call_sites = Vec::new();
+                    let mut short_name = None;
+                    let mut scopes =
+                        std::collections::BTreeMap::<String, Vec<(usize, usize)>>::new();
                     for id in &ids {
-                        for edge in store.incoming_edges(*id, None, 10_000)? {
-                            if let Some(src) = store.get_node(edge.source_id)? {
-                                if !src.file_path.is_empty() && src.start_line >= 1 {
-                                    call_sites.push(greppy_edit::certificate::Candidate {
-                                        qualified_name: src.qualified_name.clone(),
-                                        path: src.file_path.clone(),
-                                        line: src.start_line as usize,
-                                    });
-                                }
+                        if let Some(definition) = store.get_node(*id)? {
+                            short_name.get_or_insert(definition.name);
+                        }
+                        for edge in store.incoming_edges(*id, None, 100_000)? {
+                            let Some(source) = store.get_node(edge.source_id)? else {
+                                continue;
+                            };
+                            if source.file_path.is_empty() || source.start_line < 1 {
+                                continue;
                             }
+                            let content = std::fs::read(root_path.join(&source.file_path))
+                                .map_err(|error| {
+                                    Error::io(format!("read {}", source.file_path), error)
+                                })?;
+                            let Some(span) = read_span_with_meta(
+                                &root_path,
+                                &source.file_path,
+                                source.start_line,
+                                source.end_line,
+                                usize::MAX,
+                                false,
+                            ) else {
+                                continue;
+                            };
+                            scopes
+                                .entry(source.file_path)
+                                .or_default()
+                                .push(line_range_to_bytes(
+                                    &content,
+                                    source.start_line as usize,
+                                    span.end_line as usize,
+                                ));
                         }
                     }
-                    call_sites.sort_by_key(|c| (c.path.clone(), c.line));
-                    call_sites.dedup_by(|a, b| a.path == b.path && a.line == b.line);
-                    let abs = root_path.join(&rel_path);
+                    let short_name = short_name.ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "change-signature could not resolve the name of `{symbol}`"
+                        ))
+                    })?;
+                    let call_scopes: Vec<greppy_edit::verbs::RenameFileScope> = scopes
+                        .into_iter()
+                        .map(|(rel_path, mut spans)| {
+                            spans.sort_unstable();
+                            spans.dedup();
+                            greppy_edit::verbs::RenameFileScope { rel_path, spans }
+                        })
+                        .collect();
                     let language = greppy_edit::language_for_path(std::path::Path::new(&rel_path));
                     let mut options = resolved_options(
                         dry_run,
@@ -6701,12 +6760,12 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
                     );
                     options.expect_residual = Some(expect_residual);
                     (
-                        greppy_edit::verbs::change_signature(
+                        greppy_edit::verbs::change_signature_files(
                             &root_path,
-                            &abs,
-                            range,
-                            &parameters,
-                            call_sites,
+                            &greppy_edit::verbs::SignatureDefinition { rel_path, range },
+                            &call_scopes,
+                            &short_name,
+                            &spec,
                             language,
                             &options,
                         )?,
@@ -6758,11 +6817,11 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
-                rel_path,
-                range,
-                planned_file_sha256,
-                planned_target_sha256,
-            } => {
+                    rel_path,
+                    range,
+                    planned_file_sha256,
+                    planned_target_sha256,
+                } => {
                     let abs = root_path.join(&rel_path);
                     let options = resolved_options(
                         dry_run,
@@ -6861,12 +6920,7 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
             dry_run,
             report,
         } => {
-            if backend == "lsp" {
-                return Err(Error::NotImplemented {
-                    feature: "rename-symbol --backend lsp".into(),
-                    reason: "the LSP engine lands in a later 0.3.x phase; the graph backend is the default".into(),
-                });
-            }
+            greppy_edit::verbs::require_semantic_backend(&backend)?;
             let store = open_default_store_query_writer(root)?;
             let ids = resolve_symbol_nodes(&store, Some(&symbol))?;
             let mut def_nodes = Vec::new();
