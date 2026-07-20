@@ -89,6 +89,19 @@ against `SHA256SUMS`, unzip, and put `greppy.exe` on `PATH`. Signature and
 provenance verification: [SECURITY.md](SECURITY.md). The models are already in
 the binary.
 
+*Checking the release before installing* — one command each; note that the
+release **web page loads its asset list lazily**, so a plain-HTML fetch shows
+only the two "Source code" links. The API and the bundled inventory are the
+source of truth:
+
+```bash
+gh release view v0.2.1 --repo metric-space-ai/greppy \
+  --json assets -q '.assets | length'          # → 24
+gh release download v0.2.1 --repo metric-space-ai/greppy \
+  --pattern RELEASE-ASSETS.json                # machine-readable asset inventory
+gh attestation verify "$asset" --repo metric-space-ai/greppy   # build provenance
+```
+
 *Build from source* (needs Rust ≥ 1.95, a C toolchain, `jq`, `curl`;
 downloads ~780 MB of model files):
 
