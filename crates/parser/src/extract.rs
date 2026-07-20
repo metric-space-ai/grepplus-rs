@@ -3500,6 +3500,11 @@ fn extract_ruby(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     let tree = crate::parse(Language::Ruby, source)?;
     let root = tree.root_node();
 
+    // Preserve statically named receivers (`Helper.do_it`) so the indexer can
+    // resolve the call to the owned singleton Method instead of its duplicate
+    // free-Function facet.
+    ruby_annotate_receiver_calls(source, root, file_path, &mut result);
+
     // (2) Function-per-def + DEFINES_METHOD + Variable passes, walking the tree
     // once. `spec_definitions` already emitted the Method (owned) / Function
     // (free) node for each def; we ADD the second "Function" node for every
@@ -3511,6 +3516,67 @@ fn extract_ruby(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     ruby_emit_usages(source, root, file_path, &file_module_qname, &mut result);
 
     Ok(result)
+}
+
+/// Mark Ruby calls whose receiver is a statically named constant as receiver
+/// dispatch. `def self.x` is indexed as an owned Method (`Owner::x`) plus a
+/// compatibility Function facet; this metadata lets the indexer select the
+/// Method deterministically for `Owner.x` call sites, including cross-file
+/// singleton methods on modules.
+fn ruby_annotate_receiver_calls(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    result: &mut ExtractionResult,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        for child in node.named_children(&mut cursor) {
+            stack.push(child);
+        }
+        if node.kind() != "call" {
+            continue;
+        }
+        let Some(receiver) = node.child_by_field_name("receiver") else {
+            continue;
+        };
+        if receiver.kind() != "constant" {
+            continue;
+        }
+        let Some(method) = node.child_by_field_name("method") else {
+            continue;
+        };
+        let owner = node_text(source, receiver);
+        let name = node_text(source, method);
+        if owner.is_empty() || name.is_empty() {
+            continue;
+        }
+        let line = method.start_position().row as u32 + 1;
+        let Some(edge) = result.edges.iter_mut().find(|edge| {
+            edge.edge_type == "CALLS"
+                && edge.line == line
+                && edge
+                    .properties
+                    .get("callee_name")
+                    .and_then(|value| value.as_str())
+                    == Some(name)
+                && edge.properties.get("receiver_owner").is_none()
+        }) else {
+            continue;
+        };
+        edge.target_qualified_name = format!("{file_path}::{owner}::{name}");
+        if let Some(properties) = edge.properties.as_object_mut() {
+            properties.insert(
+                "callee_form".into(),
+                serde_json::Value::String("receiver".into()),
+            );
+            properties.insert(
+                "receiver_owner".into(),
+                serde_json::Value::String(owner.to_string()),
+            );
+        }
+    }
 }
 
 /// The nearest enclosing Ruby callable qname for `node`'s source endpoint:
@@ -17097,6 +17163,30 @@ end
         assert!(
             !callees.contains("require") && !callees.contains("require_relative"),
             "require must not appear as a call: {callees:?}"
+        );
+    }
+
+    #[test]
+    fn ruby_constant_receiver_call_preserves_singleton_owner() {
+        let r = rb("def caller\n  Helper.do_it\nend\n", "app.rb");
+        let edge = r
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "CALLS"
+                    && edge.properties.get("callee_name").and_then(|v| v.as_str()) == Some("do_it")
+            })
+            .expect("Helper.do_it must emit a CALLS edge");
+        assert_eq!(edge.target_qualified_name, "app.rb::Helper::do_it");
+        assert_eq!(
+            edge.properties.get("callee_form").and_then(|v| v.as_str()),
+            Some("receiver")
+        );
+        assert_eq!(
+            edge.properties
+                .get("receiver_owner")
+                .and_then(|v| v.as_str()),
+            Some("Helper")
         );
     }
 

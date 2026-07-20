@@ -338,7 +338,6 @@ fn graph_grid_ruby_brief_shows_definition_with_callers() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "ruby graph gap: no CALLS chain to module singleton method (path exits 1)"]
 fn graph_grid_ruby_path_connects_caller_to_helper() {
     let (repo, store) = index_fixture("path");
 
