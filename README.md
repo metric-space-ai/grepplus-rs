@@ -27,6 +27,12 @@ where is the code that does X.* Deterministic source and graph evidence is the
 authority. Locally generated summaries are short navigation hints attached to
 the exact source signature, not a replacement for reading the returned code.
 
+Everything runs on your machine: index, symbol graph, embeddings, and
+summaries are computed locally by the embedded models. No network calls at
+runtime, no telemetry, no account — greppy works offline and air-gapped. The
+only downloads are the model files at build time (prebuilt binaries already
+contain them).
+
 ```bash
 # Standard grep — every command works, unchanged:
 greppy -rn "TODO" src/
