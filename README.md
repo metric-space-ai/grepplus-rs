@@ -302,6 +302,32 @@ separately with its break-even.
 
 ---
 
+## How greppy compares
+
+**vs. plain `grep`/`ripgrep` + file reads.** That is the measured baseline: the
+same agent answered 6–50 percentage points fewer questions and paid 1.6–5×
+more API cost for its best quality. Text search finds occurrences; it does not
+resolve callers, callees, or types, so the agent pays for every disambiguation
+round. greppy keeps grep — ordinary invocations pass through byte-exact.
+
+**vs. MCP context servers.** Context servers integrate through an MCP server
+process, per-agent registration, and tool schemas in the prompt; retrieval is
+typically full-text search plus name matching and graph traversal. greppy
+integrates by being on `PATH` — one pasted prompt block, no server, no
+per-agent config — and its semantic search is real embedding retrieval
+(on-device EmbeddingGemma), which finds code you can only describe, not name.
+Freshness needs no file watcher: every query validates the index against the
+worktree and fails closed rather than answering from stale spans.
+
+**vs. LSP.** An LSP resolves the open project precisely but needs a running
+language server per language and an editor-shaped session. greppy is a
+stateless CLI over 60+ languages with one index per repository, built for
+agents that live in a shell. They compose: the paper's benchmark harness
+itself pins LSPs for oracle validation.
+
+The difference to hosted code-search services is simpler: greppy has no
+service. Nothing leaves the machine.
+
 ## Paper
 
 The navigation problem greppy optimizes is formalized in an accompanying
