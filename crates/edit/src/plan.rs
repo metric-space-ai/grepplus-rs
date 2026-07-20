@@ -1,13 +1,10 @@
 //! The `greppy.edit-plan.v1` executor: multiple operations across multiple
 //! files as one logical transaction.
 //!
-//! Selector engines `text` and `tree-sitter` resolve here; `symbol`
-//! selectors are resolved by the caller (the CLI owns the store) into
-//! explicit byte ranges before execution. All ranges are planned against
-//! per-file snapshots taken under one pass, cross-file overlap is impossible
-//! by construction (per-file overlap is rejected), and publication goes
-//! through the journal (`journal` mode), single-file atomic writes
-//! (`atomic`, single-file plans only), or a unified patch (`patch`).
+//! Every selector is resolved against one immutable per-file snapshot. All
+//! operation preconditions and all cross-operation overlaps are checked before
+//! any projected edit is built. Valid operations are then applied high-to-low
+//! per file and the complete publication set is committed with one journal.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -15,12 +12,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::certificate::{
-    Certificate, Guarantee, Guarantees, OperationReport, PublishMode, SelectorClass,
-    SelectorEngine, Status, SyntaxDelta, WorkspaceReport,
+    Certificate, Guarantee, Guarantees, OperationReport, PostconditionResult, PublishMode,
+    SelectorClass, SelectorEngine, Status, SyntaxDelta, WorkspaceReport,
 };
 use crate::hash::sha256_hex;
-use crate::journal::{publish_journal, FilePublication};
-use crate::txn::{apply_in_memory, outside_ranges_unchanged, syntax_counts, PlannedOp, Snapshot};
+use crate::journal::{publish_journal_locked, FilePublication, WorkspaceLock};
+use crate::txn::{
+    apply_in_memory, outside_ranges_unchanged, syntax_counts, Applied, PlannedOp, Snapshot,
+};
 use greppy_core::{Error, Result};
 
 pub const PLAN_SCHEMA: &str = "greppy.edit-plan.v1";
@@ -62,7 +61,8 @@ pub struct PlanOperation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "engine")]
 pub enum PlanSelector {
-    /// Resolved by the caller into a byte range (CLI resolves symbols).
+    /// Resolved by the caller into a byte range (the CLI owns symbol/store
+    /// resolution). The live file and declared hashes still decide.
     Resolved { byte_start: usize, byte_end: usize },
     /// Exact text, `expect` occurrences (all are edited).
     Text {
@@ -79,10 +79,19 @@ fn one() -> usize {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum PlanAction {
-    Replace { content: String },
+    Replace {
+        #[serde(alias = "content_literal")]
+        content: String,
+    },
     Delete,
-    InsertAfter { content: String },
-    InsertBefore { content: String },
+    InsertAfter {
+        #[serde(alias = "content_literal")]
+        content: String,
+    },
+    InsertBefore {
+        #[serde(alias = "content_literal")]
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -118,8 +127,39 @@ pub enum PlanPublishMode {
     ShadowWorktree,
 }
 
-/// Execute a plan. `dry_run` runs everything through postconditions and
-/// validators but publishes nothing.
+#[derive(Debug, Clone)]
+struct OperationProblem {
+    status: Status,
+    name: String,
+    detail: String,
+}
+
+#[derive(Debug)]
+struct PlannedOperation<'a> {
+    operation: &'a PlanOperation,
+    selector_engine: SelectorEngine,
+    selector_class: SelectorClass,
+    target_ranges: Vec<(usize, usize)>,
+    mutations: Vec<PlannedOp>,
+    target_matches: usize,
+    target_before: Vec<u8>,
+    target_after: Vec<u8>,
+    problem: Option<OperationProblem>,
+    overlap_details: Vec<String>,
+}
+
+#[derive(Debug)]
+struct FileProjection {
+    applied: Applied,
+    syntax: SyntaxDelta,
+    syntax_applicable: bool,
+    syntax_ok: bool,
+    isolation_ok: bool,
+}
+
+/// Execute a parsed plan as one transaction. The workspace lock is held from
+/// snapshot acquisition through validation and publication; active contention
+/// returns immediately as a publish-failed certificate.
 pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
     if plan.schema_version != PLAN_SCHEMA {
         return Err(Error::Invalid(format!(
@@ -127,215 +167,212 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             plan.schema_version
         )));
     }
-    let root = Path::new(&plan.workspace.root);
-    let git_head_before = git_head(root);
-
-    // group operations per file, snapshot each file once
-    let mut by_file: BTreeMap<String, Vec<&PlanOperation>> = BTreeMap::new();
-    for op in &plan.operations {
-        by_file.entry(op.file.clone()).or_default().push(op);
+    if plan.operations.is_empty() {
+        return Err(Error::Invalid("edit plan has no operations".into()));
     }
 
-    let mut op_reports = Vec::new();
-    let mut publications = Vec::new();
-    let mut refusal = plan
+    let root = Path::new(&plan.workspace.root);
+    let transaction_id = plan_transaction_id(plan);
+    let lock = match WorkspaceLock::acquire(root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return Ok(lock_refusal_certificate(
+                plan,
+                dry_run,
+                transaction_id,
+                &error.to_string(),
+            ))
+        }
+    };
+    let takeover_reason = lock.takeover_reason().map(str::to_owned);
+    let git_head_before = git_head(root);
+
+    // Snapshot every distinct file exactly once while holding the workspace
+    // lock. Plan order is retained separately for reports and error precedence.
+    let mut snapshots = BTreeMap::new();
+    for operation in &plan.operations {
+        if !snapshots.contains_key(&operation.file) {
+            let snapshot = Snapshot::read(&root.join(&operation.file))?;
+            snapshots.insert(operation.file.clone(), snapshot);
+        }
+    }
+
+    let mut planned = Vec::with_capacity(plan.operations.len());
+    for operation in &plan.operations {
+        let snapshot = snapshots
+            .get(&operation.file)
+            .expect("every operation file was snapshotted");
+        planned.push(plan_operation(plan, operation, snapshot));
+    }
+
+    // Selector overlap is defined on original target coordinates, before an
+    // action converts insert-before/after to an empty mutation at a boundary.
+    // Only different plan operations conflict; multiple cardinality matches of
+    // one operation are one declared operation.
+    let mut found_overlap = false;
+    for first_index in 0..planned.len() {
+        for second_index in first_index + 1..planned.len() {
+            if planned[first_index].operation.file != planned[second_index].operation.file {
+                continue;
+            }
+            let overlaps = overlapping_target_ranges(
+                &planned[first_index].target_ranges,
+                &planned[second_index].target_ranges,
+            );
+            for (first_range, second_range) in overlaps {
+                found_overlap = true;
+                let first_id = planned[first_index].operation.id.clone();
+                let second_id = planned[second_index].operation.id.clone();
+                planned[first_index].overlap_details.push(format!(
+                    "operation `{first_id}` range {}..{} overlaps operation `{second_id}` range {}..{}",
+                    first_range.0, first_range.1, second_range.0, second_range.1
+                ));
+                planned[second_index].overlap_details.push(format!(
+                    "operation `{second_id}` range {}..{} overlaps operation `{first_id}` range {}..{}",
+                    second_range.0, second_range.1, first_range.0, first_range.1
+                ));
+            }
+        }
+    }
+
+    let git_head_stale = plan
         .workspace
         .expect_git_head
         .as_ref()
-        .filter(|expected| git_head_before.as_ref() != Some(*expected))
-        .map(|_| Status::Stale);
+        .is_some_and(|expected| git_head_before.as_ref() != Some(expected));
+    let mut status = if git_head_stale {
+        Status::Stale
+    } else if let Some(problem) = planned
+        .iter()
+        .find_map(|operation| operation.problem.as_ref())
+    {
+        problem.status
+    } else if found_overlap {
+        Status::InvalidResult
+    } else {
+        Status::Applied
+    };
 
-    for (file, ops) in &by_file {
-        if refusal.is_some() {
-            break;
-        }
-        let abs = root.join(file);
-        let snapshot = Snapshot::read(&abs)?;
-        let mut planned: Vec<PlannedOp> = Vec::new();
-        for op in ops {
-            if plan.workspace.require_unchanged_files && op.preconditions.file_sha256.is_none() {
-                refusal = Some(Status::Stale);
-                break;
-            }
-            if let Some(expected) = &op.preconditions.file_sha256 {
-                if *expected != snapshot.file_sha256 {
-                    refusal = Some(Status::Stale);
-                    break;
-                }
-            }
-            let ranges: Vec<(usize, usize)> = match &op.selector {
-                PlanSelector::Resolved {
-                    byte_start,
-                    byte_end,
-                } => vec![(*byte_start, *byte_end)],
-                PlanSelector::Text { old_text, expect } => {
-                    let found = find_all(&snapshot.content, old_text.as_bytes());
-                    if found.is_empty() {
-                        refusal = Some(Status::NotFound);
-                        break;
-                    }
-                    if found.len() != *expect {
-                        refusal = Some(Status::Ambiguous);
-                        break;
-                    }
-                    found.into_iter().map(|s| (s, s + old_text.len())).collect()
-                }
-            };
-            if let Some(expected) = &op.preconditions.target_sha256 {
-                let ok = ranges.len() == 1
-                    && sha256_hex(&snapshot.content[ranges[0].0..ranges[0].1]) == *expected;
-                if !ok {
-                    refusal = Some(Status::Stale);
-                    break;
-                }
-            }
-            for (i, range) in ranges.iter().enumerate() {
-                let replacement: Vec<u8> = match &op.action {
-                    PlanAction::Replace { content } => content.clone().into_bytes(),
-                    PlanAction::Delete => Vec::new(),
-                    PlanAction::InsertAfter { content } => {
-                        let mut b = Vec::new();
-                        b.push(b'\n');
-                        b.extend_from_slice(content.as_bytes());
-                        if !content.ends_with('\n') {
-                            b.push(b'\n');
-                        }
-                        planned.push(PlannedOp {
-                            id: format!("{}-{i}", op.id),
-                            range: (range.1, range.1),
-                            replacement: b,
-                        });
-                        continue;
-                    }
-                    PlanAction::InsertBefore { content } => {
-                        let mut b = content.as_bytes().to_vec();
-                        if !content.ends_with('\n') {
-                            b.push(b'\n');
-                        }
-                        b.push(b'\n');
-                        planned.push(PlannedOp {
-                            id: format!("{}-{i}", op.id),
-                            range: (range.0, range.0),
-                            replacement: b,
-                        });
-                        continue;
-                    }
-                };
-                planned.push(PlannedOp {
-                    id: format!("{}-{i}", op.id),
-                    range: *range,
-                    replacement,
-                });
-            }
-        }
-        if refusal.is_some() {
-            break;
-        }
-        let applied = apply_in_memory(&snapshot, &planned)?;
-        let language = greppy_parser::language_for_path(&abs);
-        let syntax_before = syntax_counts(language, &snapshot.content);
-        let syntax_after = syntax_counts(language, &applied.content);
-        let (syntax, syntax_applicable) = match (syntax_before, syntax_after) {
-            (Some(b), Some(a)) => (
-                SyntaxDelta {
-                    errors_before: b.errors,
-                    errors_after: a.errors,
-                    new_errors: a.errors.saturating_sub(b.errors),
-                    new_missing_nodes: a.missing.saturating_sub(b.missing),
-                },
-                true,
-            ),
-            _ => (
-                SyntaxDelta {
-                    errors_before: 0,
-                    errors_after: 0,
-                    new_errors: 0,
-                    new_missing_nodes: 0,
-                },
-                false,
-            ),
-        };
-        let syntax_ok =
-            !syntax_applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
-        let isolation_ok = outside_ranges_unchanged(&snapshot.content, &applied.content, &planned);
-        if !syntax_ok || !isolation_ok {
-            refusal = Some(Status::InvalidResult);
-        }
-        op_reports.push(OperationReport {
-            id: ops.first().map(|o| o.id.clone()).unwrap_or_default(),
-            file: file.clone(),
-            selector_engine: SelectorEngine::Text,
-            selector_class: SelectorClass::ExactText,
-            scope_matches: 1,
-            target_matches: planned.len(),
-            file_sha256_before: snapshot.file_sha256.clone(),
-            file_sha256_after: Some(applied.file_sha256.clone()),
-            target_sha256_before: String::new(),
-            target_sha256_after: None,
-            outside_declared_ranges_unchanged: isolation_ok,
-            changed_byte_ranges: applied.changed_ranges.clone(),
-            node_before: None,
-            node_after: None,
-            unified_diff: (plan.publish.mode == PlanPublishMode::Patch).then(|| {
-                crate::verbs::unified_diff_public(file, &snapshot.content, &applied.content)
-            }),
-            syntax,
-            postconditions_passed: syntax_ok && isolation_ok,
-            postconditions: vec![],
-            residual_occurrences: None,
-            guarantees: Guarantees {
-                addressed_range: Guarantee::Proved,
-                no_clobber: Guarantee::Proved,
-                byte_isolation: if isolation_ok {
-                    Guarantee::Proved
-                } else {
-                    Guarantee::Failed
-                },
-                syntax: if !syntax_applicable {
-                    Guarantee::NotApplicable
-                } else if syntax_ok {
-                    Guarantee::Proved
-                } else {
-                    Guarantee::Failed
-                },
-                validators: Guarantee::NotApplicable,
+    if status != Status::Applied {
+        let reports = planned
+            .iter()
+            .map(|operation| {
+                refusal_report(
+                    operation,
+                    snapshots
+                        .get(&operation.operation.file)
+                        .expect("snapshot retained"),
+                    git_head_stale,
+                    takeover_reason.as_deref(),
+                )
+            })
+            .collect();
+        return Ok(Certificate {
+            schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
+            status,
+            transaction_id,
+            workspace: WorkspaceReport {
+                root: plan.workspace.root.clone(),
+                git_head_before: git_head_before.clone(),
+                git_head_after: git_head(root),
             },
-            formatter_expanded_change_scope: false,
-            store_refreshed: false,
-            candidates: vec![],
-        });
-        publications.push(FilePublication {
-            rel_path: file.clone(),
-            expected_live_sha256: snapshot.file_sha256.clone(),
-            content: applied.content,
+            operations: reports,
+            validators: vec![],
+            published: false,
+            publish_mode: certificate_publish_mode(plan.publish.mode, dry_run),
         });
     }
 
-    let tx = format!(
-        "ge-{}",
-        &sha256_hex(
-            publications
-                .iter()
-                .map(|p| p.expected_live_sha256.as_str())
-                .collect::<Vec<_>>()
-                .join(":")
-                .as_bytes()
-        )[..16]
-    );
+    // Build every file projection only after all selectors, hashes, and
+    // overlaps have passed. No workspace bytes are touched in this phase.
+    let mut projections = BTreeMap::new();
+    let mut projection_error = None;
+    for (file, snapshot) in &snapshots {
+        let mutations: Vec<PlannedOp> = planned
+            .iter()
+            .filter(|operation| operation.operation.file == *file)
+            .flat_map(|operation| operation.mutations.iter().cloned())
+            .collect();
+        match apply_in_memory(snapshot, &mutations) {
+            Ok(applied) => {
+                let language = greppy_parser::language_for_path(&snapshot.path);
+                let syntax_before = language
+                    .is_supported()
+                    .then(|| syntax_counts(language, &snapshot.content))
+                    .flatten();
+                let syntax_after = language
+                    .is_supported()
+                    .then(|| syntax_counts(language, &applied.content))
+                    .flatten();
+                let (syntax, syntax_applicable) = syntax_delta(syntax_before, syntax_after);
+                let syntax_ok =
+                    !syntax_applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
+                let isolation_ok =
+                    outside_ranges_unchanged(&snapshot.content, &applied.content, &mutations);
+                projections.insert(
+                    file.clone(),
+                    FileProjection {
+                        applied,
+                        syntax,
+                        syntax_applicable,
+                        syntax_ok,
+                        isolation_ok,
+                    },
+                );
+            }
+            Err(error) => {
+                projection_error = Some(error.to_string());
+                break;
+            }
+        }
+    }
 
-    let mut status = refusal.unwrap_or(Status::Applied);
-    let mut published = false;
+    if projection_error.is_some()
+        || projections
+            .values()
+            .any(|projection| !projection.syntax_ok || !projection.isolation_ok)
+    {
+        status = Status::InvalidResult;
+    }
+
+    let mut reports: Vec<OperationReport> = planned
+        .iter()
+        .map(|operation| {
+            projected_report(
+                operation,
+                snapshots
+                    .get(&operation.operation.file)
+                    .expect("snapshot retained"),
+                projections.get(&operation.operation.file),
+                projection_error.as_deref(),
+                takeover_reason.as_deref(),
+            )
+        })
+        .collect();
+
+    let publications: Vec<FilePublication> = projections
+        .iter()
+        .map(|(file, projection)| FilePublication {
+            rel_path: file.clone(),
+            expected_live_sha256: snapshots
+                .get(file)
+                .expect("projection has snapshot")
+                .file_sha256
+                .clone(),
+            content: projection.applied.content.clone(),
+        })
+        .collect();
+
     let mut validator_reports = Vec::new();
-    // Validators always run against the edited shadow. Shadow-worktree
-    // publication is kept separate so workspace preconditions can be
-    // rechecked after validation and immediately before journal publish.
     if status == Status::Applied
         && (!plan.validators.is_empty() || plan.publish.mode == PlanPublishMode::ShadowWorktree)
     {
         match crate::shadow::shadow_validate(root, &publications, &plan.validators) {
-            Ok(reports) => {
-                let all_ok = reports.iter().all(|r| r.exit_code == 0 && !r.timed_out);
-                validator_reports = reports;
+            Ok(results) => {
+                let all_ok = results
+                    .iter()
+                    .all(|report| report.exit_code == 0 && !report.timed_out);
+                validator_reports = results;
                 if !all_ok {
                     status = Status::ValidationFailed;
                 }
@@ -344,41 +381,46 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
         }
     }
 
+    // External, non-greppy writers do not honor the advisory lock, so retain
+    // the binding CAS check immediately before every publish mode.
     if status == Status::Applied {
         let head_matches = plan
             .workspace
             .expect_git_head
             .as_ref()
             .is_none_or(|expected| git_head(root).as_ref() == Some(expected));
-        let files_match =
-            !plan.workspace.require_unchanged_files || publications_unchanged(root, &publications);
+        let files_match = publications_unchanged(root, &publications);
         if !head_matches || !files_match {
             status = Status::Stale;
         }
     }
 
+    let mut published = false;
     if status == Status::Applied && !dry_run {
         match plan.publish.mode {
             PlanPublishMode::Patch => {}
             PlanPublishMode::Atomic => {
                 if publications.len() != 1 {
-                    return Err(Error::Invalid(
-                        "publish mode atomic requires a single-file plan; use journal".into(),
-                    ));
-                }
-                let p = &publications[0];
-                match crate::publish::publish_atomic(
-                    root,
-                    &root.join(&p.rel_path),
-                    &p.content,
-                    &p.expected_live_sha256,
-                ) {
-                    Ok(_) => published = true,
-                    Err(error) => status = crate::certificate::publish_error_status(&error),
+                    status = Status::PublishFailed;
+                    append_transaction_failure(
+                        &mut reports,
+                        "atomic publish requires exactly one file; use journal",
+                    );
+                } else {
+                    let publication = &publications[0];
+                    match crate::publish::publish_atomic(
+                        root,
+                        &root.join(&publication.rel_path),
+                        &publication.content,
+                        &publication.expected_live_sha256,
+                    ) {
+                        Ok(_) => published = true,
+                        Err(error) => status = crate::certificate::publish_error_status(&error),
+                    }
                 }
             }
             PlanPublishMode::Journal | PlanPublishMode::ShadowWorktree => {
-                match publish_journal(root, &tx, &publications) {
+                match publish_journal_locked(root, &transaction_id, &publications, &lock) {
                     Ok(()) => published = true,
                     Err(error) => status = crate::certificate::publish_error_status(&error),
                 }
@@ -386,7 +428,6 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
         }
     }
 
-    let git_head_after = git_head(root);
     let validator_guarantee = if plan.validators.is_empty() {
         Guarantee::NotApplicable
     } else if status == Status::ValidationFailed {
@@ -399,33 +440,531 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
     } else {
         Guarantee::Failed
     };
-    for report in &mut op_reports {
+    for report in &mut reports {
         report.guarantees.validators = validator_guarantee;
+        if matches!(status, Status::Stale | Status::PublishFailed) {
+            report.file_sha256_after = None;
+        }
+        if status == Status::PublishFailed {
+            report.guarantees.no_clobber = Guarantee::Failed;
+            report.postconditions_passed = false;
+        }
     }
 
     Ok(Certificate {
         schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
         status,
-        transaction_id: tx,
+        transaction_id,
         workspace: WorkspaceReport {
             root: plan.workspace.root.clone(),
             git_head_before,
-            git_head_after,
+            git_head_after: git_head(root),
         },
-        operations: op_reports,
+        operations: reports,
         validators: validator_reports,
         published,
-        publish_mode: if dry_run {
-            PublishMode::DryRun
-        } else {
-            match plan.publish.mode {
-                PlanPublishMode::Atomic => PublishMode::Atomic,
-                PlanPublishMode::Journal => PublishMode::Journal,
-                PlanPublishMode::Patch => PublishMode::Patch,
-                PlanPublishMode::ShadowWorktree => PublishMode::ShadowWorktree,
-            }
-        },
+        publish_mode: certificate_publish_mode(plan.publish.mode, dry_run),
     })
+}
+
+fn plan_operation<'a>(
+    plan: &Plan,
+    operation: &'a PlanOperation,
+    snapshot: &Snapshot,
+) -> PlannedOperation<'a> {
+    let (selector_engine, selector_class) = selector_profile(&operation.selector);
+    let mut problem = None;
+    if plan.workspace.require_unchanged_files && operation.preconditions.file_sha256.is_none() {
+        problem = Some(OperationProblem {
+            status: Status::Stale,
+            name: "file-sha256".into(),
+            detail: "require_unchanged_files requires a file_sha256 precondition".into(),
+        });
+    }
+    if operation
+        .preconditions
+        .file_sha256
+        .as_ref()
+        .is_some_and(|expected| expected != &snapshot.file_sha256)
+    {
+        problem = Some(OperationProblem {
+            status: Status::Stale,
+            name: "file-sha256".into(),
+            detail: format!(
+                "expected {}, found {}",
+                operation
+                    .preconditions
+                    .file_sha256
+                    .as_deref()
+                    .unwrap_or_default(),
+                snapshot.file_sha256
+            ),
+        });
+    }
+
+    let target_ranges = match &operation.selector {
+        PlanSelector::Resolved {
+            byte_start,
+            byte_end,
+        } => {
+            if byte_start > byte_end || *byte_end > snapshot.content.len() {
+                if problem.is_none() {
+                    problem = Some(OperationProblem {
+                        status: Status::InvalidResult,
+                        name: "selector-range".into(),
+                        detail: format!(
+                            "resolved range {byte_start}..{byte_end} is outside a {} byte file",
+                            snapshot.content.len()
+                        ),
+                    });
+                }
+                vec![]
+            } else {
+                vec![(*byte_start, *byte_end)]
+            }
+        }
+        PlanSelector::Text { old_text, expect } => {
+            let found = find_all(&snapshot.content, old_text.as_bytes());
+            if found.is_empty() {
+                if problem.is_none() {
+                    problem = Some(OperationProblem {
+                        status: Status::NotFound,
+                        name: "selector-cardinality".into(),
+                        detail: format!("expected {expect} target(s), found 0"),
+                    });
+                }
+            } else if found.len() != *expect && problem.is_none() {
+                problem = Some(OperationProblem {
+                    status: Status::Ambiguous,
+                    name: "selector-cardinality".into(),
+                    detail: format!("expected {expect} target(s), found {}", found.len()),
+                });
+            }
+            found
+                .into_iter()
+                .map(|start| (start, start + old_text.len()))
+                .collect()
+        }
+    };
+
+    if let Some(expected) = &operation.preconditions.target_sha256 {
+        let target_matches = target_ranges.len() == 1
+            && snapshot
+                .content
+                .get(target_ranges[0].0..target_ranges[0].1)
+                .is_some_and(|target| sha256_hex(target) == *expected);
+        if !target_matches && problem.is_none() {
+            problem = Some(OperationProblem {
+                status: Status::Stale,
+                name: "target-sha256".into(),
+                detail: "resolved target no longer matches target_sha256".into(),
+            });
+        }
+    }
+
+    let mut mutations = Vec::with_capacity(target_ranges.len());
+    for (match_index, &target_range) in target_ranges.iter().enumerate() {
+        mutations.push(action_mutation(operation, target_range, match_index));
+    }
+    let target_before = concatenate_ranges(&snapshot.content, &target_ranges);
+    let target_after = mutations
+        .iter()
+        .flat_map(|mutation| mutation.replacement.iter().copied())
+        .collect();
+    let target_matches = target_ranges.len();
+
+    PlannedOperation {
+        operation,
+        selector_engine,
+        selector_class,
+        target_ranges,
+        mutations,
+        target_matches,
+        target_before,
+        target_after,
+        problem,
+        overlap_details: vec![],
+    }
+}
+
+fn action_mutation(
+    operation: &PlanOperation,
+    target_range: (usize, usize),
+    match_index: usize,
+) -> PlannedOp {
+    let (range, replacement) = match &operation.action {
+        PlanAction::Replace { content } => (target_range, content.as_bytes().to_vec()),
+        PlanAction::Delete => (target_range, vec![]),
+        PlanAction::InsertAfter { content } => {
+            let mut replacement = vec![b'\n'];
+            replacement.extend_from_slice(content.as_bytes());
+            if !content.ends_with('\n') {
+                replacement.push(b'\n');
+            }
+            ((target_range.1, target_range.1), replacement)
+        }
+        PlanAction::InsertBefore { content } => {
+            let mut replacement = content.as_bytes().to_vec();
+            if !content.ends_with('\n') {
+                replacement.push(b'\n');
+            }
+            replacement.push(b'\n');
+            ((target_range.0, target_range.0), replacement)
+        }
+    };
+    PlannedOp {
+        id: format!("{}[{match_index}]", operation.id),
+        range,
+        replacement,
+    }
+}
+
+fn selector_profile(selector: &PlanSelector) -> (SelectorEngine, SelectorClass) {
+    match selector {
+        PlanSelector::Resolved { .. } => (SelectorEngine::Symbol, SelectorClass::Resolved),
+        PlanSelector::Text { .. } => (SelectorEngine::Text, SelectorClass::ExactText),
+    }
+}
+
+fn overlapping_target_ranges(
+    first: &[(usize, usize)],
+    second: &[(usize, usize)],
+) -> Vec<((usize, usize), (usize, usize))> {
+    let mut overlaps = Vec::new();
+    for &first_range in first {
+        for &second_range in second {
+            if target_ranges_overlap(first_range, second_range) {
+                overlaps.push((first_range, second_range));
+            }
+        }
+    }
+    overlaps
+}
+
+fn target_ranges_overlap(first: (usize, usize), second: (usize, usize)) -> bool {
+    match (first.0 == first.1, second.0 == second.1) {
+        (true, true) => first.0 == second.0,
+        (true, false) => second.0 <= first.0 && first.0 < second.1,
+        (false, true) => first.0 <= second.0 && second.0 < first.1,
+        (false, false) => first.0 < second.1 && second.0 < first.1,
+    }
+}
+
+fn refusal_report(
+    planned: &PlannedOperation<'_>,
+    snapshot: &Snapshot,
+    git_head_stale: bool,
+    takeover_reason: Option<&str>,
+) -> OperationReport {
+    let mut postconditions = Vec::new();
+    if let Some(problem) = &planned.problem {
+        postconditions.push(PostconditionResult {
+            name: problem.name.clone(),
+            passed: false,
+            detail: Some(problem.detail.clone()),
+        });
+    }
+    for detail in &planned.overlap_details {
+        postconditions.push(PostconditionResult {
+            name: "non-overlapping-targets".into(),
+            passed: false,
+            detail: Some(detail.clone()),
+        });
+    }
+    if git_head_stale {
+        postconditions.push(PostconditionResult {
+            name: "git-head".into(),
+            passed: false,
+            detail: Some("workspace HEAD does not match expect_git_head".into()),
+        });
+    }
+    if planned.problem.is_none() && planned.overlap_details.is_empty() && !git_head_stale {
+        postconditions.push(PostconditionResult {
+            name: "transaction".into(),
+            passed: false,
+            detail: Some("another operation refused the all-or-nothing plan".into()),
+        });
+    }
+    append_takeover_postcondition(&mut postconditions, takeover_reason);
+    OperationReport {
+        id: planned.operation.id.clone(),
+        file: planned.operation.file.clone(),
+        selector_engine: planned.selector_engine,
+        selector_class: planned.selector_class,
+        scope_matches: 1,
+        target_matches: planned.target_matches,
+        file_sha256_before: snapshot.file_sha256.clone(),
+        file_sha256_after: None,
+        target_sha256_before: sha256_hex(&planned.target_before),
+        target_sha256_after: None,
+        outside_declared_ranges_unchanged: true,
+        changed_byte_ranges: planned
+            .mutations
+            .iter()
+            .map(|mutation| mutation.range)
+            .collect(),
+        node_before: String::from_utf8(planned.target_before.clone()).ok(),
+        node_after: String::from_utf8(planned.target_after.clone()).ok(),
+        unified_diff: None,
+        syntax: empty_syntax_delta(),
+        postconditions_passed: false,
+        postconditions,
+        residual_occurrences: None,
+        guarantees: Guarantees {
+            addressed_range: if planned.problem.is_none() && planned.target_matches > 0 {
+                Guarantee::Proved
+            } else {
+                Guarantee::Failed
+            },
+            no_clobber: Guarantee::Proved,
+            byte_isolation: Guarantee::Proved,
+            syntax: Guarantee::NotApplicable,
+            validators: Guarantee::NotApplicable,
+        },
+        formatter_expanded_change_scope: false,
+        store_refreshed: false,
+        candidates: vec![],
+    }
+}
+
+fn projected_report(
+    planned: &PlannedOperation<'_>,
+    snapshot: &Snapshot,
+    projection: Option<&FileProjection>,
+    projection_error: Option<&str>,
+    takeover_reason: Option<&str>,
+) -> OperationReport {
+    let mut postconditions = Vec::new();
+    let (file_sha256_after, syntax, syntax_applicable, syntax_ok, isolation_ok, unified_diff) =
+        if let Some(projection) = projection {
+            postconditions.push(PostconditionResult {
+                name: "syntax-no-new-errors".into(),
+                passed: projection.syntax_ok,
+                detail: (!projection.syntax_ok).then(|| {
+                    format!(
+                        "new errors: {}, new missing nodes: {}",
+                        projection.syntax.new_errors, projection.syntax.new_missing_nodes
+                    )
+                }),
+            });
+            postconditions.push(PostconditionResult {
+                name: "outside-declared-ranges-unchanged".into(),
+                passed: projection.isolation_ok,
+                detail: (!projection.isolation_ok)
+                    .then(|| "projected file changed outside declared ranges".into()),
+            });
+            (
+                Some(projection.applied.file_sha256.clone()),
+                projection.syntax.clone(),
+                projection.syntax_applicable,
+                projection.syntax_ok,
+                projection.isolation_ok,
+                Some(crate::verbs::unified_diff_public(
+                    &planned.operation.file,
+                    &snapshot.content,
+                    &projection.applied.content,
+                )),
+            )
+        } else {
+            postconditions.push(PostconditionResult {
+                name: "in-memory-apply".into(),
+                passed: false,
+                detail: projection_error.map(str::to_owned),
+            });
+            (None, empty_syntax_delta(), false, false, false, None)
+        };
+    append_takeover_postcondition(&mut postconditions, takeover_reason);
+    let postconditions_passed = projection.is_some() && syntax_ok && isolation_ok;
+    OperationReport {
+        id: planned.operation.id.clone(),
+        file: planned.operation.file.clone(),
+        selector_engine: planned.selector_engine,
+        selector_class: planned.selector_class,
+        scope_matches: 1,
+        target_matches: planned.target_matches,
+        file_sha256_before: snapshot.file_sha256.clone(),
+        file_sha256_after,
+        target_sha256_before: sha256_hex(&planned.target_before),
+        target_sha256_after: Some(sha256_hex(&planned.target_after)),
+        outside_declared_ranges_unchanged: isolation_ok,
+        changed_byte_ranges: planned
+            .mutations
+            .iter()
+            .map(|mutation| mutation.range)
+            .collect(),
+        node_before: String::from_utf8(planned.target_before.clone()).ok(),
+        node_after: String::from_utf8(planned.target_after.clone()).ok(),
+        unified_diff,
+        syntax,
+        postconditions_passed,
+        postconditions,
+        residual_occurrences: None,
+        guarantees: Guarantees {
+            addressed_range: if planned.target_matches > 0 {
+                Guarantee::Proved
+            } else {
+                Guarantee::Failed
+            },
+            no_clobber: Guarantee::Proved,
+            byte_isolation: if isolation_ok {
+                Guarantee::Proved
+            } else {
+                Guarantee::Failed
+            },
+            syntax: if !syntax_applicable {
+                Guarantee::NotApplicable
+            } else if syntax_ok {
+                Guarantee::Proved
+            } else {
+                Guarantee::Failed
+            },
+            validators: Guarantee::NotApplicable,
+        },
+        formatter_expanded_change_scope: false,
+        store_refreshed: false,
+        candidates: vec![],
+    }
+}
+
+fn lock_refusal_certificate(
+    plan: &Plan,
+    dry_run: bool,
+    transaction_id: String,
+    detail: &str,
+) -> Certificate {
+    let reports = plan
+        .operations
+        .iter()
+        .map(|operation| {
+            let (selector_engine, selector_class) = selector_profile(&operation.selector);
+            OperationReport {
+                id: operation.id.clone(),
+                file: operation.file.clone(),
+                selector_engine,
+                selector_class,
+                scope_matches: 0,
+                target_matches: 0,
+                file_sha256_before: String::new(),
+                file_sha256_after: None,
+                target_sha256_before: String::new(),
+                target_sha256_after: None,
+                outside_declared_ranges_unchanged: true,
+                changed_byte_ranges: vec![],
+                node_before: None,
+                node_after: None,
+                unified_diff: None,
+                syntax: empty_syntax_delta(),
+                postconditions_passed: false,
+                postconditions: vec![PostconditionResult {
+                    name: "workspace-lock".into(),
+                    passed: false,
+                    detail: Some(detail.to_string()),
+                }],
+                residual_occurrences: None,
+                guarantees: Guarantees {
+                    addressed_range: Guarantee::NotApplicable,
+                    no_clobber: Guarantee::Proved,
+                    byte_isolation: Guarantee::Proved,
+                    syntax: Guarantee::NotApplicable,
+                    validators: Guarantee::NotApplicable,
+                },
+                formatter_expanded_change_scope: false,
+                store_refreshed: false,
+                candidates: vec![],
+            }
+        })
+        .collect();
+    Certificate {
+        schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
+        status: Status::PublishFailed,
+        transaction_id,
+        workspace: WorkspaceReport {
+            root: plan.workspace.root.clone(),
+            git_head_before: git_head(Path::new(&plan.workspace.root)),
+            git_head_after: git_head(Path::new(&plan.workspace.root)),
+        },
+        operations: reports,
+        validators: vec![],
+        published: false,
+        publish_mode: certificate_publish_mode(plan.publish.mode, dry_run),
+    }
+}
+
+fn append_takeover_postcondition(
+    postconditions: &mut Vec<PostconditionResult>,
+    takeover_reason: Option<&str>,
+) {
+    if let Some(reason) = takeover_reason {
+        postconditions.push(PostconditionResult {
+            name: "workspace-lock-takeover".into(),
+            passed: true,
+            detail: Some(reason.to_string()),
+        });
+    }
+}
+
+fn append_transaction_failure(reports: &mut [OperationReport], detail: &str) {
+    for report in reports {
+        report.postconditions_passed = false;
+        report.postconditions.push(PostconditionResult {
+            name: "publish-mode".into(),
+            passed: false,
+            detail: Some(detail.to_string()),
+        });
+    }
+}
+
+fn syntax_delta(
+    before: Option<crate::txn::SyntaxCounts>,
+    after: Option<crate::txn::SyntaxCounts>,
+) -> (SyntaxDelta, bool) {
+    match (before, after) {
+        (Some(before), Some(after)) => (
+            SyntaxDelta {
+                errors_before: before.errors,
+                errors_after: after.errors,
+                new_errors: after.errors.saturating_sub(before.errors),
+                new_missing_nodes: after.missing.saturating_sub(before.missing),
+            },
+            true,
+        ),
+        _ => (empty_syntax_delta(), false),
+    }
+}
+
+fn empty_syntax_delta() -> SyntaxDelta {
+    SyntaxDelta {
+        errors_before: 0,
+        errors_after: 0,
+        new_errors: 0,
+        new_missing_nodes: 0,
+    }
+}
+
+fn concatenate_ranges(content: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| content.get(start..end))
+        .flatten()
+        .copied()
+        .collect()
+}
+
+fn certificate_publish_mode(mode: PlanPublishMode, dry_run: bool) -> PublishMode {
+    if dry_run {
+        return PublishMode::DryRun;
+    }
+    match mode {
+        PlanPublishMode::Atomic => PublishMode::Atomic,
+        PlanPublishMode::Journal => PublishMode::Journal,
+        PlanPublishMode::Patch => PublishMode::Patch,
+        PlanPublishMode::ShadowWorktree => PublishMode::ShadowWorktree,
+    }
+}
+
+fn plan_transaction_id(plan: &Plan) -> String {
+    let bytes = serde_json::to_vec(plan).unwrap_or_default();
+    format!("ge-plan-{}", &sha256_hex(&bytes)[..16])
 }
 
 fn git_head(root: &Path) -> Option<String> {
@@ -459,11 +998,11 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
     while from + needle.len() <= haystack.len() {
         match haystack[from..]
             .windows(needle.len())
-            .position(|w| w == needle)
+            .position(|window| window == needle)
         {
-            Some(rel) => {
-                out.push(from + rel);
-                from = from + rel + needle.len();
+            Some(relative) => {
+                out.push(from + relative);
+                from += relative + needle.len();
             }
             None => break,
         }

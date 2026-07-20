@@ -16,6 +16,8 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +28,8 @@ use greppy_core::{Error, Result};
 const JOURNAL_DIR: &str = ".greppy-edit-journal";
 const LOCK_NAME: &str = ".greppy-edit.lock";
 const CRASH_AFTER_ENV: &str = "GREPPY_EDIT_TEST_JOURNAL_CRASH_AFTER";
+const LOCK_STALE_AFTER_SECS: u64 = 600;
+static LOCK_NONCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -50,39 +54,78 @@ pub struct FilePublication {
     pub content: Vec<u8>,
 }
 
-/// Simple advisory lock: exclusive-create of a lock file. Stale locks (from
-/// a crashed process) are taken over if older than 10 minutes.
-struct WorkspaceLock {
+/// Advisory workspace lock acquired with exclusive-create. The payload binds
+/// the lock to a PID and a unique token. A dead PID is taken over immediately;
+/// malformed legacy locks are only taken over after the staleness TTL.
+#[derive(Debug)]
+pub struct WorkspaceLock {
     path: PathBuf,
+    token: String,
+    takeover_reason: Option<String>,
 }
 
 impl WorkspaceLock {
-    fn acquire(workspace_root: &Path) -> Result<Self> {
+    /// Acquire the workspace lock without waiting. An active owner fails
+    /// immediately. A dead owner is quarantined with an atomic rename before
+    /// this process retries exclusive creation, so contenders cannot delete a
+    /// newly-created lock.
+    pub fn acquire(workspace_root: &Path) -> Result<Self> {
         let path = workspace_root.join(LOCK_NAME);
-        for _ in 0..2 {
+        let token = lock_token();
+        let mut takeover_reason = None;
+        for _ in 0..4 {
             match std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
             {
-                Ok(mut f) => {
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Self { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = std::fs::metadata(&path)
-                        .and_then(|m| m.modified())
-                        .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .map(|age| age.as_secs() > 600)
-                        .unwrap_or(true);
-                    if stale {
-                        let _ = std::fs::remove_file(&path);
-                        continue;
+                Ok(mut file) => {
+                    writeln!(file, "pid={}", std::process::id()).map_err(|source| Error::Io {
+                        context: format!("write lock {}", path.display()),
+                        source,
+                    })?;
+                    writeln!(file, "token={token}").map_err(|source| Error::Io {
+                        context: format!("write lock {}", path.display()),
+                        source,
+                    })?;
+                    file.sync_all().map_err(|source| Error::Io {
+                        context: format!("fsync lock {}", path.display()),
+                        source,
+                    })?;
+                    if let Some(reason) = &takeover_reason {
+                        tracing::warn!(workspace = %workspace_root.display(), reason, "taking over orphaned greppy edit lock");
                     }
-                    return Err(Error::Workspace(
-                        "another greppy edit transaction holds the workspace lock".into(),
-                    ));
+                    return Ok(Self {
+                        path,
+                        token,
+                        takeover_reason,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let state = inspect_lock(&path);
+                    let reason = match state {
+                        LockState::Active { pid } => {
+                            return Err(Error::Workspace(format!(
+                            "another greppy edit transaction holds the workspace lock (pid {pid})"
+                        )))
+                        }
+                        LockState::Orphaned { reason } => reason,
+                    };
+                    let quarantine = workspace_root
+                        .join(format!("{LOCK_NAME}.stale.{}", token.replace(':', "-")));
+                    match std::fs::rename(&path, &quarantine) {
+                        Ok(()) => {
+                            let _ = std::fs::remove_file(&quarantine);
+                            takeover_reason = Some(reason);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(source) => {
+                            return Err(Error::Io {
+                                context: format!("quarantine stale lock {}", path.display()),
+                                source,
+                            })
+                        }
+                    }
                 }
                 Err(source) => {
                     return Err(Error::Io {
@@ -92,14 +135,124 @@ impl WorkspaceLock {
                 }
             }
         }
-        Err(Error::Workspace("could not acquire workspace lock".into()))
+        Err(Error::Workspace(
+            "could not acquire workspace lock after orphan takeover".into(),
+        ))
+    }
+
+    /// Explanation recorded when this acquisition replaced an orphaned lock.
+    pub fn takeover_reason(&self) -> Option<&str> {
+        self.takeover_reason.as_deref()
     }
 }
 
 impl Drop for WorkspaceLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let owns_lock = std::fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|payload| lock_token_from_payload(&payload).map(str::to_owned))
+            .is_some_and(|token| token == self.token);
+        if owns_lock {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+#[derive(Debug)]
+enum LockState {
+    Active { pid: u32 },
+    Orphaned { reason: String },
+}
+
+fn lock_token() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = LOCK_NONCE.fetch_add(1, Ordering::Relaxed);
+    format!("{}:{nanos}:{nonce}", std::process::id())
+}
+
+fn lock_pid_from_payload(payload: &str) -> Option<u32> {
+    payload.lines().find_map(|line| {
+        line.strip_prefix("pid=")
+            .unwrap_or(line)
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+fn lock_token_from_payload(payload: &str) -> Option<&str> {
+    payload.lines().find_map(|line| line.strip_prefix("token="))
+}
+
+fn inspect_lock(path: &Path) -> LockState {
+    let payload = std::fs::read_to_string(path).unwrap_or_default();
+    if let Some(pid) = lock_pid_from_payload(&payload) {
+        if process_is_live(pid) {
+            return LockState::Active { pid };
+        }
+        return LockState::Orphaned {
+            reason: format!("lock owner pid {pid} is no longer alive"),
+        };
+    }
+    let stale = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age.as_secs() > LOCK_STALE_AFTER_SECS);
+    if stale {
+        LockState::Orphaned {
+            reason: format!(
+                "lock payload had no readable pid and was older than {LOCK_STALE_AFTER_SECS} seconds"
+            ),
+        }
+    } else {
+        LockState::Active { pid: 0 }
+    }
+}
+
+#[cfg(unix)]
+fn process_is_live(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "pid="])
+        .output()
+    {
+        Ok(output) => output.status.success() && !output.stdout.is_empty(),
+        Err(_) => true, // liveness probe unavailable: fail closed
+    }
+}
+
+#[cfg(windows)]
+fn process_is_live(pid: u32) -> bool {
+    if pid == std::process::id() {
+        return true;
+    }
+    let pid = pid.to_string();
+    let filter = format!("PID eq {pid}");
+    match std::process::Command::new("tasklist")
+        .args(["/FI", &filter, "/FO", "CSV", "/NH"])
+        .output()
+    {
+        Ok(output) => {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .split(',')
+                    .any(|field| field.trim_matches([' ', '"', '\r', '\n']) == pid)
+        }
+        Err(_) => true, // liveness probe unavailable: fail closed
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn process_is_live(_pid: u32) -> bool {
+    // Unknown platforms fail closed rather than stealing a potentially active
+    // lock. Malformed lock files still use the age-based fallback above.
+    true
 }
 
 fn journal_dir(workspace_root: &Path) -> PathBuf {
@@ -125,9 +278,19 @@ pub fn publish_journal(
     transaction_id: &str,
     files: &[FilePublication],
 ) -> Result<()> {
-    let _lock = WorkspaceLock::acquire(workspace_root)?;
+    let lock = WorkspaceLock::acquire(workspace_root)?;
     crash_after("lock-acquired")?;
+    publish_journal_locked(workspace_root, transaction_id, files, &lock)
+}
 
+/// Publish while the caller holds the workspace lock. Used by plan execution,
+/// which keeps the same lock from snapshot through validation and publication.
+pub(crate) fn publish_journal_locked(
+    workspace_root: &Path,
+    transaction_id: &str,
+    files: &[FilePublication],
+    _lock: &WorkspaceLock,
+) -> Result<()> {
     // CAS for every file under the lock, before anything is written
     for f in files {
         let abs = require_inside_workspace(workspace_root, &workspace_root.join(&f.rel_path))?;
@@ -251,7 +414,7 @@ fn write_journal(workspace_root: &Path, journal: &Journal) -> Result<()> {
     Ok(())
 }
 
-/// Recovery outcome for `greppy edit recover`.
+/// Recovery outcome retained for the existing CLI surface.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Recovery {
     NothingToRecover,
@@ -262,8 +425,44 @@ pub enum Recovery {
     DiscardedUncommitted,
 }
 
-/// Restore pre-images from a committed journal left by a crash.
+/// Full explicit-recovery report for library callers and `--report` wiring.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryReport {
+    pub found_journal: bool,
+    pub committed: bool,
+    pub action: RecoveryAction,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    pub files_considered: usize,
+    pub files_restored: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryAction {
+    NothingToRecover,
+    DiscardedUncommitted,
+    RolledBack,
+}
+
+/// Restore pre-images from a committed journal left by a crash and return a
+/// concise compatibility outcome.
 pub fn recover(workspace_root: &Path) -> Result<Recovery> {
+    let report = recover_with_report(workspace_root)?;
+    Ok(match report.action {
+        RecoveryAction::NothingToRecover => Recovery::NothingToRecover,
+        RecoveryAction::DiscardedUncommitted => Recovery::DiscardedUncommitted,
+        RecoveryAction::RolledBack => Recovery::RolledBack {
+            transaction_id: report.transaction_id.unwrap_or_default(),
+            files: report.files_restored,
+        },
+    })
+}
+
+/// Explicit journal recovery with a machine-readable report. Recovery is
+/// serialized by the same workspace lock as plan publication.
+pub fn recover_with_report(workspace_root: &Path) -> Result<RecoveryReport> {
+    let _lock = WorkspaceLock::acquire(workspace_root)?;
     let path = journal_path(workspace_root);
     if !path.exists() {
         let dir = journal_dir(workspace_root);
@@ -272,9 +471,23 @@ pub fn recover(workspace_root: &Path) -> Result<Recovery> {
                 context: format!("remove orphan journal {}", dir.display()),
                 source,
             })?;
-            return Ok(Recovery::DiscardedUncommitted);
+            return Ok(RecoveryReport {
+                found_journal: true,
+                committed: false,
+                action: RecoveryAction::DiscardedUncommitted,
+                transaction_id: None,
+                files_considered: 0,
+                files_restored: 0,
+            });
         }
-        return Ok(Recovery::NothingToRecover);
+        return Ok(RecoveryReport {
+            found_journal: false,
+            committed: false,
+            action: RecoveryAction::NothingToRecover,
+            transaction_id: None,
+            files_considered: 0,
+            files_restored: 0,
+        });
     }
     let journal: Journal =
         serde_json::from_slice(&std::fs::read(&path).map_err(|source| Error::Io {
@@ -284,11 +497,20 @@ pub fn recover(workspace_root: &Path) -> Result<Recovery> {
         .map_err(|e| Error::Invalid(format!("journal unreadable: {e}")))?;
     let dir = journal_dir(workspace_root);
     if !journal.committed {
+        let transaction_id = Some(journal.transaction_id);
+        let files_considered = journal.entries.len();
         std::fs::remove_dir_all(&dir).map_err(|source| Error::Io {
             context: format!("remove journal {}", dir.display()),
             source,
         })?;
-        return Ok(Recovery::DiscardedUncommitted);
+        return Ok(RecoveryReport {
+            found_journal: true,
+            committed: false,
+            action: RecoveryAction::DiscardedUncommitted,
+            transaction_id,
+            files_considered,
+            files_restored: 0,
+        });
     }
     let mut restored = 0usize;
     for entry in &journal.entries {
@@ -321,9 +543,13 @@ pub fn recover(workspace_root: &Path) -> Result<Recovery> {
         context: format!("remove journal {}", dir.display()),
         source,
     })?;
-    Ok(Recovery::RolledBack {
-        transaction_id: journal.transaction_id,
-        files: restored,
+    Ok(RecoveryReport {
+        found_journal: true,
+        committed: true,
+        action: RecoveryAction::RolledBack,
+        transaction_id: Some(journal.transaction_id),
+        files_considered: journal.entries.len(),
+        files_restored: restored,
     })
 }
 

@@ -76,21 +76,19 @@ pub fn apply_in_memory(snapshot: &Snapshot, ops: &[PlannedOp]) -> Result<Applied
     }
     let mut sorted: Vec<&PlannedOp> = ops.iter().collect();
     sorted.sort_by_key(|op| op.range.0);
-    for pair in sorted.windows(2) {
-        // insertions (empty ranges) at the same position also conflict: their
-        // relative order against the same snapshot would be ambiguous
-        if pair[1].range.0 < pair[0].range.1
-            || (pair[0].range == pair[1].range && pair[0].range.0 == pair[0].range.1)
-        {
-            return Err(Error::Invalid(format!(
-                "operations {} and {} overlap ({}..{} vs {}..{}); nothing was changed",
-                pair[0].id,
-                pair[1].id,
-                pair[0].range.0,
-                pair[0].range.1,
-                pair[1].range.0,
-                pair[1].range.1
-            )));
+    for (index, first) in sorted.iter().enumerate() {
+        for second in &sorted[index + 1..] {
+            if mutation_ranges_overlap(first.range, second.range) {
+                return Err(Error::Invalid(format!(
+                    "operations {} and {} overlap ({}..{} vs {}..{}); nothing was changed",
+                    first.id,
+                    second.id,
+                    first.range.0,
+                    first.range.1,
+                    second.range.0,
+                    second.range.1
+                )));
+            }
         }
     }
     let mut content = snapshot.content.clone();
@@ -104,6 +102,17 @@ pub fn apply_in_memory(snapshot: &Snapshot, ops: &[PlannedOp]) -> Result<Applied
         file_sha256,
         changed_ranges,
     })
+}
+
+fn mutation_ranges_overlap(first: (usize, usize), second: (usize, usize)) -> bool {
+    match (first.0 == first.1, second.0 == second.1) {
+        // Several insertions at one boundary are deterministic: stable sorting
+        // plus reverse application preserves plan order in the output.
+        (true, true) => false,
+        (true, false) => second.0 <= first.0 && first.0 < second.1,
+        (false, true) => first.0 <= second.0 && second.0 < first.1,
+        (false, false) => first.0 < second.1 && second.0 < first.1,
+    }
 }
 
 /// Verify that every byte outside the declared original ranges maps
@@ -250,6 +259,19 @@ mod tests {
         let s = snap(b"0123456789");
         let err = apply_in_memory(&s, &[op("a", (0, 5), b""), op("b", (3, 7), b"")]);
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn same_boundary_insertions_preserve_plan_order() {
+        let s = snap(b"ab");
+        let applied =
+            apply_in_memory(&s, &[op("first", (1, 1), b"X"), op("second", (1, 1), b"Y")]).unwrap();
+        assert_eq!(applied.content, b"aXYb");
+        assert!(outside_ranges_unchanged(
+            &s.content,
+            &applied.content,
+            &[op("first", (1, 1), b"X"), op("second", (1, 1), b"Y")]
+        ));
     }
 
     #[test]
