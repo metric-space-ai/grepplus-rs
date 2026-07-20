@@ -151,7 +151,7 @@ numbers from the `runtime-footprint-*.json` assets on the release):
 | Release archive | 735–825 MB (models included) |
 | Installed binary | ~1 GB |
 | Graph index build | ~2 s (Apple Silicon), ~4 s (4-core Linux) — queries work immediately |
-| Semantic embeddings | background, one-time per repo: ~24 min (M-series CPU), ~63 min (4-core Linux CPU) |
+| Semantic embeddings | background, one-time per repo: **~1.5 min with Metal** (3-core virtual M1 CI runner; real Apple Silicon is faster), ~24 min (M-series CPU), ~63 min (4-core Linux CPU) |
 | Warm query, Metal | `brief` 0.7 s · `semantic-search` 1.5 s |
 | Warm query, CPU only | `brief` 3.6–7 s · `semantic-search` 6–16 s |
 | Per-repo store | ~32 MB; extracted model cache 814 MB, 10 GiB quota with GC |
