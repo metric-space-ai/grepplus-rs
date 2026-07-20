@@ -36,6 +36,18 @@ impl Status {
     }
 }
 
+/// Map publication errors to the certificate status required by the edit
+/// contract. Only a failed compare-and-swap is stale; path, lock, and I/O
+/// failures are publication failures and must not be mislabeled as staleness.
+pub(crate) fn publish_error_status(error: &greppy_core::Error) -> Status {
+    match error {
+        greppy_core::Error::Workspace(message) if message.starts_with("stale plan:") => {
+            Status::Stale
+        }
+        _ => Status::PublishFailed,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Guarantee {

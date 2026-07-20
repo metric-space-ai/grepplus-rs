@@ -25,6 +25,7 @@ use greppy_core::{Error, Result};
 
 const JOURNAL_DIR: &str = ".greppy-edit-journal";
 const LOCK_NAME: &str = ".greppy-edit.lock";
+const CRASH_AFTER_ENV: &str = "GREPPY_EDIT_TEST_JOURNAL_CRASH_AFTER";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEntry {
@@ -109,6 +110,15 @@ fn journal_path(workspace_root: &Path) -> PathBuf {
     journal_dir(workspace_root).join("journal.json")
 }
 
+fn crash_after(boundary: &str) -> Result<()> {
+    if std::env::var(CRASH_AFTER_ENV).as_deref() == Ok(boundary) {
+        return Err(Error::Workspace(format!(
+            "injected journal crash after {boundary}"
+        )));
+    }
+    Ok(())
+}
+
 /// Publish `files` as one logical transaction. Returns the transaction id.
 pub fn publish_journal(
     workspace_root: &Path,
@@ -116,6 +126,7 @@ pub fn publish_journal(
     files: &[FilePublication],
 ) -> Result<()> {
     let _lock = WorkspaceLock::acquire(workspace_root)?;
+    crash_after("lock-acquired")?;
 
     // CAS for every file under the lock, before anything is written
     for f in files {
@@ -131,6 +142,7 @@ pub fn publish_journal(
             )));
         }
     }
+    crash_after("cas-verified")?;
 
     // write pre-images + journal, fsync, then mark committed
     let dir = journal_dir(workspace_root);
@@ -138,6 +150,7 @@ pub fn publish_journal(
         context: format!("create {}", dir.display()),
         source,
     })?;
+    crash_after("journal-dir-created")?;
     let mut entries = Vec::new();
     for (i, f) in files.iter().enumerate() {
         let abs = workspace_root.join(&f.rel_path);
@@ -154,6 +167,7 @@ pub fn publish_journal(
         if let Ok(h) = std::fs::File::open(&pre_path) {
             let _ = h.sync_all();
         }
+        crash_after(&format!("pre-image-{i}"))?;
         entries.push(JournalEntry {
             rel_path: f.rel_path.clone(),
             pre_image_file: pre_name,
@@ -168,20 +182,25 @@ pub fn publish_journal(
         entries,
     };
     write_journal(workspace_root, &journal)?;
+    crash_after("journal-uncommitted")?;
     journal.committed = true;
     write_journal(workspace_root, &journal)?;
+    crash_after("journal-committed")?;
 
     // publish; roll back from pre-images on any failure
     let mut published = 0usize;
     let mut failure: Option<Error> = None;
-    for f in files {
+    for (index, f) in files.iter().enumerate() {
         match publish_atomic(
             workspace_root,
             &workspace_root.join(&f.rel_path),
             &f.content,
             &f.expected_live_sha256,
         ) {
-            Ok(_) => published += 1,
+            Ok(_) => {
+                published += 1;
+                crash_after(&format!("published-{index}"))?;
+            }
             Err(e) => {
                 failure = Some(e);
                 break;
@@ -209,6 +228,7 @@ pub fn publish_journal(
         context: format!("remove journal {}", dir.display()),
         source,
     })?;
+    crash_after("journal-removed")?;
     Ok(())
 }
 
@@ -246,6 +266,14 @@ pub enum Recovery {
 pub fn recover(workspace_root: &Path) -> Result<Recovery> {
     let path = journal_path(workspace_root);
     if !path.exists() {
+        let dir = journal_dir(workspace_root);
+        if dir.exists() {
+            std::fs::remove_dir_all(&dir).map_err(|source| Error::Io {
+                context: format!("remove orphan journal {}", dir.display()),
+                source,
+            })?;
+            return Ok(Recovery::DiscardedUncommitted);
+        }
         return Ok(Recovery::NothingToRecover);
     }
     let journal: Journal =

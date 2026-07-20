@@ -117,16 +117,14 @@ pub fn run_validator(cwd: &Path, validator: &PlanValidator) -> Result<ValidatorR
     }
 }
 
-/// Apply `publications` in a shadow copy, run `validators` there, and
-/// journal-publish to the real workspace only when all pass. Returns the
-/// validator reports and whether publication happened.
-pub fn shadow_validate_and_publish(
+/// Apply `publications` in a shadow copy and run `validators` there.
+/// Publication is deliberately separate so callers can recheck workspace
+/// preconditions after validators finish.
+pub(crate) fn shadow_validate(
     workspace_root: &Path,
-    transaction_id: &str,
     publications: &[FilePublication],
     validators: &[PlanValidator],
-    publish: bool,
-) -> Result<(Vec<ValidatorReport>, bool)> {
+) -> Result<Vec<ValidatorReport>> {
     let (_tmp, shadow) = copy_workspace(workspace_root)?;
     for p in publications {
         let dst = shadow.join(&p.rel_path);
@@ -142,12 +140,26 @@ pub fn shadow_validate_and_publish(
         })?;
     }
     let mut reports = Vec::new();
-    let mut all_ok = true;
-    for v in validators {
-        let report = run_validator(&shadow, v)?;
-        all_ok &= report.exit_code == 0 && !report.timed_out;
-        reports.push(report);
+    for validator in validators {
+        reports.push(run_validator(&shadow, validator)?);
     }
+    Ok(reports)
+}
+
+/// Apply `publications` in a shadow copy, run `validators` there, and
+/// journal-publish to the real workspace only when all pass. Returns the
+/// validator reports and whether publication happened.
+pub fn shadow_validate_and_publish(
+    workspace_root: &Path,
+    transaction_id: &str,
+    publications: &[FilePublication],
+    validators: &[PlanValidator],
+    publish: bool,
+) -> Result<(Vec<ValidatorReport>, bool)> {
+    let reports = shadow_validate(workspace_root, publications, validators)?;
+    let all_ok = reports
+        .iter()
+        .all(|report| report.exit_code == 0 && !report.timed_out);
     if !all_ok || !publish {
         return Ok((reports, false));
     }

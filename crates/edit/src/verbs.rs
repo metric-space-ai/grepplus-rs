@@ -1062,11 +1062,7 @@ pub fn rename_symbol_files(
         match crate::journal::publish_journal(workspace_root, &tx, &publications) {
             Ok(()) => published = true,
             Err(e) => {
-                status = if format!("{e}").contains("stale") {
-                    Status::Stale
-                } else {
-                    Status::PublishFailed
-                };
+                status = crate::certificate::publish_error_status(&e);
             }
         }
     }
@@ -1325,11 +1321,7 @@ fn run_pipeline(
                 file_sha_after = Some(sha);
             }
             Err(e) => {
-                status = if format!("{e}").contains("stale") {
-                    Status::Stale
-                } else {
-                    Status::PublishFailed
-                };
+                status = crate::certificate::publish_error_status(&e);
             }
         }
     } else if status == Status::Applied {
@@ -1573,6 +1565,33 @@ mod tests {
         assert!(cert.operations[0].outside_declared_ranges_unchanged);
         assert_eq!(std::fs::read(&f).unwrap(), b"port = 8080\nhost = x\n");
         assert_eq!(cert.exit_code(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_publish_is_publish_failed_not_stale() {
+        let dir = ws();
+        let f = dir.path().join("conf.ini");
+        let alias = dir.path().join("alias.ini");
+        std::fs::write(&f, b"port = 9000\n").unwrap();
+        std::fs::hard_link(&f, &alias).unwrap();
+
+        let cert = text_cas(
+            dir.path(),
+            &f,
+            b"port = 9000",
+            b"port = 8080",
+            1,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(cert.status, Status::PublishFailed);
+        assert_eq!(cert.exit_code(), 16);
+        assert!(!cert.published);
+        assert_eq!(std::fs::read(&f).unwrap(), b"port = 9000\n");
+        let json = serde_json::to_value(&cert).unwrap();
+        let _: Certificate = serde_json::from_value(json).unwrap();
     }
 
     #[test]

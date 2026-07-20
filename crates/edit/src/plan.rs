@@ -128,6 +128,7 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
         )));
     }
     let root = Path::new(&plan.workspace.root);
+    let git_head_before = git_head(root);
 
     // group operations per file, snapshot each file once
     let mut by_file: BTreeMap<String, Vec<&PlanOperation>> = BTreeMap::new();
@@ -137,14 +138,25 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
 
     let mut op_reports = Vec::new();
     let mut publications = Vec::new();
-    let mut refusal: Option<Status> = None;
-    let mut patch_out = String::new();
+    let mut refusal = plan
+        .workspace
+        .expect_git_head
+        .as_ref()
+        .filter(|expected| git_head_before.as_ref() != Some(*expected))
+        .map(|_| Status::Stale);
 
     for (file, ops) in &by_file {
+        if refusal.is_some() {
+            break;
+        }
         let abs = root.join(file);
         let snapshot = Snapshot::read(&abs)?;
         let mut planned: Vec<PlannedOp> = Vec::new();
         for op in ops {
+            if plan.workspace.require_unchanged_files && op.preconditions.file_sha256.is_none() {
+                refusal = Some(Status::Stale);
+                break;
+            }
             if let Some(expected) = &op.preconditions.file_sha256 {
                 if *expected != snapshot.file_sha256 {
                     refusal = Some(Status::Stale);
@@ -264,7 +276,9 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             changed_byte_ranges: applied.changed_ranges.clone(),
             node_before: None,
             node_after: None,
-            unified_diff: None,
+            unified_diff: (plan.publish.mode == PlanPublishMode::Patch).then(|| {
+                crate::verbs::unified_diff_public(file, &snapshot.content, &applied.content)
+            }),
             syntax,
             postconditions_passed: syntax_ok && isolation_ok,
             postconditions: vec![],
@@ -289,13 +303,6 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
             store_refreshed: false,
             candidates: vec![],
         });
-        if plan.publish.mode == PlanPublishMode::Patch {
-            patch_out.push_str(&crate::verbs::unified_diff_public(
-                file,
-                &snapshot.content,
-                &applied.content,
-            ));
-        }
         publications.push(FilePublication {
             rel_path: file.clone(),
             expected_live_sha256: snapshot.file_sha256.clone(),
@@ -318,30 +325,40 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
     let mut status = refusal.unwrap_or(Status::Applied);
     let mut published = false;
     let mut validator_reports = Vec::new();
-    // validators without shadow mode still run - against the shadow copy,
-    // never against unpublished workspace state
+    // Validators always run against the edited shadow. Shadow-worktree
+    // publication is kept separate so workspace preconditions can be
+    // rechecked after validation and immediately before journal publish.
     if status == Status::Applied
         && (!plan.validators.is_empty() || plan.publish.mode == PlanPublishMode::ShadowWorktree)
     {
-        let do_publish = !dry_run && plan.publish.mode == PlanPublishMode::ShadowWorktree;
-        let (reports, did_publish) = crate::shadow::shadow_validate_and_publish(
-            root,
-            &tx,
-            &publications,
-            &plan.validators,
-            do_publish,
-        )?;
-        let all_ok = reports.iter().all(|r| r.exit_code == 0 && !r.timed_out);
-        validator_reports = reports;
-        if !all_ok {
-            status = Status::ValidationFailed;
-        } else if did_publish {
-            published = true;
+        match crate::shadow::shadow_validate(root, &publications, &plan.validators) {
+            Ok(reports) => {
+                let all_ok = reports.iter().all(|r| r.exit_code == 0 && !r.timed_out);
+                validator_reports = reports;
+                if !all_ok {
+                    status = Status::ValidationFailed;
+                }
+            }
+            Err(error) => status = crate::certificate::publish_error_status(&error),
         }
     }
-    if status == Status::Applied && !dry_run && !published {
+
+    if status == Status::Applied {
+        let head_matches = plan
+            .workspace
+            .expect_git_head
+            .as_ref()
+            .is_none_or(|expected| git_head(root).as_ref() == Some(expected));
+        let files_match =
+            !plan.workspace.require_unchanged_files || publications_unchanged(root, &publications);
+        if !head_matches || !files_match {
+            status = Status::Stale;
+        }
+    }
+
+    if status == Status::Applied && !dry_run {
         match plan.publish.mode {
-            PlanPublishMode::Patch | PlanPublishMode::ShadowWorktree => {}
+            PlanPublishMode::Patch => {}
             PlanPublishMode::Atomic => {
                 if publications.len() != 1 {
                     return Err(Error::Invalid(
@@ -356,20 +373,33 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
                     &p.expected_live_sha256,
                 ) {
                     Ok(_) => published = true,
-                    Err(_) => status = Status::Stale,
+                    Err(error) => status = crate::certificate::publish_error_status(&error),
                 }
             }
-            PlanPublishMode::Journal => match publish_journal(root, &tx, &publications) {
-                Ok(()) => published = true,
-                Err(e) => {
-                    status = if format!("{e}").contains("stale") {
-                        Status::Stale
-                    } else {
-                        Status::PublishFailed
-                    };
+            PlanPublishMode::Journal | PlanPublishMode::ShadowWorktree => {
+                match publish_journal(root, &tx, &publications) {
+                    Ok(()) => published = true,
+                    Err(error) => status = crate::certificate::publish_error_status(&error),
                 }
-            },
+            }
         }
+    }
+
+    let git_head_after = git_head(root);
+    let validator_guarantee = if plan.validators.is_empty() {
+        Guarantee::NotApplicable
+    } else if status == Status::ValidationFailed {
+        Guarantee::Failed
+    } else if validator_reports
+        .iter()
+        .all(|report| report.exit_code == 0 && !report.timed_out)
+    {
+        Guarantee::Proved
+    } else {
+        Guarantee::Failed
+    };
+    for report in &mut op_reports {
+        report.guarantees.validators = validator_guarantee;
     }
 
     Ok(Certificate {
@@ -378,8 +408,8 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
         transaction_id: tx,
         workspace: WorkspaceReport {
             root: plan.workspace.root.clone(),
-            git_head_before: None,
-            git_head_after: None,
+            git_head_before,
+            git_head_after,
         },
         operations: op_reports,
         validators: validator_reports,
@@ -394,6 +424,28 @@ pub fn apply_plan(plan: &Plan, dry_run: bool) -> Result<Certificate> {
                 PlanPublishMode::ShadowWorktree => PublishMode::ShadowWorktree,
             }
         },
+    })
+}
+
+fn git_head(root: &Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let head = String::from_utf8(output.stdout).ok()?;
+    let head = head.trim();
+    (!head.is_empty()).then(|| head.to_string())
+}
+
+fn publications_unchanged(root: &Path, publications: &[FilePublication]) -> bool {
+    publications.iter().all(|publication| {
+        std::fs::read(root.join(&publication.rel_path))
+            .map(|content| sha256_hex(&content) == publication.expected_live_sha256)
+            .unwrap_or(false)
     })
 }
 
@@ -423,20 +475,38 @@ mod tests {
     use super::*;
 
     fn plan_json(root: &str, mode: &str) -> Plan {
+        let a_sha = sha256_hex(&std::fs::read(Path::new(root).join("a.py")).unwrap());
+        let b_sha = sha256_hex(&std::fs::read(Path::new(root).join("b.py")).unwrap());
         serde_json::from_value(serde_json::json!({
             "schema_version": PLAN_SCHEMA,
             "workspace": {"root": root},
             "operations": [
                 {"id": "op-a", "file": "a.py",
                  "selector": {"engine": "text", "old_text": "VALUE = 1", "expect": 1},
-                 "action": {"type": "replace", "content": "VALUE = 2"}},
+                 "action": {"type": "replace", "content": "VALUE = 2"},
+                 "preconditions": {"file_sha256": a_sha}},
                 {"id": "op-b", "file": "b.py",
                  "selector": {"engine": "text", "old_text": "LIMIT = 10", "expect": 1},
-                 "action": {"type": "replace", "content": "LIMIT = 20"}}
+                 "action": {"type": "replace", "content": "LIMIT = 20"},
+                 "preconditions": {"file_sha256": b_sha}}
             ],
             "publish": {"mode": mode}
         }))
         .unwrap()
+    }
+
+    fn assert_schema_roundtrip(certificate: &Certificate) {
+        let json = serde_json::to_value(certificate).unwrap();
+        assert_eq!(
+            json["schema_version"],
+            crate::certificate::CERTIFICATE_SCHEMA
+        );
+        assert!(json.get("status").is_some());
+        assert!(json.get("transaction_id").is_some());
+        assert!(json.get("workspace").is_some());
+        assert!(json.get("operations").is_some());
+        assert!(json.get("published").is_some());
+        let _: Certificate = serde_json::from_value(json).unwrap();
     }
 
     #[test]
@@ -448,6 +518,7 @@ mod tests {
         let cert = apply_plan(&plan, false).unwrap();
         assert_eq!(cert.status, Status::Applied);
         assert!(cert.published);
+        assert_schema_roundtrip(&cert);
         assert_eq!(
             std::fs::read(dir.path().join("a.py")).unwrap(),
             b"VALUE = 2\n"
@@ -474,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn patch_mode_mutates_nothing() {
+    fn patch_mode_mutates_nothing_and_reports_unified_diffs() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
         std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
@@ -482,6 +553,11 @@ mod tests {
         let cert = apply_plan(&plan, false).unwrap();
         assert_eq!(cert.status, Status::Applied);
         assert!(!cert.published);
+        assert_schema_roundtrip(&cert);
+        assert!(cert.operations.iter().all(|operation| operation
+            .unified_diff
+            .as_deref()
+            .is_some_and(|diff| diff.starts_with("--- a/") && diff.contains("+++ b/"))));
         assert_eq!(
             std::fs::read(dir.path().join("a.py")).unwrap(),
             b"VALUE = 1\n"
@@ -506,6 +582,7 @@ mod tests {
         let cert = apply_plan(&plan, false).unwrap();
         assert_eq!(cert.status, Status::Applied);
         assert!(cert.published);
+        assert_schema_roundtrip(&cert);
         assert_eq!(cert.validators.len(), 1);
         assert_eq!(
             std::fs::read(dir.path().join("a.py")).unwrap(),
@@ -527,6 +604,130 @@ mod tests {
             std::fs::read(dir.path().join("a.py")).unwrap(),
             b"VALUE = 1\n"
         );
+    }
+
+    #[test]
+    fn atomic_plan_emits_applied_certificate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "atomic");
+        plan.operations.truncate(1);
+
+        let cert = apply_plan(&plan, false).unwrap();
+
+        assert_eq!(cert.status, Status::Applied);
+        assert_eq!(cert.exit_code(), 0);
+        assert!(cert.published);
+        assert_eq!(cert.publish_mode, PublishMode::Atomic);
+        assert_schema_roundtrip(&cert);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_unsafe_path_is_publish_failed_not_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        std::fs::hard_link(dir.path().join("a.py"), dir.path().join("alias.py")).unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "atomic");
+        plan.operations.truncate(1);
+
+        let cert = apply_plan(&plan, false).unwrap();
+
+        assert_eq!(cert.status, Status::PublishFailed);
+        assert_eq!(cert.exit_code(), 16);
+        assert!(!cert.published);
+        assert_schema_roundtrip(&cert);
+    }
+
+    #[test]
+    fn every_publish_mode_emits_stale_certificate_for_hash_mismatch() {
+        for mode in ["atomic", "journal", "patch", "shadow-worktree"] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+            std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+            let mut plan = plan_json(dir.path().to_str().unwrap(), mode);
+            if mode == "atomic" {
+                plan.operations.truncate(1);
+            }
+            plan.operations[0].preconditions.file_sha256 = Some("stale".into());
+
+            let cert = apply_plan(&plan, false).unwrap();
+
+            assert_eq!(cert.status, Status::Stale, "mode {mode}");
+            assert_eq!(cert.exit_code(), 12, "mode {mode}");
+            assert!(!cert.published, "mode {mode}");
+            let json = serde_json::to_value(&cert).unwrap();
+            assert_eq!(json["status"], "stale", "mode {mode}");
+            assert_schema_roundtrip(&cert);
+        }
+    }
+
+    #[test]
+    fn require_unchanged_files_requires_file_hash_preconditions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "journal");
+        plan.operations[0].preconditions.file_sha256 = None;
+
+        let cert = apply_plan(&plan, false).unwrap();
+
+        assert_eq!(cert.status, Status::Stale);
+        assert_eq!(cert.exit_code(), 12);
+        assert!(!cert.published);
+    }
+
+    #[test]
+    fn matching_git_head_is_reported_and_permitted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.email", "edit-tests@example.invalid"][..],
+            &["config", "user.name", "Edit Tests"][..],
+            &["add", "a.py", "b.py"][..],
+            &["commit", "-qm", "initial"][..],
+        ] {
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .status()
+                .unwrap()
+                .success());
+        }
+        let head = git_head(dir.path()).unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "patch");
+        plan.workspace.expect_git_head = Some(head.clone());
+
+        let cert = apply_plan(&plan, false).unwrap();
+
+        assert_eq!(cert.status, Status::Applied);
+        assert_eq!(
+            cert.workspace.git_head_before.as_deref(),
+            Some(head.as_str())
+        );
+        assert_eq!(
+            cert.workspace.git_head_after.as_deref(),
+            Some(head.as_str())
+        );
+    }
+
+    #[test]
+    fn expect_git_head_mismatch_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.py"), b"VALUE = 1\n").unwrap();
+        std::fs::write(dir.path().join("b.py"), b"LIMIT = 10\n").unwrap();
+        let mut plan = plan_json(dir.path().to_str().unwrap(), "journal");
+        plan.workspace.expect_git_head = Some("not-the-live-head".into());
+
+        let cert = apply_plan(&plan, false).unwrap();
+
+        assert_eq!(cert.status, Status::Stale);
+        assert_eq!(cert.exit_code(), 12);
+        assert!(!cert.published);
     }
 
     #[test]
