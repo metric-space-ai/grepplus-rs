@@ -3801,8 +3801,13 @@ fn ruby_emit_references(
         && !is_inside_kind(node, &["call", "command_call"])
         && !is_definition_name(node)
         && !ruby_is_assignment_lhs(node);
-    let is_type_ref = node.kind() == "constant" && ruby_is_constant_call_receiver(node);
-    if is_identifier_use || is_type_ref {
+    let is_type_ref = node.kind() == "constant"
+        && (ruby_is_constant_call_receiver(node) || ruby_is_scope_owner(node));
+    let is_constant_use = node.kind() == "constant"
+        && !is_type_ref
+        && !ruby_is_constant_declaration_name(node)
+        && !ruby_is_assignment_lhs(node);
+    if is_identifier_use || is_constant_use || is_type_ref {
         let text = node_text(source, node);
         if !text.is_empty() && !is_ruby_usage_keyword(text) {
             let source_qname = ruby_enclosing_qname(source, node, file_path)
@@ -3837,6 +3842,16 @@ fn ruby_emit_references(
     }
 }
 
+fn ruby_is_constant_declaration_name(node: Node<'_>) -> bool {
+    if node
+        .parent()
+        .is_some_and(|parent| parent.kind() == "scope_resolution")
+    {
+        return false;
+    }
+    is_definition_name(node)
+}
+
 fn ruby_is_assignment_lhs(node: Node<'_>) -> bool {
     node.parent().is_some_and(|parent| {
         parent.kind() == "assignment"
@@ -3855,6 +3870,15 @@ fn ruby_is_constant_call_receiver(node: Node<'_>) -> bool {
                     receiver.start_byte() == node.start_byte()
                         && receiver.end_byte() == node.end_byte()
                 })
+    })
+}
+
+fn ruby_is_scope_owner(node: Node<'_>) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.kind() == "scope_resolution"
+            && parent.child_by_field_name("scope").is_some_and(|scope| {
+                scope.start_byte() == node.start_byte() && scope.end_byte() == node.end_byte()
+            })
     })
 }
 
@@ -17291,6 +17315,40 @@ end
             !r.edges.iter().any(|edge| edge.edge_type == "USAGE"),
             "Ruby reference kinds must not collapse during extraction: {:?}",
             r.edges
+        );
+    }
+
+    #[test]
+    fn ruby_classifies_qualified_and_bare_constants_as_uses() {
+        let r = rb(
+            "def report_limit\n  Helper::LIMIT\n  LIMIT\nend\n",
+            "app.rb",
+        );
+        let refs: Vec<(&str, &str)> = r
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let name = edge
+                    .properties
+                    .get(if edge.edge_type == "TYPE_REF" {
+                        "type_name"
+                    } else {
+                        "ref_name"
+                    })?
+                    .as_str()?;
+                Some((edge.edge_type.as_str(), name))
+            })
+            .collect();
+        assert!(
+            refs.contains(&("TYPE_REF", "Helper")),
+            "scope owner Helper must classify as TYPE_REF: {refs:?}"
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|(kind, name)| *kind == "USES" && *name == "LIMIT")
+                .count(),
+            2,
+            "qualified and bare LIMIT reads must classify as USES: {refs:?}"
         );
     }
 

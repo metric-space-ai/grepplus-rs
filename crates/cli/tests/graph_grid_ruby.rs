@@ -444,7 +444,6 @@ fn graph_grid_ruby_stale_edit_detected() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "ruby graph gap: constant USAGE (Helper::LIMIT) not resolved cross-file"]
 fn graph_grid_ruby_declarative_or_edge_case() {
     let (repo, store) = index_fixture("singleton");
 
@@ -469,8 +468,8 @@ fn graph_grid_ruby_declarative_or_edge_case() {
         "find-usages LIMIT should exit 0; stderr={err}\nstdout={out}"
     );
     assert!(
-        out.contains("USAGE") && out.contains("report_limit"),
-        "find-usages LIMIT must show USAGE from report_limit (cross-file); got: {out:?}"
+        out.contains("USES") && out.contains("report_limit"),
+        "find-usages LIMIT must show USES from report_limit (cross-file); got: {out:?}"
     );
     assert!(
         out.contains("app.rb:"),
