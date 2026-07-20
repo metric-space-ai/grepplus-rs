@@ -303,6 +303,8 @@ pub fn manifest_for_language(language: Language) -> ProviderManifest {
             EdgeClass::TypeAssigns,
             EdgeClass::Implements,
         ]);
+    } else if matches!(language, Language::Kotlin) {
+        supported.extend([EdgeClass::Usages, EdgeClass::TypeRefs]);
     }
     let all = [
         EdgeClass::Definitions,
@@ -348,7 +350,14 @@ pub fn manifest_for_language(language: Language) -> ProviderManifest {
         fixture_paths: Vec::new(),
         golden_paths: Vec::new(),
         review_artifact: None,
-        notes: vec!["R0 contract manifest; acceptance requires language-specific evidence".into()],
+        notes: if matches!(language, Language::Kotlin) {
+            vec![
+                "Kotlin classifies type/value references, but remains partial: member-call coverage, type assignments, and implements edges are not complete"
+                    .into(),
+            ]
+        } else {
+            vec!["R0 contract manifest; acceptance requires language-specific evidence".into()]
+        },
     }
 }
 
@@ -535,6 +544,26 @@ mod tests {
             output.validate(),
             Err(ProviderContractError::InvalidConfidence(1.2))
         );
+    }
+
+    #[test]
+    fn kotlin_manifest_claims_reference_classes_but_remains_partial() {
+        let manifest = manifest_for_language(Language::Kotlin);
+        assert_eq!(manifest.status, ProviderStatus::Partial);
+        assert!(manifest.supports(EdgeClass::Usages));
+        assert!(manifest.supports(EdgeClass::TypeRefs));
+        assert!(
+            manifest
+                .unsupported_edge_classes
+                .contains(&EdgeClass::TypeAssigns)
+        );
+        assert!(
+            manifest
+                .notes
+                .iter()
+                .any(|note| note.contains("member-call coverage"))
+        );
+        manifest.validate().unwrap();
     }
 
     #[test]

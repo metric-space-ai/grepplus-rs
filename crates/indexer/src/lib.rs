@@ -1763,14 +1763,10 @@ fn new_edge(project: &str, source_id: i64, target_id: i64, edge: &ExtractedEdge)
         project: project.to_string(),
         source_id,
         target_id,
-        // The persisted graph schema folds every non-call, non-import
-        // identifier reference into a single unified `USAGE` edge. We keep
-        // `TYPE_REF` (type references) and `USES` (value references) as
-        // SEPARATE extraction passes because that distinction is cheap and
-        // useful, but persist them under the unified `USAGE` label so the
-        // graph schema stays uniform. A pass that already emits `USAGE` (a
-        // per-language usages pass) is passed through unchanged.
-        edge_type: usage_persist_label(&edge.edge_type).to_string(),
+        // The compatibility graph schema folds reference kinds into `USAGE`.
+        // Providers with certified logical classification may opt into keeping
+        // `TYPE_REF` / `USES` distinct via `preserve_reference_kind`.
+        edge_type: persisted_edge_label(edge).to_string(),
         properties: {
             // Fold the reference-site line into the resolved edge too (P4):
             // nav commands print it grep-shaped so one answer carries the
@@ -1787,10 +1783,23 @@ fn new_edge(project: &str, source_id: i64, target_id: i64, edge: &ExtractedEdge)
     }
 }
 
-/// Map an extraction-time edge type to its persisted graph label. The only
-/// remapping is the `TYPE_REF`/`USES`/`USAGE` family → `USAGE` (see
-/// [`new_edge`]); every other type (`CALLS`, `IMPORTS`, `DEFINES`,
-/// `DEFINES_METHOD`, …) is persisted verbatim.
+/// Map an extraction-time edge to its persisted graph label. Most providers
+/// retain the compatibility rule `TYPE_REF`/`USES`/`USAGE` → `USAGE`. A provider
+/// that has certified distinct logical reference classes can set
+/// `preserve_reference_kind=true` to persist `TYPE_REF` / `USES` verbatim.
+fn persisted_edge_label(edge: &ExtractedEdge) -> &str {
+    if edge
+        .properties
+        .get("preserve_reference_kind")
+        .and_then(|value| value.as_bool())
+        == Some(true)
+    {
+        edge.edge_type.as_str()
+    } else {
+        usage_persist_label(&edge.edge_type)
+    }
+}
+
 fn usage_persist_label(edge_type: &str) -> &str {
     match edge_type {
         "TYPE_REF" | "USES" | "USAGE" => "USAGE",
@@ -2849,6 +2858,23 @@ mod tests {
         fs::write(tmp.join("src/lib.rs"), source).unwrap();
         fs::write(tmp.join("src/empty.txt"), "").unwrap();
         tmp
+    }
+
+    #[test]
+    fn certified_reference_kind_can_bypass_usage_label_folding() {
+        let preserved = ExtractedEdge {
+            edge_type: "TYPE_REF".into(),
+            source_qualified_name: "src/main.kt::Function::caller".into(),
+            target_qualified_name: "src/types.kt::Class::Payload".into(),
+            file_path: "src/main.kt".into(),
+            line: 1,
+            properties: serde_json::json!({ "preserve_reference_kind": true }),
+        };
+        assert_eq!(persisted_edge_label(&preserved), "TYPE_REF");
+
+        let mut folded = preserved;
+        folded.properties = serde_json::json!({});
+        assert_eq!(persisted_edge_label(&folded), "USAGE");
     }
 
     #[test]

@@ -6488,14 +6488,11 @@ fn kotlin_func_owner_name<'a>(source: &'a [u8], func: Node<'_>) -> Option<&'a st
     None
 }
 
-/// USAGE pass for Kotlin. Every `simple_identifier` / `identifier` /
-/// `type_identifier` reference emits a USAGE edge unless it is a definition
-/// *name*, sits inside a call node (`call_expression` / `navigation_expression`
-/// — already a CALLS edge, and its nested references suppressed), sits inside an
-/// import, or is a Kotlin keyword. The `ref_name` is resolved project-wide by
-/// the indexer, so the target qname is a placeholder that never resolves
-/// directly. The source is the nearest enclosing callable qname, falling back to
-/// the per-file Module node at file / type scope.
+/// Reference pass for Kotlin. Identifiers under a `user_type` are emitted as
+/// `TYPE_REF`; other references are emitted as `USES`. Definition names, call
+/// endpoints/arguments, imports, and keywords are excluded. Kotlin preserves
+/// these logical labels in the persisted graph (rather than folding them to the
+/// compatibility `USAGE` label) so provider completeness is externally visible.
 fn kotlin_emit_usages(
     source: &[u8],
     node: Node<'_>,
@@ -6515,15 +6512,28 @@ fn kotlin_emit_usages(
             // function name, so the enclosing-callable lookup is deterministic.
             let source_qname = kotlin_enclosing_qname(source, node, file_path)
                 .unwrap_or_else(|| file_module_qname.to_string());
+            let is_type_ref = kotlin_is_type_reference(node);
             result.edges.push(ExtractedEdge {
-                edge_type: "USAGE".into(),
+                edge_type: if is_type_ref { "TYPE_REF" } else { "USES" }.into(),
                 source_qualified_name: source_qname,
-                target_qualified_name: format!("{file_path}::__ref__::{text}"),
+                target_qualified_name: if is_type_ref {
+                    format!("{file_path}::Class::{text}")
+                } else {
+                    format!("{file_path}::__ref__::{text}")
+                },
                 file_path: file_path.to_string(),
                 line: node.start_position().row as u32 + 1,
-                properties: serde_json::json!({
-                    "ref_name": text,
-                }),
+                properties: if is_type_ref {
+                    serde_json::json!({
+                        "type_name": text,
+                        "preserve_reference_kind": true,
+                    })
+                } else {
+                    serde_json::json!({
+                        "ref_name": text,
+                        "preserve_reference_kind": true,
+                    })
+                },
             });
         }
     }
@@ -6533,8 +6543,33 @@ fn kotlin_emit_usages(
     }
 }
 
-/// Decide whether an `identifier` reference is a genuine USAGE, for the
-/// tree-sitter-kotlin-ng tree shape.
+/// Whether a Kotlin identifier is part of a user-defined type reference. The
+/// grammar wraps parameter, return, property, and generic types in `user_type`;
+/// builtin names are filtered before this classifier is called.
+fn kotlin_is_type_reference(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    let mut depth = 0;
+    while let Some(parent) = current {
+        if depth >= 8 {
+            break;
+        }
+        if parent.kind() == "user_type" {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "block" | "function_body" | "source_file" | "import"
+        ) {
+            break;
+        }
+        current = parent.parent();
+        depth += 1;
+    }
+    false
+}
+
+/// Decide whether an `identifier` reference is a genuine Kotlin reference, for
+/// the tree-sitter-kotlin-ng tree shape.
 ///
 /// A usage is emitted for every reference that is NOT a definition name, NOT
 /// inside a call node (`call_expression` / `navigation_expression`), and NOT
@@ -18986,6 +19021,48 @@ fun freeFn() { freeOther() }
         assert!(b.nodes.iter().any(|n| n.name == "shared"));
     }
 
+    #[test]
+    fn kotlin_classifies_type_refs_and_constant_uses() {
+        let r = kotlin(
+            r#"
+import grid.helper.HELPER_VALUE
+import grid.types.Payload
+fun caller(payload: Payload): Payload {
+    val total = HELPER_VALUE
+    return payload
+}
+"#,
+            "src/main.kt",
+        );
+        let edge = |kind: &str, property: &str, name: &str| {
+            r.edges.iter().any(|edge| {
+                edge.edge_type == kind
+                    && edge.source_qualified_name == "src/main.kt::Function::caller"
+                    && edge.properties.get(property).and_then(|v| v.as_str()) == Some(name)
+                    && edge
+                        .properties
+                        .get("preserve_reference_kind")
+                        .and_then(|v| v.as_bool())
+                        == Some(true)
+            })
+        };
+        assert!(
+            edge("TYPE_REF", "type_name", "Payload"),
+            "Payload parameter/return type must classify as TYPE_REF: {:?}",
+            r.edges
+        );
+        assert!(
+            edge("USES", "ref_name", "HELPER_VALUE"),
+            "HELPER_VALUE read must classify as USES: {:?}",
+            r.edges
+        );
+        assert!(
+            !r.edges.iter().any(|edge| edge.edge_type == "USAGE"),
+            "Kotlin references must not collapse to generic USAGE at extraction: {:?}",
+            r.edges
+        );
+    }
+
     // ---- Scala ------------------------------------------------------------
 
     #[test]
@@ -19683,7 +19760,7 @@ end
         //   * a `fun` in a `companion object` is neither a Method nor a Function
         //     (the name-less companion is never descended into);
         //   * DEFINES_METHOD (owner Class node → its Method);
-        //   * a non-call reference emits a USAGE.
+        //   * non-call value references emit USES and type positions emit TYPE_REF.
         const SRC: &str = r#"
 package app
 
@@ -19814,13 +19891,13 @@ class Cache(val capacity: Int) : Store {
             import_pairs(&r)
         );
 
-        // USAGE: a non-call reference (`MAX` returned from `peek`, `SEED` from
-        // `make`) emits a USAGE keyed on `ref_name`, sourced from the enclosing
-        // method. Keywords / def-names / call args never do.
+        // USES: non-call references (`MAX` returned from `peek`, `SEED` from
+        // `make`) are keyed on `ref_name` and sourced from the enclosing method.
+        // Keywords / def-names / call args never emit one.
         let usages: Vec<(&str, &str)> = r
             .edges
             .iter()
-            .filter(|e| e.edge_type == "USAGE")
+            .filter(|e| e.edge_type == "USES")
             .filter_map(|e| {
                 e.properties
                     .get("ref_name")
@@ -19830,17 +19907,17 @@ class Cache(val capacity: Int) : Store {
             .collect();
         assert!(
             usages.contains(&("app/App.kt::Cache::peek", "MAX")),
-            "method-body USAGE of `MAX`: {usages:?}"
+            "method-body USES of `MAX`: {usages:?}"
         );
         assert!(
             usages.contains(&("app/App.kt::Registry::make", "SEED")),
-            "object-method-body USAGE of `SEED`: {usages:?}"
+            "object-method-body USES of `SEED`: {usages:?}"
         );
         assert!(
             !usages
                 .iter()
                 .any(|(_, rn)| *rn == "fun" || *rn == "val" || *rn == "return" || *rn == "String"),
-            "keywords / builtins must not emit USAGE: {usages:?}"
+            "keywords / builtins must not emit USES: {usages:?}"
         );
     }
 

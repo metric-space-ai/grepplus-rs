@@ -191,7 +191,6 @@ fn graph_grid_kotlin_callees_lists_cross_file_target() {
 }
 
 #[test]
-#[ignore = "kotlin graph gap: constant uses classified as generic USAGE, not USES (provider self-reports partial)"]
 fn graph_grid_kotlin_find_usages_covers_call_and_import() {
     let (repo, store) = index_fixture("find-usages-call-import");
     let (code, out, err) = run(
@@ -226,7 +225,6 @@ fn graph_grid_kotlin_find_usages_covers_call_and_import() {
 }
 
 #[test]
-#[ignore = "kotlin graph gap: type references classified as generic USAGE, not TYPE_REF (provider self-reports partial)"]
 fn graph_grid_kotlin_find_usages_type_reference() {
     let (repo, store) = index_fixture("find-usages-type");
     let (code, out, err) = run(&["find-usages", "Payload", "--json"], &repo, &store);
