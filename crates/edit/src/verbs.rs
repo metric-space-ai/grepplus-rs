@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use crate::certificate::{
-    Candidate, Certificate, Guarantee, Guarantees, OperationReport, PostconditionResult, PublishMode,
-    SelectorClass, SelectorEngine, Status, SyntaxDelta, WorkspaceReport,
+    Candidate, Certificate, Guarantee, Guarantees, OperationReport, PostconditionResult,
+    PublishMode, SelectorClass, SelectorEngine, Status, SyntaxDelta, WorkspaceReport,
 };
 use crate::handle::EditHandle;
 use crate::hash::sha256_hex;
@@ -979,65 +979,599 @@ fn identifier_sites(
     Some(out)
 }
 
-/// Graph-backed `change-signature` v1: replace the parameter list of the
-/// resolved definition. Call sites are NOT rewritten by the graph backend -
-/// they are returned as a checklist in `candidates` so the agent addresses
-/// each one deliberately (rename-call / patch-span). The LSP backend is the
-/// planned engine for coupled call-site rewriting.
+/// Compatibility entry point for the pre-M4 parameters-only API. Its inputs
+/// cannot express argument add/remove/reorder, call-site cardinality, or
+/// multi-file CAS, so it now fails closed instead of publishing a partial
+/// definition-only edit. Use [`change_signature_files`] with a JSON spec.
 pub fn change_signature(
+    _workspace_root: &Path,
+    _file: &Path,
+    _def_range: (usize, usize),
+    _new_parameters: &str,
+    _call_sites: Vec<crate::certificate::Candidate>,
+    _language: Language,
+    _options: &VerbOptions,
+) -> Result<Certificate> {
+    Err(greppy_core::Error::Invalid(
+        "parameters-only change-signature cannot rewrite call sites safely; use --spec with the graph backend"
+            .into(),
+    ))
+}
+
+/// JSON specification consumed by the graph-backed change-signature engine.
+/// Parameter lists include their delimiters. Added parameters need an explicit
+/// call-site expression so application never guesses a value.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ChangeSignatureSpec {
+    #[serde(alias = "oldParameters")]
+    pub old_parameters: String,
+    #[serde(alias = "newParameters")]
+    pub new_parameters: String,
+    #[serde(default, alias = "addedArguments")]
+    pub added_arguments: std::collections::BTreeMap<String, String>,
+    #[serde(alias = "expectCallSites")]
+    pub expect_call_sites: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct SignatureDefinition {
+    pub rel_path: String,
+    pub range: (usize, usize),
+}
+
+/// Validate semantic backend selection inside the edit engine. CLI wiring can
+/// map the returned invalid specification to contract exit 20.
+pub fn require_semantic_backend(backend: &str) -> Result<()> {
+    match backend {
+        "graph" => Ok(()),
+        "lsp" => Err(greppy_core::Error::Invalid(
+            "--backend lsp is unavailable in this build; use --backend graph".into(),
+        )),
+        other => Err(greppy_core::Error::Invalid(format!(
+            "unknown semantic backend `{other}`; expected graph or lsp"
+        ))),
+    }
+}
+
+/// Graph-backed change-signature: update one definition and every graph scope
+/// in one journal transaction. The spec supports removal (omit a former name),
+/// reorder (change name order), and addition (new name plus `added_arguments`).
+#[allow(clippy::too_many_arguments)]
+pub fn change_signature_files(
     workspace_root: &Path,
-    file: &Path,
-    def_range: (usize, usize),
-    new_parameters: &str,
-    call_sites: Vec<crate::certificate::Candidate>,
+    definition: &SignatureDefinition,
+    call_scopes: &[RenameFileScope],
+    symbol_name: &str,
+    spec: &ChangeSignatureSpec,
     language: Language,
     options: &VerbOptions,
 ) -> Result<Certificate> {
-    let snapshot = Snapshot::read(file)?;
-    if let Some(certificate) = planned_precondition_refusal(workspace_root, &snapshot, options) {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    require_semantic_backend("graph")?;
+    let old_parameters = parse_parameter_declarations(&spec.old_parameters)?;
+    let new_parameters = parse_parameter_declarations(&spec.new_parameters)?;
+    let old_names: Vec<String> = old_parameters
+        .iter()
+        .filter(|parameter| !is_receiver_parameter(&parameter.name))
+        .map(|parameter| parameter.name.clone())
+        .collect();
+    let new_names: Vec<String> = new_parameters
+        .iter()
+        .filter(|parameter| !is_receiver_parameter(&parameter.name))
+        .map(|parameter| parameter.name.clone())
+        .collect();
+    if old_names.iter().collect::<BTreeSet<_>>().len() != old_names.len()
+        || new_names.iter().collect::<BTreeSet<_>>().len() != new_names.len()
+    {
+        return Err(greppy_core::Error::Invalid(
+            "change-signature parameter names must be unique".into(),
+        ));
+    }
+    for added in new_names.iter().filter(|name| !old_names.contains(name)) {
+        if !spec.added_arguments.contains_key(added) {
+            return Err(greppy_core::Error::Invalid(format!(
+                "added parameter `{added}` needs an `added_arguments` expression"
+            )));
+        }
+    }
+
+    let mut snapshots: BTreeMap<String, Snapshot> = BTreeMap::new();
+    let definition_path = workspace_root.join(&definition.rel_path);
+    let definition_snapshot = Snapshot::read(&definition_path)?;
+    if let Some(certificate) =
+        planned_precondition_refusal(workspace_root, &definition_snapshot, options)
+    {
         return Ok(certificate);
     }
-    let Some(param_range) = parameters_range_within(language, &snapshot.content, def_range) else {
+    let Some(parameter_range) =
+        parameters_range_within(language, &definition_snapshot.content, definition.range)
+    else {
         return Ok(single_refusal_certificate(
             workspace_root,
-            &snapshot,
+            &definition_snapshot,
             SelectorEngine::Symbol,
-            SelectorClass::Resolved,
+            SelectorClass::Semantic,
             Status::NotFound,
             options,
         ));
     };
-    if &snapshot.content[param_range.0..param_range.1] == new_parameters.as_bytes() {
-        return Ok(single_refusal_certificate(
+    let live_parameters = &definition_snapshot.content[parameter_range.0..parameter_range.1];
+    if live_parameters != spec.old_parameters.as_bytes() {
+        return Ok(single_status_certificate(
             workspace_root,
-            &snapshot,
+            &definition_snapshot,
             SelectorEngine::Symbol,
-            SelectorClass::Resolved,
-            Status::AlreadySatisfied,
+            SelectorClass::Semantic,
+            if live_parameters == spec.new_parameters.as_bytes() {
+                Status::AlreadySatisfied
+            } else {
+                Status::Stale
+            },
+            1,
             options,
         ));
     }
-    let ops = vec![PlannedOp {
-        id: "change-signature".into(),
-        range: param_range,
-        replacement: new_parameters.as_bytes().to_vec(),
-    }];
-    let mut cert = run_pipeline(
-        workspace_root,
-        snapshot,
-        ops,
-        SelectorEngine::Symbol,
-        SelectorClass::Resolved,
-        Some(language),
-        options,
-        true,
-    )?;
-    // the call-site checklist rides in candidates: every entry is a place
-    // the agent must review, because the graph backend does not rewrite them
-    if let Some(op) = cert.operations.first_mut() {
-        op.candidates = call_sites;
+    snapshots.insert(definition.rel_path.clone(), definition_snapshot);
+
+    let duplicate_scopes = call_scopes
+        .iter()
+        .map(|scope| (&scope.rel_path, &scope.spans))
+        .collect::<BTreeSet<_>>()
+        .len()
+        != call_scopes.len();
+    if duplicate_scopes {
+        let snapshot = snapshots.get(&definition.rel_path).expect("inserted above");
+        return Ok(single_status_certificate(
+            workspace_root,
+            snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Semantic,
+            Status::Ambiguous,
+            call_scopes.len(),
+            options,
+        ));
     }
-    Ok(cert)
+
+    let mut call_ranges: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    let mut missing_scope = false;
+    for scope in call_scopes {
+        if !snapshots.contains_key(&scope.rel_path) {
+            snapshots.insert(
+                scope.rel_path.clone(),
+                Snapshot::read(&workspace_root.join(&scope.rel_path))?,
+            );
+        }
+        let snapshot = snapshots.get(&scope.rel_path).expect("inserted above");
+        let mut sites = call_argument_sites(
+            language,
+            &snapshot.content,
+            &scope.spans,
+            symbol_name.as_bytes(),
+        )
+        .unwrap_or_default();
+        sites.sort_unstable();
+        sites.dedup();
+        missing_scope |= sites.is_empty();
+        call_ranges
+            .entry(scope.rel_path.clone())
+            .or_default()
+            .extend(sites);
+    }
+    for ranges in call_ranges.values_mut() {
+        ranges.sort_unstable();
+        ranges.dedup();
+    }
+    let actual_call_sites: usize = call_ranges.values().map(Vec::len).sum();
+    if missing_scope || actual_call_sites != spec.expect_call_sites {
+        let snapshot = snapshots.get(&definition.rel_path).expect("inserted above");
+        return Ok(single_status_certificate(
+            workspace_root,
+            snapshot,
+            SelectorEngine::Symbol,
+            SelectorClass::Semantic,
+            if actual_call_sites == 0 {
+                Status::NotFound
+            } else {
+                Status::Ambiguous
+            },
+            actual_call_sites,
+            options,
+        ));
+    }
+
+    let expected_residual = options.expect_residual.unwrap_or(0);
+    let mut ops_by_file: BTreeMap<String, Vec<PlannedOp>> = BTreeMap::new();
+    ops_by_file
+        .entry(definition.rel_path.clone())
+        .or_default()
+        .push(PlannedOp {
+            id: "change-signature-definition".into(),
+            range: parameter_range,
+            replacement: spec.new_parameters.as_bytes().to_vec(),
+        });
+    for (rel_path, ranges) in &call_ranges {
+        let snapshot = snapshots.get(rel_path).expect("loaded above");
+        for (index, &range) in ranges.iter().enumerate() {
+            let current =
+                std::str::from_utf8(&snapshot.content[range.0..range.1]).map_err(|e| {
+                    greppy_core::Error::Invalid(format!("call arguments are not UTF-8: {e}"))
+                })?;
+            let replacement =
+                rewrite_call_arguments(current, &old_names, &new_names, &spec.added_arguments)?;
+            ops_by_file
+                .entry(rel_path.clone())
+                .or_default()
+                .push(PlannedOp {
+                    id: format!("change-signature-call-{index}"),
+                    range,
+                    replacement: replacement.into_bytes(),
+                });
+        }
+    }
+
+    let mut reports = Vec::new();
+    let mut publications = Vec::new();
+    let mut valid = true;
+    for (rel_path, snapshot) in snapshots {
+        let ops = ops_by_file.remove(&rel_path).unwrap_or_default();
+        let plan = plan_semantic_file(
+            &rel_path,
+            snapshot,
+            ops,
+            language,
+            &format!("change-signature-{rel_path}"),
+            1,
+            options,
+        )?;
+        valid &= plan.valid;
+        if let Some(publication) = plan.publication {
+            publications.push(publication);
+        }
+        reports.push(plan.report);
+    }
+    let tx = format!(
+        "ge-signature-{}",
+        &sha256_hex(
+            format!(
+                "{symbol_name}:{}->{}",
+                spec.old_parameters, spec.new_parameters
+            )
+            .as_bytes()
+        )[..12]
+    );
+    let mut status = if valid {
+        Status::Applied
+    } else {
+        Status::InvalidResult
+    };
+    let mut published = false;
+    if status == Status::Applied && !options.dry_run {
+        match crate::journal::publish_journal(workspace_root, &tx, &publications) {
+            Ok(()) => published = true,
+            Err(error) => {
+                status = crate::certificate::publish_error_status(&error);
+                for report in &mut reports {
+                    report.file_sha256_after = None;
+                    report.guarantees.no_clobber = Guarantee::Failed;
+                    report.postconditions_passed = false;
+                }
+            }
+        }
+    }
+    if status == Status::Applied {
+        // Binding postcondition: count uncovered same-language calls only after
+        // the journal publish has completed (or against the dry-run workspace,
+        // where changing arguments cannot change call cardinality).
+        let workspace_calls = count_workspace_calls(workspace_root, language, symbol_name)?;
+        let residual_occurrences = workspace_calls.saturating_sub(actual_call_sites);
+        let passed = residual_occurrences == expected_residual;
+        for report in &mut reports {
+            report.residual_occurrences = Some(residual_occurrences);
+            report.postconditions_passed &= passed;
+            report.postconditions.push(PostconditionResult {
+                name: "residual-call-sites".into(),
+                passed,
+                detail: Some(format!(
+                    "expected {expected_residual} uncovered call site(s) of `{symbol_name}`, found {residual_occurrences}"
+                )),
+            });
+        }
+        if !passed {
+            status = Status::InvalidResult;
+        }
+    }
+
+    Ok(Certificate {
+        schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
+        status,
+        transaction_id: tx,
+        workspace: WorkspaceReport {
+            root: workspace_root.to_string_lossy().into_owned(),
+            git_head_before: None,
+            git_head_after: None,
+        },
+        operations: reports,
+        validators: vec![],
+        published,
+        publish_mode: if options.dry_run {
+            PublishMode::DryRun
+        } else {
+            PublishMode::Journal
+        },
+    })
+}
+
+#[derive(Debug)]
+struct ParameterDeclaration {
+    name: String,
+}
+
+fn parse_parameter_declarations(parameters: &str) -> Result<Vec<ParameterDeclaration>> {
+    let parts = split_delimited_list(parameters)?;
+    parts
+        .into_iter()
+        .filter(|part| !matches!(part.as_str(), "*" | "/"))
+        .map(|part| {
+            let name = parameter_name(&part).ok_or_else(|| {
+                greppy_core::Error::Invalid(format!(
+                    "cannot determine parameter name from `{part}`"
+                ))
+            })?;
+            Ok(ParameterDeclaration { name })
+        })
+        .collect()
+}
+
+fn parameter_name(parameter: &str) -> Option<String> {
+    let declaration = parameter
+        .split_once('=')
+        .map(|(left, _)| left)
+        .unwrap_or(parameter)
+        .trim();
+    if declaration == "self" || declaration.ends_with(" self") || declaration.contains("&self") {
+        return Some("self".into());
+    }
+    let before_type = declaration
+        .split_once(':')
+        .map(|(name, _)| name)
+        .unwrap_or(declaration)
+        .trim();
+    before_type
+        .trim_start_matches(['*', '&'])
+        .strip_prefix("mut ")
+        .unwrap_or_else(|| before_type.trim_start_matches(['*', '&']))
+        .split_whitespace()
+        .next()
+        .map(|name| name.trim_end_matches('?').to_string())
+        .filter(|name| !name.is_empty())
+}
+
+fn is_receiver_parameter(name: &str) -> bool {
+    name == "self" || name == "this"
+}
+
+fn split_delimited_list(list: &str) -> Result<Vec<String>> {
+    let trimmed = list.trim();
+    let (open, close) = match (trimmed.as_bytes().first(), trimmed.as_bytes().last()) {
+        (Some(b'('), Some(b')')) => (b'(', b')'),
+        _ => {
+            return Err(greppy_core::Error::Invalid(format!(
+                "expected a parenthesized list, got `{list}`"
+            )))
+        }
+    };
+    let _ = (open, close);
+    split_top_level(&trimmed[1..trimmed.len() - 1])
+}
+
+fn split_top_level(body: &str) -> Result<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut stack = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in body.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote.is_some() && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(current) = quote {
+            if current == ch {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '(' | '[' | '{' | '<' => stack.push(ch),
+            ')' | ']' | '}' | '>' if stack.pop().is_none() => {
+                return Err(greppy_core::Error::Invalid(
+                    "unbalanced list delimiter".into(),
+                ));
+            }
+            ')' | ']' | '}' | '>' => {}
+            ',' if stack.is_empty() => {
+                let part = body[start..index].trim();
+                if !part.is_empty() {
+                    parts.push(part.to_string());
+                }
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() || !stack.is_empty() {
+        return Err(greppy_core::Error::Invalid(
+            "unbalanced parameter or argument list".into(),
+        ));
+    }
+    let tail = body[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+    Ok(parts)
+}
+
+fn named_argument(argument: &str) -> Option<(&str, &str)> {
+    let (name, value) = argument.split_once('=')?;
+    let name = name.trim();
+    (!name.is_empty() && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_'))
+        .then_some((name, value.trim()))
+}
+
+fn rewrite_call_arguments(
+    arguments: &str,
+    old_names: &[String],
+    new_names: &[String],
+    added_arguments: &std::collections::BTreeMap<String, String>,
+) -> Result<String> {
+    let current = split_delimited_list(arguments)?;
+    let mut positional = current.iter().filter(|arg| named_argument(arg).is_none());
+    let named: std::collections::BTreeMap<&str, &str> = current
+        .iter()
+        .filter_map(|arg| named_argument(arg))
+        .collect();
+    let mut bound: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+    for name in old_names {
+        if let Some(value) = named.get(name.as_str()) {
+            bound.insert(name, format!("{name}={value}"));
+        } else if let Some(value) = positional.next() {
+            bound.insert(name, value.clone());
+        }
+    }
+    if positional.next().is_some()
+        || named
+            .keys()
+            .any(|name| !old_names.iter().any(|old| old == name))
+    {
+        return Err(greppy_core::Error::Invalid(format!(
+            "call `{arguments}` does not match the declared old signature"
+        )));
+    }
+    let rewritten: Vec<String> = new_names
+        .iter()
+        .map(|name| {
+            bound
+                .get(name.as_str())
+                .cloned()
+                .or_else(|| added_arguments.get(name).cloned())
+                .ok_or_else(|| {
+                    greppy_core::Error::Invalid(format!(
+                        "no call-site value available for parameter `{name}`"
+                    ))
+                })
+        })
+        .collect::<Result<_>>()?;
+    Ok(format!("({})", rewritten.join(", ")))
+}
+
+fn call_argument_sites(
+    language: Language,
+    content: &[u8],
+    scopes: &[(usize, usize)],
+    name: &[u8],
+) -> Option<Vec<(usize, usize)>> {
+    let tree = greppy_parser::parse(language, content).ok()?;
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut reached_root = false;
+    while !reached_root {
+        let node = cursor.node();
+        if let Some(arguments) = node.child_by_field_name("arguments") {
+            let inside_scope = scopes.iter().any(|&(start, end)| {
+                node.start_byte() >= start && node.end_byte() <= end.min(content.len())
+            });
+            let target = node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("name"));
+            let target_matches = target.is_some_and(|target| {
+                let mut target_cursor = target.walk();
+                let mut terminal = None;
+                loop {
+                    let current = target_cursor.node();
+                    if current.child_count() == 0 && current.kind().contains("identifier") {
+                        terminal = content.get(current.start_byte()..current.end_byte());
+                    }
+                    if target_cursor.goto_first_child() {
+                        continue;
+                    }
+                    loop {
+                        if target_cursor.goto_next_sibling() {
+                            break;
+                        }
+                        if !target_cursor.goto_parent() {
+                            return terminal == Some(name);
+                        }
+                    }
+                    if target_cursor.node() == target {
+                        return terminal == Some(name);
+                    }
+                }
+            });
+            if inside_scope && target_matches {
+                out.push((arguments.start_byte(), arguments.end_byte()));
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                reached_root = true;
+                break;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn count_workspace_calls(workspace_root: &Path, language: Language, name: &str) -> Result<usize> {
+    fn visit(dir: &Path, language: Language, name: &[u8]) -> Result<usize> {
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(dir).map_err(|source| greppy_core::Error::Io {
+            context: format!("read directory {}", dir.display()),
+            source,
+        })? {
+            let entry = entry.map_err(|source| greppy_core::Error::Io {
+                context: format!("read directory entry in {}", dir.display()),
+                source,
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| greppy_core::Error::Io {
+                context: format!("stat {}", path.display()),
+                source,
+            })?;
+            if file_type.is_dir() {
+                let dir_name = entry.file_name();
+                let dir_name = dir_name.to_string_lossy();
+                if matches!(
+                    dir_name.as_ref(),
+                    ".git" | ".greppy-edit-journal" | "target" | "node_modules" | ".venv" | "venv"
+                ) {
+                    continue;
+                }
+                count += visit(&path, language, name)?;
+            } else if file_type.is_file() && greppy_parser::language_for_path(&path) == language {
+                let content = std::fs::read(&path).map_err(|source| greppy_core::Error::Io {
+                    context: format!("read {}", path.display()),
+                    source,
+                })?;
+                count += call_argument_sites(language, &content, &[(0, usize::MAX)], name)
+                    .unwrap_or_default()
+                    .len();
+            }
+        }
+        Ok(count)
+    }
+    visit(workspace_root, language, name.as_bytes())
 }
 
 /// Smallest node covering `def_range` with the range's leading whitespace
@@ -1115,9 +1649,118 @@ pub fn signature_fingerprint(
 /// Cross-file rename input: per file, the byte spans in which identifier
 /// occurrences of the old name are AST-verified and renamed. Spans of
 /// `(0, usize::MAX)` mean "the whole file" (definition file, import lines).
+#[derive(Debug, Clone)]
 pub struct RenameFileScope {
     pub rel_path: String,
     pub spans: Vec<(usize, usize)>,
+}
+
+struct SemanticFilePlan {
+    report: OperationReport,
+    publication: Option<crate::journal::FilePublication>,
+    valid: bool,
+}
+
+fn plan_semantic_file(
+    rel_path: &str,
+    snapshot: Snapshot,
+    ops: Vec<PlannedOp>,
+    language: Language,
+    id: &str,
+    scope_matches: usize,
+    options: &VerbOptions,
+) -> Result<SemanticFilePlan> {
+    let applied = apply_in_memory(&snapshot, &ops)?;
+    let syntax_before = syntax_counts(language, &snapshot.content);
+    let syntax_after = syntax_counts(language, &applied.content);
+    let (syntax, applicable) = match (syntax_before, syntax_after) {
+        (Some(before), Some(after)) => (
+            SyntaxDelta {
+                errors_before: before.errors,
+                errors_after: after.errors,
+                new_errors: after.errors.saturating_sub(before.errors),
+                new_missing_nodes: after.missing.saturating_sub(before.missing),
+            },
+            true,
+        ),
+        _ => (
+            SyntaxDelta {
+                errors_before: 0,
+                errors_after: 0,
+                new_errors: 0,
+                new_missing_nodes: 0,
+            },
+            false,
+        ),
+    };
+    let syntax_ok = !applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
+    let isolation_ok = outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
+    let valid = syntax_ok && isolation_ok;
+    let target_before: Vec<u8> = ops
+        .iter()
+        .flat_map(|op| snapshot.content[op.range.0..op.range.1].iter().copied())
+        .collect();
+    let target_after: Vec<u8> = ops
+        .iter()
+        .flat_map(|op| op.replacement.iter().copied())
+        .collect();
+    let changed = !ops.is_empty() && applied.content != snapshot.content;
+    let report = OperationReport {
+        id: id.into(),
+        file: rel_path.into(),
+        selector_engine: SelectorEngine::Symbol,
+        selector_class: SelectorClass::Semantic,
+        scope_matches,
+        target_matches: ops.len(),
+        file_sha256_before: snapshot.file_sha256.clone(),
+        file_sha256_after: Some(applied.file_sha256.clone()),
+        target_sha256_before: sha256_hex(&target_before),
+        target_sha256_after: Some(sha256_hex(&target_after)),
+        outside_declared_ranges_unchanged: isolation_ok,
+        changed_byte_ranges: applied.changed_ranges.clone(),
+        node_before: None,
+        node_after: None,
+        unified_diff: (options.with_diff && changed)
+            .then(|| unified_diff(rel_path, &snapshot.content, &applied.content)),
+        syntax,
+        postconditions_passed: valid,
+        postconditions: vec![],
+        residual_occurrences: None,
+        guarantees: Guarantees {
+            addressed_range: if ops.is_empty() {
+                Guarantee::Failed
+            } else {
+                Guarantee::Proved
+            },
+            no_clobber: Guarantee::Proved,
+            byte_isolation: if isolation_ok {
+                Guarantee::Proved
+            } else {
+                Guarantee::Failed
+            },
+            syntax: if !applicable {
+                Guarantee::NotApplicable
+            } else if syntax_ok {
+                Guarantee::Proved
+            } else {
+                Guarantee::Failed
+            },
+            validators: Guarantee::NotApplicable,
+        },
+        formatter_expanded_change_scope: false,
+        store_refreshed: false,
+        candidates: vec![],
+    };
+    let publication = changed.then(|| crate::journal::FilePublication {
+        rel_path: rel_path.into(),
+        expected_live_sha256: snapshot.file_sha256,
+        content: applied.content,
+    });
+    Ok(SemanticFilePlan {
+        report,
+        publication,
+        valid,
+    })
 }
 
 fn identifier_name_occurrences(content: &[u8], name: &[u8]) -> usize {
@@ -1181,23 +1824,16 @@ fn count_workspace_residuals(
                 source,
             })?;
             let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|source| greppy_core::Error::Io {
-                    context: format!("stat {}", path.display()),
-                    source,
-                })?;
+            let file_type = entry.file_type().map_err(|source| greppy_core::Error::Io {
+                context: format!("stat {}", path.display()),
+                source,
+            })?;
             if file_type.is_dir() {
                 let dir_name = entry.file_name();
                 let dir_name = dir_name.to_string_lossy();
                 if matches!(
                     dir_name.as_ref(),
-                    ".git"
-                        | ".greppy-edit-journal"
-                        | "target"
-                        | "node_modules"
-                        | ".venv"
-                        | "venv"
+                    ".git" | ".greppy-edit-journal" | "target" | "node_modules" | ".venv" | "venv"
                 ) {
                     continue;
                 }
@@ -1238,164 +1874,134 @@ pub fn rename_symbol_files(
     to: &str,
     options: &VerbOptions,
 ) -> Result<Certificate> {
-    use crate::journal::FilePublication;
+    use std::collections::BTreeSet;
+
+    let tx = format!(
+        "ge-rename-{}",
+        &sha256_hex(format!("{from}->{to}").as_bytes())[..12]
+    );
     let residual_language = scopes
         .iter()
         .find(|scope| scope.spans.contains(&(0, usize::MAX)))
         .or_else(|| scopes.first())
         .map(|scope| greppy_parser::language_for_path(Path::new(&scope.rel_path)));
-    let mut op_reports = Vec::new();
-    let mut publications = Vec::new();
-    let mut total_sites = 0usize;
-    for scope in scopes {
-        let abs = workspace_root.join(&scope.rel_path);
-        let snapshot = Snapshot::read(&abs)?;
-        let language = greppy_parser::language_for_path(&abs);
-        let mut sites: Vec<(usize, usize)> = Vec::new();
-        for &(start, end) in &scope.spans {
-            let end = end.min(snapshot.content.len());
-            if let Some(mut found) =
-                identifier_sites(language, &snapshot.content, (start, end), from.as_bytes())
-            {
-                sites.append(&mut found);
-            }
-        }
-        sites.sort_unstable();
-        sites.dedup();
-        if sites.is_empty() {
-            continue;
-        }
-        total_sites += sites.len();
-        let ops: Vec<PlannedOp> = sites
-            .iter()
-            .enumerate()
-            .map(|(i, &(start, end))| PlannedOp {
-                id: format!("rename-{}-{i}", scope.rel_path),
-                range: (start, end),
-                replacement: to.as_bytes().to_vec(),
-            })
-            .collect();
-        let applied = apply_in_memory(&snapshot, &ops)?;
-        let syntax_before = syntax_counts(language, &snapshot.content);
-        let syntax_after = syntax_counts(language, &applied.content);
-        let (syntax, applicable) = match (syntax_before, syntax_after) {
-            (Some(b), Some(a)) => (
-                SyntaxDelta {
-                    errors_before: b.errors,
-                    errors_after: a.errors,
-                    new_errors: a.errors.saturating_sub(b.errors),
-                    new_missing_nodes: a.missing.saturating_sub(b.missing),
-                },
-                true,
-            ),
-            _ => (
-                SyntaxDelta {
-                    errors_before: 0,
-                    errors_after: 0,
-                    new_errors: 0,
-                    new_missing_nodes: 0,
-                },
-                false,
-            ),
-        };
-        let syntax_ok = !applicable || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0);
-        let isolation_ok = outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
-        if !syntax_ok || !isolation_ok {
-            return Ok(Certificate {
-                schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
-                status: Status::InvalidResult,
-                transaction_id: transaction_id(&snapshot.file_sha256, "rename"),
-                workspace: WorkspaceReport {
-                    root: workspace_root.to_string_lossy().into_owned(),
-                    git_head_before: None,
-                    git_head_after: None,
-                },
-                operations: op_reports,
-                validators: vec![],
-                published: false,
-                publish_mode: PublishMode::Journal,
-            });
-        }
-        op_reports.push(OperationReport {
-            id: format!("rename-{}", scope.rel_path),
-            file: scope.rel_path.clone(),
-            selector_engine: SelectorEngine::Symbol,
-            selector_class: SelectorClass::Resolved,
-            scope_matches: scope.spans.len(),
-            target_matches: sites.len(),
-            file_sha256_before: snapshot.file_sha256.clone(),
-            file_sha256_after: Some(applied.file_sha256.clone()),
-            target_sha256_before: String::new(),
-            target_sha256_after: None,
-            outside_declared_ranges_unchanged: isolation_ok,
-            changed_byte_ranges: applied.changed_ranges.clone(),
-            node_before: None,
-            node_after: None,
-            unified_diff: options
-                .with_diff
-                .then(|| unified_diff(&scope.rel_path, &snapshot.content, &applied.content)),
-            syntax,
-            postconditions_passed: true,
-            postconditions: vec![],
-            residual_occurrences: None,
-            guarantees: Guarantees {
-                addressed_range: Guarantee::Proved,
-                no_clobber: Guarantee::Proved,
-                byte_isolation: Guarantee::Proved,
-                syntax: if applicable {
-                    Guarantee::Proved
-                } else {
-                    Guarantee::NotApplicable
-                },
-                validators: Guarantee::NotApplicable,
-            },
-            formatter_expanded_change_scope: false,
-            store_refreshed: false,
-            candidates: vec![],
-        });
-        publications.push(FilePublication {
-            rel_path: scope.rel_path.clone(),
-            expected_live_sha256: snapshot.file_sha256.clone(),
-            content: applied.content,
-        });
-    }
-    if total_sites == 0 {
-        // nothing found anywhere: not-found (or already renamed)
+    let duplicate_paths = scopes
+        .iter()
+        .map(|scope| scope.rel_path.as_str())
+        .collect::<BTreeSet<_>>()
+        .len()
+        != scopes.len();
+    if scopes.is_empty() || duplicate_paths {
         let dummy = Snapshot {
             path: workspace_root.to_path_buf(),
             content: Vec::new(),
             file_sha256: String::new(),
         };
-        return Ok(single_refusal_certificate(
+        return Ok(single_status_certificate(
             workspace_root,
             &dummy,
             SelectorEngine::Symbol,
-            SelectorClass::Resolved,
-            Status::NotFound,
+            SelectorClass::Semantic,
+            if duplicate_paths {
+                Status::Ambiguous
+            } else {
+                Status::NotFound
+            },
+            scopes.len(),
             options,
         ));
     }
-    let tx = format!(
-        "ge-rename-{}",
-        &crate::hash::sha256_hex(format!("{from}->{to}").as_bytes())[..12]
-    );
-    let mut status = Status::Applied;
+
+    let mut reports = Vec::with_capacity(scopes.len());
+    let mut publications = Vec::new();
+    let mut missing_scope = false;
+    let mut already_renamed = true;
+    let mut all_valid = true;
+    for scope in scopes {
+        let abs = workspace_root.join(&scope.rel_path);
+        let snapshot = Snapshot::read(&abs)?;
+        let language = greppy_parser::language_for_path(&abs);
+        let mut sites = Vec::new();
+        let mut replacement_sites = Vec::new();
+        for &(start, end) in &scope.spans {
+            let range = (start, end.min(snapshot.content.len()));
+            if range.0 > range.1 {
+                continue;
+            }
+            if let Some(mut found) =
+                identifier_sites(language, &snapshot.content, range, from.as_bytes())
+            {
+                sites.append(&mut found);
+            }
+            if let Some(mut found) =
+                identifier_sites(language, &snapshot.content, range, to.as_bytes())
+            {
+                replacement_sites.append(&mut found);
+            }
+        }
+        sites.sort_unstable();
+        sites.dedup();
+        replacement_sites.sort_unstable();
+        replacement_sites.dedup();
+        missing_scope |= sites.is_empty();
+        already_renamed &= sites.is_empty() && !replacement_sites.is_empty();
+        let ops: Vec<PlannedOp> = sites
+            .iter()
+            .enumerate()
+            .map(|(index, &(start, end))| PlannedOp {
+                id: format!("rename-{}-{index}", scope.rel_path),
+                range: (start, end),
+                replacement: to.as_bytes().to_vec(),
+            })
+            .collect();
+        let plan = plan_semantic_file(
+            &scope.rel_path,
+            snapshot,
+            ops,
+            language,
+            &format!("rename-{}", scope.rel_path),
+            scope.spans.len(),
+            options,
+        )?;
+        all_valid &= plan.valid;
+        if let Some(publication) = plan.publication {
+            publications.push(publication);
+        }
+        reports.push(plan.report);
+    }
+
+    let mut status = if from == to || already_renamed {
+        Status::AlreadySatisfied
+    } else if missing_scope {
+        Status::NotFound
+    } else if !all_valid {
+        Status::InvalidResult
+    } else {
+        Status::Applied
+    };
     let mut published = false;
-    if !options.dry_run {
+    if status == Status::Applied && !options.dry_run {
         match crate::journal::publish_journal(workspace_root, &tx, &publications) {
             Ok(()) => published = true,
-            Err(e) => {
-                status = crate::certificate::publish_error_status(&e);
+            Err(error) => {
+                status = crate::certificate::publish_error_status(&error);
+                for report in &mut reports {
+                    report.file_sha256_after = None;
+                    report.guarantees.no_clobber = Guarantee::Failed;
+                    report.postconditions_passed = false;
+                }
             }
         }
     }
+
     if status == Status::Applied {
-        if let (Some(expected), Some(language)) = (options.expect_residual, residual_language) {
+        let expected = options.expect_residual.unwrap_or(0);
+        if let Some(language) = residual_language {
             let projected = options.dry_run.then_some(publications.as_slice());
             let residual_occurrences =
                 count_workspace_residuals(workspace_root, language, from, projected)?;
             let passed = residual_occurrences == expected;
-            for report in &mut op_reports {
+            for report in &mut reports {
                 report.residual_occurrences = Some(residual_occurrences);
                 report.postconditions_passed &= passed;
                 report.postconditions.push(PostconditionResult {
@@ -1411,6 +2017,7 @@ pub fn rename_symbol_files(
             }
         }
     }
+
     Ok(Certificate {
         schema_version: crate::certificate::CERTIFICATE_SCHEMA.into(),
         status,
@@ -1420,7 +2027,7 @@ pub fn rename_symbol_files(
             git_head_before: None,
             git_head_after: None,
         },
-        operations: op_reports,
+        operations: reports,
         validators: vec![],
         published,
         publish_mode: if options.dry_run {
@@ -1675,15 +2282,14 @@ fn run_pipeline(
         // Re-check the resolution-time hashes against the live file directly
         // before the publication CAS. The atomic publisher closes the smaller
         // race between this read and rename.
-        let planned_still_live = if options.planned_file_sha256.is_some()
-            || options.planned_target_sha256.is_some()
-        {
-            Snapshot::read(&snapshot.path)
-                .map(|live| planned_preconditions_hold(&live, options))
-                .unwrap_or(true)
-        } else {
-            true
-        };
+        let planned_still_live =
+            if options.planned_file_sha256.is_some() || options.planned_target_sha256.is_some() {
+                Snapshot::read(&snapshot.path)
+                    .map(|live| planned_preconditions_hold(&live, options))
+                    .unwrap_or(true)
+            } else {
+                true
+            };
         if !planned_still_live {
             status = Status::Stale;
         } else {
