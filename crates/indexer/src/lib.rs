@@ -1869,15 +1869,27 @@ fn resolve_file_imports(store: &mut Store, project: &str) -> Result<()> {
         if stem.contains('.') {
             continue; // dotted module namespace → not a file import
         }
-        let Some([file_id]) = index.files_by_stem.get(stem).map(Vec::as_slice) else {
-            continue; // no File, or an ambiguous stem — never guess
+        let target_id = if edge
+            .properties
+            .get("filesystem_module_import")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            index.resolve_filesystem_module_import(edge, stem)
+        } else {
+            match index.files_by_stem.get(stem).map(Vec::as_slice) {
+                Some([file_id]) => Some(*file_id),
+                _ => None,
+            }
         };
-        let file_id = *file_id;
+        let Some(target_id) = target_id else {
+            continue; // no target, or an ambiguous stem — never guess
+        };
         let Some(src) = index.by_qname(&edge.source_qualified_name) else {
             continue;
         };
-        if file_id != src.id {
-            resolved.push(new_edge(project, src.id, file_id, edge));
+        if target_id != src.id {
+            resolved.push(new_edge(project, src.id, target_id, edge));
         }
     }
     insert_edges_batched(store, &resolved)
@@ -2294,6 +2306,40 @@ impl GraphIndex {
         }
     }
 
+    /// Resolve a filesystem import to the required file's per-file Module
+    /// node. Ruby `require_relative` first gets an exact lexical path lookup;
+    /// bare `require` falls back to a unique file stem, preserving never-guess
+    /// behavior when multiple files share the stem.
+    fn resolve_filesystem_module_import(&self, edge: &ExtractedEdge, stem: &str) -> Option<i64> {
+        if edge
+            .properties
+            .get("ruby_require_relative")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+        {
+            let path = edge
+                .properties
+                .get("path")
+                .and_then(|value| value.as_str())?;
+            if let Some(qname) = relative_ruby_module_qname(&edge.file_path, path) {
+                if let Some(module) = self.by_qname(&qname) {
+                    if module.label == "Module" {
+                        return Some(module.id);
+                    }
+                }
+            }
+        }
+
+        note_edge_resolution_work(self.by_qname.len());
+        let mut matches = self
+            .by_qname
+            .values()
+            .filter(|node| node.label == "Module" && file_stem_matches(&node.file_path, stem))
+            .map(|node| node.id);
+        let target = matches.next()?;
+        matches.next().is_none().then_some(target)
+    }
+
     /// Resolve an imported symbol to a unique definition, using the use-
     /// `path`'s module segment to break a name tie. Mirrors
     /// `greppy_resolver::unique_def_named_with_path` exactly.
@@ -2316,6 +2362,35 @@ impl GraphIndex {
             None
         }
     }
+}
+
+/// Build the exact per-file Module qname targeted by Ruby
+/// `require_relative`. The path is resolved lexically against the importing
+/// file, without touching the filesystem, and an omitted extension means `.rb`.
+fn relative_ruby_module_qname(source_file: &str, import_path: &str) -> Option<String> {
+    let parent = Path::new(source_file)
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    let mut candidate = parent.join(import_path);
+    if candidate.extension().is_none() {
+        candidate.set_extension("rb");
+    }
+
+    let mut normalized = std::path::PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            std::path::Component::Normal(segment) => normalized.push(segment),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => return None,
+        }
+    }
+    let relative = normalized.to_str()?.replace('\\', "/");
+    Some(file_module_qname(&relative))
 }
 
 /// The qualified name of the per-file `Module` node. Kept byte-identical
@@ -2858,6 +2933,55 @@ mod tests {
         fs::write(tmp.join("src/lib.rs"), source).unwrap();
         fs::write(tmp.join("src/empty.txt"), "").unwrap();
         tmp
+    }
+
+    #[test]
+    fn ruby_relative_module_qname_normalizes_path_and_extension() {
+        assert_eq!(
+            relative_ruby_module_qname("src/app.rb", "../lib/helper"),
+            Some("lib/helper.rb::__file__".into())
+        );
+        assert_eq!(
+            relative_ruby_module_qname("app.rb", "./helper.rb"),
+            Some("helper.rb::__file__".into())
+        );
+        assert_eq!(relative_ruby_module_qname("app.rb", "../helper"), None);
+    }
+
+    #[test]
+    fn ruby_require_relative_targets_exact_file_module() {
+        let repo = std::env::temp_dir().join(format!(
+            "greppy-indexer-test-ruby-relative-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(repo.join("nested")).unwrap();
+        fs::write(repo.join("app.rb"), "require_relative './nested/helper'\n").unwrap();
+        fs::write(repo.join("helper.rb"), "module RootHelper\nend\n").unwrap();
+        fs::write(repo.join("nested/helper.rb"), "module NestedHelper\nend\n").unwrap();
+
+        let mut store = Store::open_memory().unwrap();
+        index(&mut store, &repo, "test").expect("index Ruby require_relative fixture");
+        let nested = store
+            .list_nodes_by_name("test", "helper", 10)
+            .unwrap()
+            .into_iter()
+            .find(|node| node.label == "Module" && node.file_path == "nested/helper.rb")
+            .expect("nested helper Module node");
+        let incoming = store
+            .incoming_edges(nested.id, Some("IMPORTS"), 10)
+            .unwrap();
+        assert_eq!(incoming.len(), 1, "exact module import edge: {incoming:?}");
+        let source = store
+            .get_node(incoming[0].source_id)
+            .unwrap()
+            .expect("import source Module");
+        assert_eq!(source.qualified_name, "app.rb::__file__");
+
+        fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]

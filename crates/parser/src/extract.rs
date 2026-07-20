@@ -3504,6 +3504,7 @@ fn extract_ruby(source: &[u8], file_path: &str) -> greppy_core::Result<Extractio
     // resolve the call to the owned singleton Method instead of its duplicate
     // free-Function facet.
     ruby_annotate_receiver_calls(source, root, file_path, &mut result);
+    ruby_annotate_require_imports(source, &mut result);
 
     // (2) Function-per-def + DEFINES_METHOD + Variable passes, walking the tree
     // once. `spec_definitions` already emitted the Method (owned) / Function
@@ -3575,6 +3576,39 @@ fn ruby_annotate_receiver_calls(
                 "receiver_owner".into(),
                 serde_json::Value::String(owner.to_string()),
             );
+        }
+    }
+}
+
+/// Mark Ruby `require` imports as file-module imports. `require_relative` also
+/// carries its relative-path semantics so the indexer can resolve the exact
+/// `<required-file>::__file__` Module node rather than guessing a definition
+/// whose spelling happens to match the file stem.
+fn ruby_annotate_require_imports(source: &[u8], result: &mut ExtractionResult) {
+    let lines: Vec<&[u8]> = source.split(|byte| *byte == b'\n').collect();
+    for edge in result
+        .edges
+        .iter_mut()
+        .filter(|edge| edge.edge_type == "IMPORTS")
+    {
+        let line = edge
+            .line
+            .checked_sub(1)
+            .and_then(|index| lines.get(index as usize))
+            .and_then(|line| std::str::from_utf8(line).ok())
+            .map(str::trim_start)
+            .unwrap_or("");
+        if let Some(properties) = edge.properties.as_object_mut() {
+            properties.insert(
+                "filesystem_module_import".into(),
+                serde_json::Value::Bool(true),
+            );
+            if line.starts_with("require_relative") {
+                properties.insert(
+                    "ruby_require_relative".into(),
+                    serde_json::Value::Bool(true),
+                );
+            }
         }
     }
 }
@@ -17251,6 +17285,32 @@ end
             imported.get("helper"),
             Some(&"./helper"),
             "helper require_relative: {imported:?}"
+        );
+        let helper = r
+            .edges
+            .iter()
+            .find(|edge| {
+                edge.edge_type == "IMPORTS"
+                    && edge
+                        .properties
+                        .get("imported_name")
+                        .and_then(|value| value.as_str())
+                        == Some("helper")
+            })
+            .expect("require_relative helper edge");
+        assert_eq!(
+            helper
+                .properties
+                .get("filesystem_module_import")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            helper
+                .properties
+                .get("ruby_require_relative")
+                .and_then(|value| value.as_bool()),
+            Some(true)
         );
     }
 

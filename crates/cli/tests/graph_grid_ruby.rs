@@ -213,23 +213,30 @@ fn graph_grid_ruby_callees_lists_cross_file_target() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "ruby graph gap: cross-file call+import usages not resolved"]
 fn graph_grid_ruby_find_usages_covers_call_and_import() {
     let (repo, store) = index_fixture("usages-call");
 
-    // `Helper` is both called (CALLS) and required (IMPORTS) cross-file.
-    let (code, out, err) = run(&["find-usages", "Helper"], &repo, &store);
+    // The qualified call resolves to the singleton method definition.
+    let (code, calls, err) = run(&["find-usages", "do_it"], &repo, &store);
     assert_eq!(
         code, 0,
-        "find-usages should exit 0; stderr={err}\nstdout={out}"
+        "find-usages do_it should exit 0; stderr={err}\nstdout={calls}"
     );
     assert!(
-        out.contains("CALLS") && out.contains("caller"),
-        "find-usages Helper must show CALLS edge to caller; got: {out:?}"
+        calls.contains("CALLS") && calls.contains("caller"),
+        "find-usages do_it must show CALLS edge from caller; got: {calls:?}"
+    );
+
+    // `require_relative 'helper'` loads the helper file, represented by its
+    // per-file Module node named `helper`.
+    let (code, imports, err) = run(&["find-usages", "helper"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "find-usages helper should exit 0; stderr={err}\nstdout={imports}"
     );
     assert!(
-        out.contains("IMPORTS") && out.contains("app.rb"),
-        "find-usages Helper must show IMPORTS edge from app.rb; got: {out:?}"
+        imports.contains("IMPORTS") && imports.contains("app.rb"),
+        "find-usages helper must show IMPORTS edge from app.rb; got: {imports:?}"
     );
 }
 
