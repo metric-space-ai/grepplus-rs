@@ -38,6 +38,9 @@ PROVIDER_EXTENSION = (
     else REPO_ROOT / "bench" / "agent_efficiency" / "minimax-provider.js"
 )
 TASK_SCHEMA_VERSION = "greppy.agent-coding-tasks.v1"
+TASK_SCHEMA_VERSION_V2 = "greppy.agent-coding-tasks.v2"
+FLASK_STALE_VENV_MARKER = "/validation-v2/venvs/flask/bin/"
+FLASK_LOCAL_PYTHON = ".tox/greppy-bench-venv/bin/python3"
 RESULT_SCHEMA_VERSION = "greppy.agent-coding-results.v1"
 MANIFEST_SCHEMA_VERSION = "greppy.agent-coding-manifest.v1"
 GATE_SCHEMA_VERSION = "greppy.agent-coding-gate.v4"
@@ -278,8 +281,12 @@ def validate_task_document(document: Any) -> list[dict[str, Any]]:
         raise HarnessError("task document must be an object")
     if set(document) != {"schema_version", "tasks"}:
         raise HarnessError("task document must contain only schema_version and tasks")
-    if document.get("schema_version") != TASK_SCHEMA_VERSION:
-        raise HarnessError(f"schema_version must be {TASK_SCHEMA_VERSION}")
+    schema_version = document.get("schema_version")
+    if schema_version not in (TASK_SCHEMA_VERSION, TASK_SCHEMA_VERSION_V2):
+        raise HarnessError(
+            f"schema_version must be {TASK_SCHEMA_VERSION} or {TASK_SCHEMA_VERSION_V2}"
+        )
+    is_v2 = schema_version == TASK_SCHEMA_VERSION_V2
     tasks = document.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         raise HarnessError("tasks must be a non-empty array")
@@ -289,17 +296,35 @@ def validate_task_document(document: Any) -> list[dict[str, Any]]:
         prefix = f"tasks[{index}]"
         if not isinstance(task, dict):
             raise HarnessError(f"{prefix} must be an object")
-        required = {
-            "id",
-            "repository",
-            "setup_commands",
-            "mutation_patch",
-            "user_task",
-            "test_command",
-            "timeout_seconds",
-        }
+        if is_v2:
+            required = {
+                "id",
+                "class",
+                "type",
+                "repository",
+                "setup_commands",
+                "test_patch",
+                "user_task",
+                "test_command",
+                "timeout_seconds",
+            }
+        else:
+            required = {
+                "id",
+                "repository",
+                "setup_commands",
+                "mutation_patch",
+                "user_task",
+                "test_command",
+                "timeout_seconds",
+            }
         if set(task) != required:
             raise HarnessError(f"{prefix} must contain exactly {sorted(required)}")
+        if is_v2:
+            if task.get("class") not in ("S", "M"):
+                raise HarnessError(f"{prefix}.class must be S or M")
+            if not isinstance(task.get("type"), str) or not task["type"].strip():
+                raise HarnessError(f"{prefix}.type must be a non-empty string")
         task_id = task["id"]
         if not isinstance(task_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", task_id):
             raise HarnessError(f"{prefix}.id is invalid")
@@ -319,7 +344,8 @@ def validate_task_document(document: Any) -> list[dict[str, Any]]:
             raise HarnessError(f"{prefix}.repository.url must not contain credentials, query, or fragment")
         if not isinstance(commit, str) or not re.fullmatch(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})", commit):
             raise HarnessError(f"{prefix}.repository.commit must be a full 40- or 64-hex object id")
-        for field in ("mutation_patch", "user_task"):
+        patch_field = "test_patch" if is_v2 else "mutation_patch"
+        for field in (patch_field, "user_task"):
             if not isinstance(task[field], str) or not task[field].strip():
                 raise HarnessError(f"{prefix}.{field} must be a non-empty string")
         setup_commands = task["setup_commands"]
@@ -340,6 +366,18 @@ def validate_task_document(document: Any) -> list[dict[str, Any]]:
         timeout = task["timeout_seconds"]
         if isinstance(timeout, bool) or not isinstance(timeout, int) or not 1 <= timeout <= 7200:
             raise HarnessError(f"{prefix}.timeout_seconds must be an integer from 1 to 7200")
+        if is_v2:
+            # Normalize: downstream patch application, cross-arm hash checks,
+            # and diff capture run on one field regardless of the bank.
+            task["mutation_patch"] = task["test_patch"]
+            task["task_bank"] = "v2"
+            # The validation stage recorded an absolute scratch-venv python for
+            # the flask tasks; rewrite it to the task-local venv the
+            # setup_commands create (load-time only — the bank file is pinned).
+            if command and FLASK_STALE_VENV_MARKER in command[0]:
+                task["test_command"] = [FLASK_LOCAL_PYTHON, *command[1:]]
+        else:
+            task["task_bank"] = "v1"
     return tasks
 
 
@@ -808,23 +846,29 @@ def run_mutation_preflight(
 
         test_env = environment_without_provider_key()
         test_env["GREPPY_STORE_DIR"] = str(preflight_store)
-        clean_result = run_process(
-            task["test_command"],
-            cwd=worktree,
-            timeout_seconds=task["timeout_seconds"],
-            env=test_env,
-        )
-        clean_output = redact(clean_result.stdout + clean_result.stderr, secrets)
-        atomic_write_bytes(raw_dir / "preflight-clean-test.log", clean_output)
-        clean_summary = process_summary(clean_result, clean_output)
-        if clean_result.timed_out or clean_result.returncode != 0:
-            return {
-                "valid": False,
-                "failure_kind": "clean_source_test_failed",
-                "setup": setup,
-                "clean_test": clean_summary,
-                "mutated_test": None,
-            }
+        if task.get("task_bank") == "v2":
+            # v2 real-commit tasks: the deciding tests arrive WITH the test
+            # patch, so there is no clean-source pass to prove. The proof is
+            # solely that the patched tests fail before the agent works.
+            clean_summary = None
+        else:
+            clean_result = run_process(
+                task["test_command"],
+                cwd=worktree,
+                timeout_seconds=task["timeout_seconds"],
+                env=test_env,
+            )
+            clean_output = redact(clean_result.stdout + clean_result.stderr, secrets)
+            atomic_write_bytes(raw_dir / "preflight-clean-test.log", clean_output)
+            clean_summary = process_summary(clean_result, clean_output)
+            if clean_result.timed_out or clean_result.returncode != 0:
+                return {
+                    "valid": False,
+                    "failure_kind": "clean_source_test_failed",
+                    "setup": setup,
+                    "clean_test": clean_summary,
+                    "mutated_test": None,
+                }
 
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
         mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
@@ -840,7 +884,7 @@ def run_mutation_preflight(
     valid = not mutated_result.timed_out and mutated_result.returncode not in (None, 0)
     return {
         "valid": valid,
-        "failure_kind": None if valid else "mutation_test_did_not_fail",
+        "failure_kind": None if valid else ("patched_test_did_not_fail" if task.get("task_bank") == "v2" else "mutation_test_did_not_fail"),
         "setup": setup,
         "clean_test": clean_summary,
         "mutated_test": mutated_summary,
@@ -1106,6 +1150,7 @@ def task_manifest_entry(task: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": task["id"],
         "repository": task["repository"],
+        "task_bank": task.get("task_bank", "v1"),
         "mutation_patch_sha256": sha256_text(task["mutation_patch"]),
         "user_task_sha256": sha256_text(task["user_task"]),
         "setup_commands_sha256": sha256_bytes(canonical_json_bytes(task["setup_commands"])),

@@ -544,5 +544,49 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(metrics["source_opens"], 1)
 
 
+class TaskBankV2Tests(unittest.TestCase):
+    def _v2_doc(self, **overrides):
+        task = {
+            "id": "hugo-reported-bugfix-abc123",
+            "class": "S",
+            "type": "reported-bugfix",
+            "repository": {"url": "https://github.com/gohugoio/hugo", "commit": "a" * 40},
+            "setup_commands": [],
+            "test_patch": "diff --git a/x_test.go b/x_test.go\n+test\n",
+            "user_task": "Fix the reported behavior.",
+            "test_command": ["go", "test", "./..."],
+            "timeout_seconds": 1800,
+        }
+        task.update(overrides)
+        return {"schema_version": "greppy.agent-coding-tasks.v2", "tasks": [task]}
+
+    def test_v2_document_validates_and_normalizes(self):
+        tasks = bench.validate_task_document(self._v2_doc())
+        self.assertEqual(tasks[0]["task_bank"], "v2")
+        self.assertEqual(tasks[0]["mutation_patch"], tasks[0]["test_patch"])
+
+    def test_v2_rejects_mutation_patch_field(self):
+        doc = self._v2_doc()
+        doc["tasks"][0]["mutation_patch"] = "x"
+        with self.assertRaises(bench.HarnessError):
+            bench.validate_task_document(doc)
+
+    def test_v2_rewrites_stale_flask_venv_python(self):
+        stale = "/private/tmp/whatever/validation-v2/venvs/flask/bin/python3"
+        doc = self._v2_doc(test_command=[stale, "-m", "pytest", "-q"])
+        tasks = bench.validate_task_document(doc)
+        self.assertEqual(
+            tasks[0]["test_command"][0], bench.FLASK_LOCAL_PYTHON
+        )
+
+    def test_v1_documents_still_validate(self):
+        doc = self._v2_doc()
+        doc["schema_version"] = "greppy.agent-coding-tasks.v1"
+        t = doc["tasks"][0]
+        del t["class"]; del t["type"]
+        t["mutation_patch"] = t.pop("test_patch")
+        tasks = bench.validate_task_document(doc)
+        self.assertEqual(tasks[0]["task_bank"], "v1")
+
 if __name__ == "__main__":
     unittest.main()
