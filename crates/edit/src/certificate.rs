@@ -188,27 +188,35 @@ impl Certificate {
     }
 
     /// Render the stdout form of a certificate. Evidence that is expensive in
-    /// an agent context window is omitted, while the resulting target span is
-    /// retained in bounded form; `--report` continues to use the full
+    /// an agent context window is omitted. A bounded `result_span` is retained
+    /// only when this certificate proves that publication actually completed;
+    /// refused, validation-only, patch, and dry-run projections never present
+    /// planned text as a written result. `--report` continues to use the full
     /// `Serialize` form.
     pub fn to_compact_json_pretty(&self) -> serde_json::Result<String> {
         let mut value = serde_json::to_value(self)?;
+        let include_result_span = self.status == Status::Applied && self.published;
         if let Some(root) = value.as_object_mut() {
             root.insert("exit_code".into(), serde_json::json!(self.exit_code()));
             root.remove("validators");
             if let Some(operations) = root.get_mut("operations").and_then(|v| v.as_array_mut()) {
                 for operation in operations {
                     if let Some(operation) = operation.as_object_mut() {
-                        let result_span = operation
-                            .get("node_after")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or_default();
-                        let (result_span, truncated, total_bytes) =
-                            bounded_result_span(result_span);
-                        operation.insert("result_span".into(), result_span.into());
-                        if truncated {
-                            operation.insert("result_span_truncated".into(), true.into());
-                            operation.insert("result_span_total_bytes".into(), total_bytes.into());
+                        if include_result_span {
+                            if let Some(result_span) =
+                                operation.get("node_after").and_then(|value| value.as_str())
+                            {
+                                let (result_span, truncated, total_bytes) =
+                                    bounded_result_span(result_span);
+                                operation.insert("result_span".into(), result_span.into());
+                                if truncated {
+                                    operation.insert("result_span_truncated".into(), true.into());
+                                    operation.insert(
+                                        "result_span_total_bytes".into(),
+                                        total_bytes.into(),
+                                    );
+                                }
+                            }
                         }
                         operation.remove("node_before");
                         operation.remove("node_after");
@@ -366,6 +374,21 @@ mod tests {
             full["operations"][0]["postconditions"][0]["detail"],
             "expected 0, found 1"
         );
+    }
+
+    #[test]
+    fn compact_refusal_omits_planned_result_span_and_truncation_fields() {
+        let mut certificate = sample_certificate("x".repeat(2001));
+        certificate.status = Status::Stale;
+        certificate.published = false;
+
+        let compact: serde_json::Value =
+            serde_json::from_str(&certificate.to_compact_json_pretty().unwrap()).unwrap();
+        let operation = &compact["operations"][0];
+        assert!(operation.get("result_span").is_none());
+        assert!(operation.get("result_span_truncated").is_none());
+        assert!(operation.get("result_span_total_bytes").is_none());
+        assert!(operation.get("node_after").is_none());
     }
 
     #[test]

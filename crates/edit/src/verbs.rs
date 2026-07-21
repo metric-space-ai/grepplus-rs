@@ -1763,7 +1763,12 @@ fn plan_semantic_file(
         outside_declared_ranges_unchanged: isolation_ok,
         changed_byte_ranges: applied.changed_ranges.clone(),
         node_before: None,
-        node_after: String::from_utf8(target_after.clone()).ok(),
+        node_after: result_span_after_mutations_public(
+            &snapshot.content,
+            &applied.content,
+            &ops,
+            isolation_ok,
+        ),
         unified_diff: (options.with_diff && changed)
             .then(|| unified_diff(rel_path, &snapshot.content, &applied.content)),
         syntax,
@@ -2313,8 +2318,9 @@ fn run_pipeline(
     let syntax_ok = (!syntax_applicable
         || (syntax.new_errors == 0 && syntax.new_missing_nodes == 0))
         && structure_ok;
-    let isolation_ok =
-        formatter_expanded || outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
+    let declared_ranges_unchanged =
+        outside_ranges_unchanged(&snapshot.content, &applied.content, &ops);
+    let isolation_ok = formatter_expanded || declared_ranges_unchanged;
 
     let target_before = ops
         .first()
@@ -2323,9 +2329,12 @@ fn run_pipeline(
     let node_before = ops
         .first()
         .and_then(|op| String::from_utf8(snapshot.content[op.range.0..op.range.1].to_vec()).ok());
-    let node_after = ops
-        .first()
-        .and_then(|op| String::from_utf8(op.replacement.clone()).ok());
+    let node_after = result_span_after_mutations_public(
+        &snapshot.content,
+        &applied.content,
+        &ops,
+        declared_ranges_unchanged,
+    );
 
     let mut status = if !syntax_ok || !isolation_ok {
         Status::InvalidResult
@@ -2540,6 +2549,27 @@ fn transaction_id(before: &str, after: &str) -> String {
         "ge-{}",
         &sha256_hex(format!("{before}:{after}").as_bytes())[..16]
     )
+}
+
+/// Return the actual after-image corresponding to the smallest original span
+/// that contains every mutation. For cardinality N this deliberately includes
+/// unchanged bytes between ranges instead of concatenating unrelated
+/// replacements without context. The mapping is valid only when bytes outside
+/// the declared ranges remained unchanged.
+pub(crate) fn result_span_after_mutations_public(
+    before: &[u8],
+    after: &[u8],
+    mutations: &[PlannedOp],
+    outside_unchanged: bool,
+) -> Option<String> {
+    if mutations.is_empty() || !outside_unchanged {
+        return None;
+    }
+    let start = mutations.iter().map(|mutation| mutation.range.0).min()?;
+    let end = mutations.iter().map(|mutation| mutation.range.1).max()?;
+    let unchanged_suffix = before.len().checked_sub(end)?;
+    let after_end = after.len().checked_sub(unchanged_suffix)?;
+    String::from_utf8(after.get(start..after_end)?.to_vec()).ok()
 }
 
 /// Minimal unified diff (line-based) for the certificate. Precise byte

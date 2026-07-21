@@ -857,7 +857,14 @@ fn projected_report(
             .map(|mutation| mutation.range)
             .collect(),
         node_before: String::from_utf8(planned.target_before.clone()).ok(),
-        node_after: String::from_utf8(planned.target_after.clone()).ok(),
+        node_after: projection.and_then(|projection| {
+            crate::verbs::result_span_after_mutations_public(
+                &snapshot.content,
+                &projection.applied.content,
+                &planned.mutations,
+                projection.isolation_ok,
+            )
+        }),
         unified_diff,
         syntax,
         postconditions_passed,
