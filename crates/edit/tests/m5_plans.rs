@@ -292,6 +292,52 @@ fn active_lock_fails_immediately_and_dead_pid_lock_is_taken_over() {
 }
 
 #[test]
+fn completed_plan_survives_journal_cleanup_failure_without_rollback() {
+    let _guard = serial();
+    const CLEANUP_FAILURE_ENV: &str = "GREPPY_EDIT_TEST_JOURNAL_CLEANUP_FAILURE";
+    let workspace = tempfile::tempdir().unwrap();
+    let first = workspace.path().join("first.txt");
+    let second = workspace.path().join("second.txt");
+    std::fs::write(&first, b"first-before").unwrap();
+    std::fs::write(&second, b"second-before").unwrap();
+    let plan = journal_plan(
+        workspace.path(),
+        vec![
+            text_operation(
+                "first-operation",
+                "first.txt",
+                "before",
+                "after",
+                sha256(b"first-before"),
+            ),
+            text_operation(
+                "second-operation",
+                "second.txt",
+                "before",
+                "after",
+                sha256(b"second-before"),
+            ),
+        ],
+    );
+
+    std::env::set_var(CLEANUP_FAILURE_ENV, "1");
+    let certificate = apply_plan(&plan, false).unwrap();
+    std::env::remove_var(CLEANUP_FAILURE_ENV);
+
+    assert_eq!(certificate.status, Status::Applied, "{certificate:#?}");
+    assert!(certificate.published);
+    assert_eq!(std::fs::read(&first).unwrap(), b"first-after");
+    assert_eq!(std::fs::read(&second).unwrap(), b"second-after");
+    assert!(workspace.path().join(".greppy-edit-journal").exists());
+
+    let report = recover_with_report(workspace.path()).unwrap();
+    assert_eq!(report.action, RecoveryAction::NothingToRecover);
+    assert_eq!(std::fs::read(first).unwrap(), b"first-after");
+    assert_eq!(std::fs::read(second).unwrap(), b"second-after");
+    assert!(!workspace.path().join(".greppy-edit-journal").exists());
+}
+
+#[test]
 fn explicit_recover_reports_and_restores_interrupted_publish() {
     let _guard = serial();
     const CRASH_AFTER_ENV: &str = "GREPPY_EDIT_TEST_JOURNAL_CRASH_AFTER";

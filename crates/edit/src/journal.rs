@@ -6,13 +6,14 @@
 //! 3. write the journal: per file the pre-image bytes + both hashes,
 //!    fsynced, then mark it `committed`
 //! 4. publish every file atomically (tmp+fsync+rename)
-//! 5. remove the journal (success) — or roll back every already-published
-//!    file from its pre-image and remove the journal (failure)
+//! 5. atomically mark the journal `completed`, making rollback impossible
+//! 6. remove the journal directory as best-effort cleanup
 //!
 //! A crash between 3 and 5 leaves a committed journal on disk;
 //! `greppy edit recover` restores every pre-image and removes it. A crash
 //! before the `committed` marker means nothing was published; the journal
-//! is discarded.
+//! is discarded. A completed journal is cleanup-only and never restores
+//! pre-images.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -28,6 +29,7 @@ use greppy_core::{Error, Result};
 const JOURNAL_DIR: &str = ".greppy-edit-journal";
 const LOCK_NAME: &str = ".greppy-edit.lock";
 const CRASH_AFTER_ENV: &str = "GREPPY_EDIT_TEST_JOURNAL_CRASH_AFTER";
+const CLEANUP_FAILURE_ENV: &str = "GREPPY_EDIT_TEST_JOURNAL_CLEANUP_FAILURE";
 const LOCK_STALE_AFTER_SECS: u64 = 600;
 static LOCK_NONCE: AtomicU64 = AtomicU64::new(1);
 
@@ -44,6 +46,8 @@ pub struct Journal {
     pub schema_version: String,
     pub transaction_id: String,
     pub committed: bool,
+    #[serde(default)]
+    pub completed: bool,
     pub entries: Vec<JournalEntry>,
 }
 
@@ -272,6 +276,23 @@ fn crash_after(boundary: &str) -> Result<()> {
     Ok(())
 }
 
+fn cleanup_journal_dir(dir: &Path) -> std::io::Result<()> {
+    if std::env::var_os(CLEANUP_FAILURE_ENV).is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected journal cleanup failure",
+        ));
+    }
+    std::fs::remove_dir_all(dir)
+}
+
+fn warn_cleanup_failure(dir: &Path, error: &std::io::Error) {
+    eprintln!(
+        "warning: edit transaction completed, but journal cleanup failed for {}: {error}",
+        dir.display()
+    );
+}
+
 /// Publish `files` as one logical transaction. Returns the transaction id.
 pub fn publish_journal(
     workspace_root: &Path,
@@ -342,6 +363,7 @@ pub(crate) fn publish_journal_locked(
         schema_version: "greppy.edit-journal.v1".into(),
         transaction_id: transaction_id.to_string(),
         committed: false,
+        completed: false,
         entries,
     };
     write_journal(workspace_root, &journal)?;
@@ -387,11 +409,23 @@ pub(crate) fn publish_journal_locked(
         let _ = std::fs::remove_dir_all(&dir);
         return Err(e);
     }
-    std::fs::remove_dir_all(&dir).map_err(|source| Error::Io {
-        context: format!("remove journal {}", dir.display()),
-        source,
-    })?;
-    crash_after("journal-removed")?;
+    // Every target now carries its post-image. From this point onward recovery
+    // must never restore pre-images. Persist that phase transition atomically
+    // before attempting best-effort directory cleanup. Even if writing the
+    // marker fails, recovery also recognizes an all-post-image journal as
+    // completed.
+    journal.completed = true;
+    if let Err(error) = write_journal(workspace_root, &journal) {
+        eprintln!(
+            "warning: edit transaction completed, but the journal completion marker could not be written: {error}"
+        );
+    }
+    if let Err(error) = cleanup_journal_dir(&dir) {
+        warn_cleanup_failure(&dir, &error);
+    }
+    // Fault injection after the point of no return must not turn a completed
+    // publication into a false PublishFailed certificate.
+    let _ = crash_after("journal-removed");
     Ok(())
 }
 
@@ -496,6 +530,19 @@ pub fn recover_with_report(workspace_root: &Path) -> Result<RecoveryReport> {
         })?)
         .map_err(|e| Error::Invalid(format!("journal unreadable: {e}")))?;
     let dir = journal_dir(workspace_root);
+    if journal.completed {
+        if let Err(error) = cleanup_journal_dir(&dir) {
+            warn_cleanup_failure(&dir, &error);
+        }
+        return Ok(RecoveryReport {
+            found_journal: true,
+            committed: true,
+            action: RecoveryAction::NothingToRecover,
+            transaction_id: Some(journal.transaction_id),
+            files_considered: journal.entries.len(),
+            files_restored: 0,
+        });
+    }
     if !journal.committed {
         let transaction_id = Some(journal.transaction_id);
         let files_considered = journal.entries.len();
@@ -512,12 +559,41 @@ pub fn recover_with_report(workspace_root: &Path) -> Result<RecoveryReport> {
             files_restored: 0,
         });
     }
+
+    let live_hashes: Vec<String> = journal
+        .entries
+        .iter()
+        .map(|entry| {
+            std::fs::read(workspace_root.join(&entry.rel_path))
+                .map(|bytes| sha256_hex(&bytes))
+                .unwrap_or_default()
+        })
+        .collect();
+    // A process can stop after publishing the final file but before persisting
+    // `completed`. All post-images are sufficient proof that publication
+    // reached its point of no return; such a journal is cleanup-only.
+    if journal
+        .entries
+        .iter()
+        .zip(&live_hashes)
+        .all(|(entry, live_sha)| live_sha == &entry.post_sha256)
+    {
+        if let Err(error) = cleanup_journal_dir(&dir) {
+            warn_cleanup_failure(&dir, &error);
+        }
+        return Ok(RecoveryReport {
+            found_journal: true,
+            committed: true,
+            action: RecoveryAction::NothingToRecover,
+            transaction_id: Some(journal.transaction_id),
+            files_considered: journal.entries.len(),
+            files_restored: 0,
+        });
+    }
+
     let mut restored = 0usize;
-    for entry in &journal.entries {
+    for (entry, live_sha) in journal.entries.iter().zip(live_hashes) {
         let abs = workspace_root.join(&entry.rel_path);
-        let live_sha = std::fs::read(&abs)
-            .map(|b| sha256_hex(&b))
-            .unwrap_or_default();
         if live_sha == entry.pre_sha256 {
             continue; // this file was never published
         }
@@ -607,22 +683,33 @@ mod tests {
     }
 
     #[test]
-    fn recover_restores_committed_journal() {
+    fn recover_restores_partially_published_committed_journal() {
         let dir = ws();
-        std::fs::write(dir.path().join("a.txt"), b"a2").unwrap(); // post-image
+        std::fs::write(dir.path().join("a.txt"), b"a2").unwrap(); // published post-image
+        std::fs::write(dir.path().join("b.txt"), b"b1").unwrap(); // not yet published
         let jd = journal_dir(dir.path());
         std::fs::create_dir_all(&jd).unwrap();
         std::fs::write(jd.join("pre-0000.bin"), b"a1").unwrap();
+        std::fs::write(jd.join("pre-0001.bin"), b"b1").unwrap();
         let journal = Journal {
             schema_version: "greppy.edit-journal.v1".into(),
             transaction_id: "tx-crash".into(),
             committed: true,
-            entries: vec![JournalEntry {
-                rel_path: "a.txt".into(),
-                pre_image_file: "pre-0000.bin".into(),
-                pre_sha256: sha256_hex(b"a1"),
-                post_sha256: sha256_hex(b"a2"),
-            }],
+            completed: false,
+            entries: vec![
+                JournalEntry {
+                    rel_path: "a.txt".into(),
+                    pre_image_file: "pre-0000.bin".into(),
+                    pre_sha256: sha256_hex(b"a1"),
+                    post_sha256: sha256_hex(b"a2"),
+                },
+                JournalEntry {
+                    rel_path: "b.txt".into(),
+                    pre_image_file: "pre-0001.bin".into(),
+                    pre_sha256: sha256_hex(b"b1"),
+                    post_sha256: sha256_hex(b"b2"),
+                },
+            ],
         };
         write_journal(dir.path(), &journal).unwrap();
         let out = recover(dir.path()).unwrap();
@@ -647,6 +734,7 @@ mod tests {
             schema_version: "greppy.edit-journal.v1".into(),
             transaction_id: "tx-crash".into(),
             committed: true,
+            completed: false,
             entries: vec![JournalEntry {
                 rel_path: "a.txt".into(),
                 pre_image_file: "pre-0000.bin".into(),

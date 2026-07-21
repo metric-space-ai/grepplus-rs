@@ -12,7 +12,6 @@ const BOUNDARIES: &[&str] = &[
     "journal-committed",
     "published-0",
     "published-1",
-    "journal-removed",
 ];
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -53,7 +52,9 @@ fn recover_restores_consistency_after_every_journal_boundary() {
         recover(workspace.path()).unwrap();
         let live_a = std::fs::read(&a).unwrap();
         let live_b = std::fs::read(&b).unwrap();
-        if *boundary == "journal-removed" {
+        if *boundary == "published-1" {
+            // Once every post-image is live, recovery treats the transaction as
+            // completed even if the explicit completion marker was not written.
             assert_eq!(live_a, b"a-after", "boundary {boundary}");
             assert_eq!(live_b, b"b-after", "boundary {boundary}");
         } else {
