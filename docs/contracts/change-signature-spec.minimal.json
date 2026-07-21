@@ -1,0 +1,8 @@
+{
+  "old_parameters": "(value: Type)",
+  "new_parameters": "(value: Type, added: Type)",
+  "added_arguments": {
+    "added": "expression"
+  },
+  "expect_call_sites": 1
+}

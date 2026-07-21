@@ -1,0 +1,27 @@
+{
+  "schema_version": "greppy.edit-plan.v1",
+  "workspace": {
+    "root": "."
+  },
+  "operations": [
+    {
+      "id": "replace-once",
+      "file": "path/to/file.txt",
+      "selector": {
+        "engine": "text",
+        "old_text": "OLD",
+        "expect": 1
+      },
+      "action": {
+        "type": "replace",
+        "content": "NEW"
+      },
+      "preconditions": {
+        "file_sha256": "<sha256-of-current-file>"
+      }
+    }
+  ],
+  "publish": {
+    "mode": "journal"
+  }
+}

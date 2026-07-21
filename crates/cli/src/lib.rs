@@ -6949,6 +6949,11 @@ fn line_range_to_bytes(content: &[u8], start_line: usize, end_line: usize) -> (u
     (start, end)
 }
 
+const MINIMAL_EDIT_PLAN_EXAMPLE: &str =
+    include_str!("../../../docs/contracts/edit-plan.minimal.json");
+const MINIMAL_CHANGE_SIGNATURE_EXAMPLE: &str =
+    include_str!("../../../docs/contracts/change-signature-spec.minimal.json");
+
 /// `greppy edit`: dispatch to the transactional verbs; print the
 /// certificate; map its status to the registered exit code.
 /// Read an edit source argument: a file path, or `-` for stdin (agents
@@ -7264,7 +7269,8 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             let spec: greppy_edit::verbs::ChangeSignatureSpec = serde_json::from_slice(&spec_bytes)
                 .map_err(|error| {
                     Error::Invalid(format!(
-                        "change-signature --spec {spec} is not valid JSON: {error}"
+                        "change-signature --spec {spec} is invalid: {error}\nminimal complete example:\n{}",
+                        MINIMAL_CHANGE_SIGNATURE_EXAMPLE.trim()
                     ))
                 })?;
             match resolve_edit_target(Some(&symbol), None, root, &root_path)? {
@@ -7598,8 +7604,12 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
                 context: format!("read {plan}"),
                 source,
             })?;
-            let mut parsed: greppy_edit::plan::Plan = serde_json::from_str(&text)
-                .map_err(|e| Error::Invalid(format!("plan invalid: {e}")))?;
+            let mut parsed: greppy_edit::plan::Plan = serde_json::from_str(&text).map_err(|error| {
+                Error::Invalid(format!(
+                    "plan invalid: {error}\nminimal complete example:\n{}",
+                    MINIMAL_EDIT_PLAN_EXAMPLE.trim()
+                ))
+            })?;
             if parsed.workspace.root.is_empty() || parsed.workspace.root == "." {
                 parsed.workspace.root = root_path.to_string_lossy().into_owned();
             }
