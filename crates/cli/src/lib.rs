@@ -10867,6 +10867,28 @@ fn search_symbols_json(
     Ok(())
 }
 
+fn print_search_code_no_matches(query: &str, path_filters: &QueryPathFilters) {
+    println!("(no matches)");
+    println!("query_interpreted_as: literal");
+    if path_filters.is_empty() {
+        println!("path_filters: <none>");
+    } else {
+        println!("path_filters: {}", path_filters.shown());
+    }
+    if query
+        .chars()
+        .any(|character| ".^$*+?()[]{}|\\".contains(character))
+    {
+        println!("hint: regex metacharacters are literal in search-code");
+        let mut retry = format!("greppy rg {}", shell_example_arg(query));
+        for filter in &path_filters.filters {
+            retry.push(' ');
+            retry.push_str(&shell_example_arg(&filter.shown));
+        }
+        println!("try: {retry}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_search_code(
     query: Option<&str>,
@@ -10949,7 +10971,7 @@ fn dispatch_search_code(
                 &path_filters,
             )?;
         } else if shown_hits.is_empty() {
-            println!("(no matches under path filter: {})", path_filters.shown());
+            print_search_code_no_matches(q, &path_filters);
         } else {
             for hit in &shown_hits {
                 println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
@@ -10982,7 +11004,7 @@ fn dispatch_search_code(
                 &path_filters,
             )?;
         } else if shown_hits.is_empty() {
-            println!("(no matches)");
+            print_search_code_no_matches(q, &path_filters);
         } else {
             for hit in &shown_hits {
                 println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
@@ -11091,7 +11113,7 @@ fn dispatch_search_code_changed(
     }
 
     if shown_hits.is_empty() {
-        println!("(no matches)");
+        print_search_code_no_matches(query, path_filters);
         return Ok(0);
     }
     for h in &shown_hits {
@@ -11173,7 +11195,7 @@ fn dispatch_search_code_staged(
     }
 
     if shown_hits.is_empty() {
-        println!("(no matches)");
+        print_search_code_no_matches(query, path_filters);
         return Ok(0);
     }
     for h in &shown_hits {
@@ -11292,7 +11314,7 @@ fn dispatch_search_code_diff_scope(
     }
 
     if shown_hits.is_empty() {
-        println!("(no matches)");
+        print_search_code_no_matches(query, path_filters);
         return Ok(0);
     }
     for h in &shown_hits {
@@ -12424,7 +12446,7 @@ fn live_grep_search_code(
             .map_err(|error| Error::Invalid(format!("serialize live search-code JSON: {error}")))?
         );
     } else if shown == 0 {
-        println!("(no matches)");
+        print_search_code_no_matches(query, &QueryPathFilters::default());
     } else {
         for hit in &hits[..shown] {
             println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
@@ -12473,7 +12495,7 @@ fn live_grep_search_code_filtered(
             .map_err(|error| Error::Invalid(format!("serialize live search-code JSON: {error}")))?
         );
     } else if shown == 0 {
-        println!("(no matches under path filter: {})", path_filters.shown());
+        print_search_code_no_matches(query, path_filters);
     } else {
         for hit in &hits[..shown] {
             println!("{}  {}", hit.location, clamp_snippet(&hit.snippet));
