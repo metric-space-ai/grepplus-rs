@@ -101,6 +101,7 @@ struct CliInferenceOverride {
 thread_local! {
     static CLI_INFERENCE_OVERRIDE: std::cell::RefCell<CliInferenceOverride> =
         std::cell::RefCell::new(CliInferenceOverride::default());
+    static CLI_RESULT_LIMIT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 fn set_cli_inference_override(device: Option<String>, no_gpu: bool) {
@@ -111,6 +112,24 @@ fn set_cli_inference_override(device: Option<String>, no_gpu: bool) {
 
 fn cli_inference_override() -> CliInferenceOverride {
     CLI_INFERENCE_OVERRIDE.with(|value| value.borrow().clone())
+}
+
+fn set_cli_result_limit(limit: Option<usize>) {
+    CLI_RESULT_LIMIT.with(|value| value.set(limit));
+}
+
+fn cli_result_limit(default: usize) -> usize {
+    CLI_RESULT_LIMIT
+        .with(|value| value.get())
+        .unwrap_or(default)
+}
+
+fn cli_result_limit_unless_all(default: usize, all: bool) -> usize {
+    if all {
+        usize::MAX
+    } else {
+        cli_result_limit(default)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -197,6 +216,11 @@ pub struct Cli {
     /// Legacy spelling for `--device cpu`.
     #[arg(long, global = true, conflicts_with = "device")]
     pub no_gpu: bool,
+
+    /// Cap the number of rows returned by navigation and search commands.
+    /// `--max` is accepted as a Postel-style alias; `--all` still lifts caps.
+    #[arg(long, alias = "max", global = true, value_name = "N")]
+    pub limit: Option<usize>,
 
     #[command(subcommand)]
     pub command: Option<Command>,
@@ -347,6 +371,9 @@ pub enum Command {
     /// over opening whole files: it returns exactly the code that matters.
     Read {
         symbol: Option<String>,
+        /// Flag spelling for the positional symbol.
+        #[arg(long = "symbol", value_name = "SYMBOL")]
+        symbol_opt: Option<String>,
         /// Optional file to disambiguate SYMBOL when it resolves in several
         /// files: `read open src/flask/testing.py` or `read open --path FILE`
         /// (equivalent to the `path::SYMBOL` form).
@@ -399,6 +426,9 @@ pub enum Command {
         /// Restrict returned callers to these files or directory subtrees.
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
+        /// Flag spelling for an additional result-path filter.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opts: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
         code: bool,
@@ -418,6 +448,9 @@ pub enum Command {
         /// Restrict returned callees to these files or directory subtrees.
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
+        /// Flag spelling for an additional result-path filter.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opts: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
         code: bool,
@@ -436,6 +469,9 @@ pub enum Command {
         /// Restrict returned usage sites to these files or directory subtrees.
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
+        /// Flag spelling for an additional result-path filter.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opts: Vec<String>,
         /// Also print the source code span of each result node.
         #[arg(long)]
         code: bool,
@@ -467,9 +503,6 @@ pub enum Command {
         /// Edge type to rank by (CALLS, USAGE, USES, TYPE_REF, IMPORTS).
         #[arg(long, default_value = "CALLS")]
         edge: String,
-        /// Maximum result rows to print.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
         /// Emit machine-readable JSON with exact count metadata.
         #[arg(long)]
         json: bool,
@@ -480,9 +513,6 @@ pub enum Command {
         /// Edge type to rank by (CALLS, USAGE, USES, TYPE_REF, IMPORTS).
         #[arg(long, default_value = "CALLS")]
         edge: String,
-        /// Maximum result rows to print.
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
         /// Emit machine-readable JSON with exact count metadata.
         #[arg(long)]
         json: bool,
@@ -533,6 +563,9 @@ pub enum Command {
         /// Restrict returned matches to these files or directory subtrees.
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
+        /// Flag spelling for an additional result-path filter.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opts: Vec<String>,
         /// Restrict search to files changed in the current git worktree.
         #[arg(long)]
         changed: bool,
@@ -561,6 +594,9 @@ pub enum Command {
         /// Restrict returned symbols to these files or directory subtrees.
         #[arg(value_name = "PATH")]
         paths: Vec<String>,
+        /// Flag spelling for an additional result-path filter.
+        #[arg(long = "path", value_name = "FILE")]
+        path_opts: Vec<String>,
         /// Restrict to one node kind (Function, Method, Struct, Class, …).
         /// Matches the label case-insensitively; agents guess this flag,
         /// so it is real (P3 forensics).
@@ -1134,6 +1170,7 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
             }
         };
     }
+    let argv = normalize_global_output_flags(argv);
     if is_grep_passthrough(&argv) {
         // argv[0] is the binary name; the rest are grep args. Build a
         // synthetic argv for the shared runner whose argv[0] is a
@@ -1193,6 +1230,9 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
                 .first()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
+            if let Some(corrected) = closest_valid_invocation(&argv, sub, &msg) {
+                println!("try: {corrected}");
+            }
             if let Some(usage) = subcommand_usage(sub) {
                 println!("usage: {usage}");
             } else {
@@ -1208,17 +1248,49 @@ pub fn run_os(argv: Vec<std::ffi::OsString>) -> u8 {
     dispatch_to_code(cli)
 }
 
+fn normalize_global_output_flags(mut argv: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let Some(subcommand_index) = argv.iter().enumerate().skip(1).find_map(|(index, token)| {
+        token
+            .to_str()
+            .is_some_and(|token| SUBCOMMANDS.contains(&token))
+            .then_some(index)
+    }) else {
+        return argv;
+    };
+    let mut moved = Vec::new();
+    let mut indexes = (1..subcommand_index)
+        .filter(|&index| matches!(argv[index].to_str(), Some("--json" | "--code" | "--all")))
+        .collect::<Vec<_>>();
+    for index in indexes.drain(..).rev() {
+        moved.push(argv.remove(index));
+    }
+    moved.reverse();
+    let Some(new_subcommand_index) = argv.iter().position(|token| {
+        token
+            .to_str()
+            .is_some_and(|token| SUBCOMMANDS.contains(&token))
+    }) else {
+        return argv;
+    };
+    for (offset, token) in moved.into_iter().enumerate() {
+        argv.insert(new_subcommand_index + 1 + offset, token);
+    }
+    argv
+}
+
 fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
     let mut index = 1;
     while index < argv.len() {
         let token = &argv[index];
-        if token == "--root" || token == "--device" {
+        if token == "--root" || token == "--device" || token == "--limit" || token == "--max" {
             index = (index + 2).min(argv.len());
             continue;
         }
         let token_lossy = token.to_string_lossy();
         if token_lossy.starts_with("--root=")
             || token_lossy.starts_with("--device=")
+            || token_lossy.starts_with("--limit=")
+            || token_lossy.starts_with("--max=")
             || token == "--no-gpu"
             || token == "--no-summaries"
         {
@@ -1228,6 +1300,86 @@ fn grep_passthrough_args(argv: &[std::ffi::OsString]) -> &[std::ffi::OsString] {
         break;
     }
     &argv[index..]
+}
+
+fn closest_valid_invocation(
+    argv: &[std::ffi::OsString],
+    subcommand: &str,
+    clap_message: &str,
+) -> Option<String> {
+    let unknown = clap_message
+        .strip_prefix("error: unexpected argument '")?
+        .split('\'')
+        .next()?;
+    if !unknown.starts_with("--") {
+        return None;
+    }
+    let mut candidates = vec![
+        "--root", "--device", "--json", "--code", "--all", "--limit", "--max",
+    ];
+    candidates.extend(match subcommand {
+        "read" => vec!["--symbol", "--path", "--handle", "--lines"],
+        "who-calls" | "callees" | "find-usages" | "brief" | "semantic-search" | "semantic" => {
+            vec!["--path"]
+        }
+        "search-code" => vec!["--path", "--changed", "--staged", "--since", "--base"],
+        "search-symbols" => vec!["--path", "--kind"],
+        "impact" => vec!["--direction", "--edge", "--depth", "--since", "--base"],
+        "trace" => vec!["--symbol", "--direction", "--edge", "--depth"],
+        "path" => vec!["--from", "--to", "--edge"],
+        "graph-locate" => vec!["--file", "--line"],
+        "plus" => vec!["--k", "--explain"],
+        "context" => vec!["--k", "--lines"],
+        _ => Vec::new(),
+    });
+    let replacement = candidates
+        .into_iter()
+        .min_by_key(|candidate| levenshtein(unknown, candidate))?;
+    let distance = levenshtein(unknown, replacement);
+    if distance > 4 {
+        return None;
+    }
+    Some(
+        argv.iter()
+            .map(|argument| {
+                let argument = argument.to_string_lossy();
+                let value = if argument == unknown {
+                    replacement
+                } else {
+                    argument.as_ref()
+                };
+                shell_quote_cli(value)
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn levenshtein(left: &str, right: &str) -> usize {
+    let mut previous = (0..=right.chars().count()).collect::<Vec<_>>();
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right.chars().enumerate() {
+            current.push(
+                (current[right_index] + 1)
+                    .min(previous[right_index + 1] + 1)
+                    .min(previous[right_index] + usize::from(left_char != right_char)),
+            );
+        }
+        previous = current;
+    }
+    previous.last().copied().unwrap_or(0)
+}
+
+fn shell_quote_cli(value: &str) -> String {
+    if value
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-._/:".contains(character))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// One-line usage per agent-facing subcommand, printed after a short arg
@@ -1649,11 +1801,16 @@ fn is_grep_passthrough(argv: &[std::ffi::OsString]) -> bool {
             i += 1;
             continue;
         }
-        if tok == "--device" {
+        if tok == "--device" || tok == "--limit" || tok == "--max" {
             i += 2;
             continue;
         }
-        if tok.to_string_lossy().starts_with("--device=") || tok == "--no-gpu" {
+        let token_lossy = tok.to_string_lossy();
+        if token_lossy.starts_with("--device=")
+            || token_lossy.starts_with("--limit=")
+            || token_lossy.starts_with("--max=")
+            || tok == "--no-gpu"
+        {
             i += 1;
             continue;
         }
@@ -1685,6 +1842,10 @@ pub fn dispatch(cli: Cli) -> Result<i32> {
     let root = cli.root.clone();
     let device = cli.device.clone();
     let no_gpu = cli.no_gpu;
+    if cli.limit == Some(0) {
+        return Err(Error::Invalid("--limit/--max must be at least 1".into()));
+    }
+    set_cli_result_limit(cli.limit);
     let configured_device = device.clone().or_else(|| env_nonempty(ENV_DEVICE));
     if !no_gpu {
         configure_explicit_cuda_device(configured_device.as_deref())?;
@@ -1797,7 +1958,7 @@ fn dispatch_subcommand(
         Command::Trial { args } => trial::run(args, root),
         Command::Verify { args } => Ok(verify::run(args, root)),
         Command::SearchGraph { name, json } => {
-            let mut q = greppy_search::GraphQuery::any().with_limit(50);
+            let mut q = greppy_search::GraphQuery::any().with_limit(cli_result_limit(50));
             let name_filter = name.as_deref();
             if let Some(n) = name_filter {
                 q = q.with_name(n);
@@ -1857,17 +2018,16 @@ fn dispatch_subcommand(
         Command::Expand { id, json } => dispatch_expand(id.as_deref(), json, root),
         Command::Read {
             symbol,
+            symbol_opt,
             path,
             path_opt,
             handle,
             code: _,
             json,
         } => {
-            let folded = qualify_symbol_with_path(
-                symbol.as_deref(),
-                path.as_deref().or(path_opt.as_deref()),
-            );
-            dispatch_read(folded.as_deref().or(symbol.as_deref()), handle, json, root)
+            let symbol = symbol_opt.as_deref().or(symbol.as_deref());
+            let folded = qualify_symbol_with_path(symbol, path.as_deref().or(path_opt.as_deref()));
+            dispatch_read(folded.as_deref().or(symbol), handle, json, root)
         }
         Command::Edit { command } => dispatch_edit(command, root),
         Command::Stats => dispatch_stats(root),
@@ -1875,37 +2035,59 @@ fn dispatch_subcommand(
         Command::Doctor { json } => dispatch_doctor(json, root),
         Command::WhoCalls {
             symbol,
-            paths,
+            mut paths,
+            path_opts,
             code,
             all,
             json,
-        } => dispatch_who_calls(symbol.as_deref(), &paths, code, all, json, root),
+        } => {
+            paths.extend(path_opts);
+            dispatch_who_calls(symbol.as_deref(), &paths, code, all, json, root)
+        }
         Command::Callees {
             symbol,
-            paths,
+            mut paths,
+            path_opts,
             code,
             all,
             json,
-        } => dispatch_callees(symbol.as_deref(), &paths, code, all, json, root),
+        } => {
+            paths.extend(path_opts);
+            dispatch_callees(symbol.as_deref(), &paths, code, all, json, root)
+        }
         Command::FindUsages {
             symbol,
-            paths,
+            mut paths,
+            path_opts,
             code,
             all,
             json,
-        } => dispatch_find_usages(symbol.as_deref(), &paths, code, all, json, root),
+        } => {
+            paths.extend(path_opts);
+            dispatch_find_usages(symbol.as_deref(), &paths, code, all, json, root)
+        }
         Command::References {
             symbol,
             code,
             all,
             json,
         } => dispatch_references(symbol.as_deref(), code, all, json, root),
-        Command::FanIn { edge, limit, json } => {
-            dispatch_fan_degree("fan-in", "incoming", &edge, limit, json, root)
-        }
-        Command::FanOut { edge, limit, json } => {
-            dispatch_fan_degree("fan-out", "outgoing", &edge, limit, json, root)
-        }
+        Command::FanIn { edge, json } => dispatch_fan_degree(
+            "fan-in",
+            "incoming",
+            &edge,
+            cli_result_limit(20),
+            json,
+            root,
+        ),
+        Command::FanOut { edge, json } => dispatch_fan_degree(
+            "fan-out",
+            "outgoing",
+            &edge,
+            cli_result_limit(20),
+            json,
+            root,
+        ),
         Command::GraphLocate {
             location,
             file,
@@ -1922,7 +2104,8 @@ fn dispatch_subcommand(
         } => dispatch_path(from.as_deref(), to.as_deref(), &edge, json, root),
         Command::SearchCode {
             query,
-            paths,
+            mut paths,
+            path_opts,
             changed,
             staged,
             since,
@@ -1930,24 +2113,31 @@ fn dispatch_subcommand(
             json,
             code: _,
             all: _,
-        } => dispatch_search_code(
-            query.as_deref(),
-            &paths,
-            changed,
-            staged,
-            since.as_deref(),
-            base.as_deref(),
-            json,
-            root,
-        ),
+        } => {
+            paths.extend(path_opts);
+            dispatch_search_code(
+                query.as_deref(),
+                &paths,
+                changed,
+                staged,
+                since.as_deref(),
+                base.as_deref(),
+                json,
+                root,
+            )
+        }
         Command::SearchSymbols {
             query,
-            paths,
+            mut paths,
+            path_opts,
             kind,
             json,
             code: _,
             all: _,
-        } => dispatch_search_symbols(query.as_deref(), &paths, kind.as_deref(), json, root),
+        } => {
+            paths.extend(path_opts);
+            dispatch_search_symbols(query.as_deref(), &paths, kind.as_deref(), json, root)
+        }
         Command::Plus {
             query,
             k,
@@ -4030,6 +4220,7 @@ fn trace_step_json(step: &greppy_search::TraceStep) -> serde_json::Value {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn trace_counts_json(
     store: &greppy_store::Store,
     root: Option<&str>,
@@ -4037,6 +4228,7 @@ fn trace_counts_json(
     project: &str,
     symbol_found: bool,
     meta: TraceJsonMeta<'_>,
+    total_exact: usize,
     steps: &[greppy_search::TraceStep],
 ) -> Result<()> {
     let freshness = nav_freshness_json(store, root, project);
@@ -4046,7 +4238,8 @@ fn trace_counts_json(
         .unwrap_or(false);
     let incomplete_providers = incomplete_provider_json(store, project)?;
     let step_json: Vec<_> = steps.iter().map(trace_step_json).collect();
-    let step_count = step_json.len();
+    let shown = step_json.len();
+    let omitted = total_exact.saturating_sub(shown);
     let v = serde_json::json!({
         "command": "trace",
         "symbol": symbol,
@@ -4061,10 +4254,10 @@ fn trace_counts_json(
         "direction": meta.direction,
         "edge_type": meta.edge_type,
         "max_depth": meta.max_depth,
-        "total_exact": step_count,
-        "shown": step_count,
-        "omitted": 0,
-        "truncated": false,
+        "total_exact": total_exact,
+        "shown": shown,
+        "omitted": omitted,
+        "truncated": omitted > 0,
         "steps": step_json,
     });
     println!(
@@ -5724,6 +5917,7 @@ fn dispatch_trace(
                     edge_type: edge_filter,
                     max_depth: depth,
                 },
+                0,
                 &[],
             )?;
             return Ok(1);
@@ -5732,6 +5926,8 @@ fn dispatch_trace(
         return Ok(1);
     };
     let steps = greppy_search::trace_path(&store, start, dir, edge_filter, depth)?;
+    let shown = steps.len().min(cli_result_limit(NAV_LIMIT));
+    let shown_steps = &steps[..shown];
     if json {
         trace_counts_json(
             &store,
@@ -5744,7 +5940,8 @@ fn dispatch_trace(
                 edge_type: edge_filter,
                 max_depth: depth,
             },
-            &steps,
+            steps.len(),
+            shown_steps,
         )?;
         return Ok(0);
     }
@@ -5754,7 +5951,7 @@ fn dispatch_trace(
     } else {
         None
     };
-    for s in &steps {
+    for s in shown_steps {
         let edge_marker = match &s.edge {
             Some(e) => format!("via {}", e.edge_type),
             None => "start".to_string(),
@@ -5985,7 +6182,7 @@ fn dispatch_impact(
     // `--all` lifts the print cap so the full transitive set is inspectable
     // in one call (the footer's "T total" was previously unreachable — clap
     // rejected --all — forcing a 28-round reconcile, r061).
-    let shown = if all { total } else { total.min(NAV_LIMIT) };
+    let shown = total.min(cli_result_limit_unless_all(NAV_LIMIT, all));
     // Informative sampling (r071/r074/r075 forensics): when the print cap
     // truncates, the FIRST `shown` rows are the answer most agents run with —
     // so rank named definitions before `__file__` file anchors and product
@@ -7665,7 +7862,7 @@ fn dispatch_brief(
 
     let mut callers = incoming_call_nodes_for_targets(&store, &targets)?;
     callers.retain(|node| path_filters.matches(&node.file_path));
-    let cshown = callers.len().min(BRIEF_LIMIT);
+    let cshown = callers.len().min(cli_result_limit(BRIEF_LIMIT));
     println!("\n-- CALLERS ({}) --", callers.len());
     for n in &callers[..cshown] {
         evidence_nodes.push((
@@ -7685,7 +7882,7 @@ fn dispatch_brief(
         )?;
         refs.retain(|reference| path_filters.matches(&reference.node.file_path));
         let total = refs.len();
-        refs.truncate(BRIEF_LIMIT);
+        refs.truncate(cli_result_limit(BRIEF_LIMIT));
         println!("\n-- REFERENCES ({}) --", total);
         for r in &refs {
             if let Some(node) = store.get_node(r.node.id)? {
@@ -7717,7 +7914,7 @@ fn dispatch_brief(
         }
     }
     callees.retain(|_, node| path_filters.matches(&node.file_path));
-    let eshown = callees.len().min(BRIEF_LIMIT);
+    let eshown = callees.len().min(cli_result_limit(BRIEF_LIMIT));
     println!("\n-- CALLS ({}) --", callees.len());
     for n in callees.values().take(eshown) {
         evidence_nodes.push((
@@ -7839,7 +8036,7 @@ fn dispatch_brief_json(
             if !path_filters.matches(&reference.node.file_path) {
                 continue;
             }
-            if references_json.len() == BRIEF_LIMIT {
+            if references_json.len() == cli_result_limit(BRIEF_LIMIT) {
                 break;
             }
             references_json.push(serde_json::json!({
@@ -8983,8 +9180,8 @@ fn dispatch_who_calls(
         return Ok(0);
     }
     let total = nodes.len();
-    let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
-    let shown = if all { total } else { total.min(cap) };
+    let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
+    let shown = total.min(cap);
     let expand = if !all && !code {
         let rows = nodes
             .iter()
@@ -9292,8 +9489,8 @@ fn dispatch_callees(
         None
     };
     let total = callees.len();
-    let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
-    let shown = if all { total } else { total.min(cap) };
+    let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
+    let shown = total.min(cap);
     let expand = if !all && !code {
         let rows = callees
             .values()
@@ -9503,8 +9700,8 @@ fn dispatch_find_usages(
         return Ok(0);
     }
     let total = rows.len();
-    let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
-    let shown = if all { total } else { total.min(cap) };
+    let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
+    let shown = total.min(cap);
     let expand = if !all && !code {
         let evidence_rows = rows
             .iter()
@@ -9661,14 +9858,14 @@ fn dispatch_references(
     }
 
     let total = greppy_search::count_references_to_any(&store, &project, &targets)?;
-    let cap = if code { CODE_NAV_LIMIT } else { NAV_LIMIT };
+    let cap = cli_result_limit_unless_all(if code { CODE_NAV_LIMIT } else { NAV_LIMIT }, all);
     let fetch_limit = if all {
         greppy_search::MAX_REACH_RESULTS
     } else {
         EXPAND_NAV_EVIDENCE_LIMIT.max(cap)
     };
     let refs = greppy_search::find_references_to_any(&store, &targets, fetch_limit)?;
-    let shown = if all { refs.len() } else { refs.len().min(cap) };
+    let shown = refs.len().min(cap);
     let expand = if !all && !code {
         let mut nodes = Vec::new();
         for r in &refs {
@@ -10266,7 +10463,7 @@ fn dispatch_search_symbols(
     let fetch = if kind.is_some() || !path_filters.is_empty() {
         10_000
     } else {
-        20
+        cli_result_limit(20)
     };
     let mut hits = greppy_search::search_symbols_in_project(&store, &project, q, fetch)?;
     if let Some(k) = kind {
@@ -10288,7 +10485,7 @@ fn dispatch_search_symbols(
             .is_some_and(|node| path_filters.matches(&node.file_path))
     });
     let total_filtered = hits.len() as i64;
-    hits.truncate(20);
+    hits.truncate(cli_result_limit(20));
     if json {
         search_symbols_json(
             &store,
@@ -10464,7 +10661,7 @@ fn dispatch_search_code(
         let all_hits = live_grep_code_hits_filtered(q, &resolve_root(root)?, &path_filters)?;
         let shown_hits = all_hits
             .iter()
-            .take(SEARCH_CODE_LIMIT)
+            .take(cli_result_limit(SEARCH_CODE_LIMIT))
             .cloned()
             .collect::<Vec<_>>();
         if json {
@@ -10488,7 +10685,8 @@ fn dispatch_search_code(
         return Ok(if all_hits.is_empty() { 1 } else { 0 });
     }
 
-    let indexed_hits = greppy_search::search_code(&store, &project, q, SEARCH_CODE_LIMIT)?;
+    let indexed_hits =
+        greppy_search::search_code(&store, &project, q, cli_result_limit(SEARCH_CODE_LIMIT))?;
     if indexed_hits.is_empty() {
         // The product index intentionally does not duplicate full source text
         // into SQLite. Use the authoritative live worktree for both text and
@@ -10496,7 +10694,7 @@ fn dispatch_search_code(
         let live_hits = live_grep_code_hits(q, &resolve_root(root)?)?;
         let shown_hits = live_hits
             .iter()
-            .take(SEARCH_CODE_LIMIT)
+            .take(cli_result_limit(SEARCH_CODE_LIMIT))
             .cloned()
             .collect::<Vec<_>>();
         if json {
@@ -10603,7 +10801,7 @@ fn dispatch_search_code_changed(
     let all_hits = live_grep_search_code_paths(query, &root_path, &changed_files)?;
     let shown_hits = all_hits
         .iter()
-        .take(SEARCH_CODE_LIMIT)
+        .take(cli_result_limit(SEARCH_CODE_LIMIT))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -10686,7 +10884,7 @@ fn dispatch_search_code_staged(
     let all_hits = grep_staged_git_blobs(query, &root_path, &staged_files)?;
     let shown_hits = all_hits
         .iter()
-        .take(SEARCH_CODE_LIMIT)
+        .take(cli_result_limit(SEARCH_CODE_LIMIT))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -10811,7 +11009,7 @@ fn dispatch_search_code_diff_scope(
     let all_hits = live_grep_search_code_paths(query, &root_path, &spec.files)?;
     let shown_hits = all_hits
         .iter()
-        .take(SEARCH_CODE_LIMIT)
+        .take(cli_result_limit(SEARCH_CODE_LIMIT))
         .cloned()
         .collect::<Vec<_>>();
 
@@ -11504,7 +11702,7 @@ fn dispatch_plus(
     if q.is_empty() {
         return Err(Error::Invalid("a query is required".into()));
     }
-    let k = k.max(1);
+    let k = cli_result_limit(k).max(1);
     let project = project_for(root)?;
     let root_path = resolve_root(root)?;
     // Combined search also refuses stale indexed lexical/graph/vector rows.
@@ -11923,7 +12121,7 @@ fn live_grep_search_code(
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let hits = live_grep_code_hits(query, &root_path)?;
-    let shown = hits.len().min(SEARCH_CODE_LIMIT);
+    let shown = hits.len().min(cli_result_limit(SEARCH_CODE_LIMIT));
     if json {
         let rows = hits[..shown]
             .iter()
@@ -11971,7 +12169,7 @@ fn live_grep_search_code_filtered(
 ) -> Result<i32> {
     let root_path = resolve_root(root)?;
     let hits = live_grep_code_hits_filtered(query, &root_path, path_filters)?;
-    let shown = hits.len().min(SEARCH_CODE_LIMIT);
+    let shown = hits.len().min(cli_result_limit(SEARCH_CODE_LIMIT));
     if json {
         let rows = hits[..shown]
             .iter()
@@ -12607,8 +12805,13 @@ fn dispatch_semantic(
                 let mut candidates =
                     greppy_search::vector_search_exact(&store, &query_vector, &scope)?;
                 candidates.retain(|hit| path_filters.matches(&hit.embedding.file_path));
-                let hits = dedupe_semantic_vector_hits(candidates, SEMANTIC_VECTOR_RESULT_LIMIT);
-                let shown = hits.len().min(SEMANTIC_VECTOR_DISPLAY_LIMIT);
+                let hits = dedupe_semantic_vector_hits(
+                    candidates,
+                    cli_result_limit(SEMANTIC_VECTOR_RESULT_LIMIT),
+                );
+                let shown = hits
+                    .len()
+                    .min(cli_result_limit(SEMANTIC_VECTOR_DISPLAY_LIMIT));
                 let display_hits = hits[..shown].to_vec();
                 let further_hits = &hits[shown..];
                 let purposes = semantic_vector_purposes(&store, root, &display_hits, true)?;
@@ -13232,7 +13435,7 @@ fn dispatch_context(
     if q.is_empty() {
         return Err(Error::Invalid("context requires a query".into()));
     }
-    let k = k.max(1);
+    let k = cli_result_limit(k).max(1);
     let project = project_for(root)?;
     let span_root = resolve_root(root)?;
     // Context also refuses stale/unknown graph locations. It never combines
@@ -18040,6 +18243,7 @@ where
                 code: _,
                 all: _,
                 paths: _,
+                path_opts: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(changed);
@@ -18067,6 +18271,7 @@ where
                 code: _,
                 all: _,
                 paths: _,
+                path_opts: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(!changed);
@@ -18101,6 +18306,7 @@ where
                 code: _,
                 all: _,
                 paths: _,
+                path_opts: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(!changed);
@@ -18135,6 +18341,7 @@ where
                 code: _,
                 all: _,
                 paths: _,
+                path_opts: _,
             }) => {
                 assert_eq!(query.as_deref(), Some("needle"));
                 assert!(!changed);
@@ -18287,13 +18494,13 @@ where
         let cli = Cli::try_parse_from(["greppy", "who-calls", "do_it"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::WhoCalls { symbol: Some(ref s), code: false, all: false, json: false, paths }) if s == "do_it" && paths.is_empty()
+            Some(Command::WhoCalls { symbol: Some(ref s), code: false, all: false, json: false, paths, path_opts }) if s == "do_it" && paths.is_empty() && path_opts.is_empty()
         ));
 
         let cli = Cli::try_parse_from(["greppy", "find-usages", "Widget"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::FindUsages { symbol: Some(ref s), code: false, all: false, json: false, paths }) if s == "Widget" && paths.is_empty()
+            Some(Command::FindUsages { symbol: Some(ref s), code: false, all: false, json: false, paths, path_opts }) if s == "Widget" && paths.is_empty() && path_opts.is_empty()
         ));
 
         let cli = Cli::try_parse_from(["greppy", "references", "Widget"]).unwrap();
@@ -18306,15 +18513,17 @@ where
             "greppy", "fan-in", "--edge", "USAGE", "--limit", "7", "--json",
         ])
         .unwrap();
+        assert_eq!(cli.limit, Some(7));
         assert!(matches!(
             cli.command,
-            Some(Command::FanIn { ref edge, limit: 7, json: true }) if edge == "USAGE"
+            Some(Command::FanIn { ref edge, json: true }) if edge == "USAGE"
         ));
 
         let cli = Cli::try_parse_from(["greppy", "fan-out"]).unwrap();
+        assert_eq!(cli.limit, None);
         assert!(matches!(
             cli.command,
-            Some(Command::FanOut { ref edge, limit: 20, json: false }) if edge == "CALLS"
+            Some(Command::FanOut { ref edge, json: false }) if edge == "CALLS"
         ));
 
         let cli = Cli::try_parse_from(["greppy", "graph-locate", "src/lib.rs:42"]).unwrap();

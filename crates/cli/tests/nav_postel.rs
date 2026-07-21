@@ -162,3 +162,73 @@ fn type_method_query_resolves_rust_trait_impl_method() {
     assert!(stdout.contains("fn serialize(&self)"), "stdout={stdout}");
     assert!(stdout.contains("src/api.rs"), "stdout={stdout}");
 }
+
+#[test]
+fn limit_max_path_and_read_symbol_aliases_are_output_identical() {
+    let (repo, store) = indexed_repo("aliases");
+
+    let limit = run(&["search-code", "pub", "--limit", "1"], &repo, &store);
+    let max = run(&["search-code", "pub", "--max", "1"], &repo, &store);
+    assert_eq!(limit, max, "--limit and --max must be exact aliases");
+
+    let positional = run(&["search-code", "target", "src/inside"], &repo, &store);
+    let flagged = run(
+        &["search-code", "target", "--path", "src/inside"],
+        &repo,
+        &store,
+    );
+    assert_eq!(positional, flagged, "positional PATH and --path differ");
+
+    let positional = run(&["read", "target"], &repo, &store);
+    let flagged = run(&["read", "--symbol", "target"], &repo, &store);
+    assert_eq!(positional, flagged, "positional SYMBOL and --symbol differ");
+}
+
+#[test]
+fn global_output_flags_work_before_and_after_subcommand() {
+    let (repo, store) = indexed_repo("global-flags");
+
+    for flag in ["--json", "--code", "--all"] {
+        let before = run(&[flag, "who-calls", "target"], &repo, &store);
+        let after = run(&["who-calls", "target", flag], &repo, &store);
+        if flag == "--json" {
+            assert_eq!(before.0, after.0);
+            assert_eq!(before.2, after.2);
+            let before: serde_json::Value = serde_json::from_str(&before.1).unwrap();
+            let after: serde_json::Value = serde_json::from_str(&after.1).unwrap();
+            assert_eq!(before["command"], after["command"]);
+            assert_eq!(before["all"], after["all"]);
+            assert_eq!(before["hits"], after["hits"]);
+            assert_eq!(before["shown"], after["shown"]);
+        } else {
+            assert_eq!(before, after, "global flag ordering differs for {flag}");
+        }
+    }
+
+    let before = run(
+        &["--root", ".", "search-code", "target", "--limit", "1"],
+        &repo,
+        &store,
+    );
+    let after = run(
+        &["search-code", "target", "--limit", "1", "--root", "."],
+        &repo,
+        &store,
+    );
+    assert_eq!(before, after, "--root ordering differs");
+}
+
+#[test]
+fn unknown_flag_suggests_a_complete_corrected_invocation() {
+    let (repo, store) = indexed_repo("unknown-flag");
+    let (code, stdout, stderr) = run(
+        &["search-code", "target", "--jsoon", "--limit", "1"],
+        &repo,
+        &store,
+    );
+    assert_eq!(code, 64, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains(" search-code target --json --limit 1"),
+        "stdout={stdout}"
+    );
+}
