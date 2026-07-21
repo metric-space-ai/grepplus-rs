@@ -76,3 +76,4 @@ crates/cli/assets/qwen35-0.8b-mtp-q4km/*.gguf
 crates/cli/assets/qwen35-0.8b-mtp-q4km/tokenizer.json
 crates/cli/assets/embeddinggemma-300m-q4k/*.gguf
 crates/cli/assets/embeddinggemma-300m-q4k/tokenizer.json
+bench/agent_coding/*.bak*
