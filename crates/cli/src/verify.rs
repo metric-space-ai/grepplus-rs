@@ -732,9 +732,8 @@ pub(crate) fn run(args: VerifyArgs, root_override: Option<&str>) -> i32 {
         Ok(revision) => {
             baseline_revision = revision.clone();
             let key = cache_key(&revision, &args.test_command, &mirrors);
-            let cache_path = greppy_core::workspace::store_dir(&root)
-                .join("verify-cache")
-                .join(format!("{key}.bin"));
+            let store_dir = greppy_core::workspace::store_dir(&root);
+            let cache_path = store_dir.join("verify-cache").join(format!("{key}.bin"));
             if !args.no_cache {
                 baseline_run = read_cache(&cache_path);
                 baseline_cache_hit = baseline_run.is_some();
@@ -762,8 +761,15 @@ pub(crate) fn run(args: VerifyArgs, root_override: Option<&str>) -> i32 {
                                 &baseline_cwd,
                                 Duration::from_secs(args.timeout),
                             );
-                            if let Err(error) = write_cache(&cache_path, &run) {
-                                limitations.push(format!("baseline cache write failed: {error}"));
+                            match greppy_core::workspace::ensure_store_dir(&store_dir) {
+                                Ok(()) => {
+                                    if let Err(error) = write_cache(&cache_path, &run) {
+                                        limitations
+                                            .push(format!("baseline cache write failed: {error}"));
+                                    }
+                                }
+                                Err(error) => limitations
+                                    .push(format!("baseline cache directory unavailable: {error}")),
                             }
                             baseline_run = Some(run);
                         }
@@ -1140,9 +1146,13 @@ impl TemporaryWorktree {
     }
 
     pub(crate) fn cleanup(mut self) -> Result<(), String> {
-        let result = self.remove();
-        self.active = false;
-        result
+        match self.remove() {
+            Ok(()) => {
+                self.active = false;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn remove(&mut self) -> Result<(), String> {
