@@ -114,6 +114,19 @@ always reported (`formatter_expanded_change_scope: true`), never silent.
 
 ## Benchmark metrics registered with this contract (gate v4)
 
+**Task bank (re-registered 2026-07-21, owner decision, before any measured
+run on this bank):** `bench/agent_coding/tasks_v2.json`
+(sha256 `8dd46a943f94fb0f…`) — 41 tasks derived from real commits of the six
+pinned repositories: parent commit as the working state, the real commit's
+test diff applied as the failing specification, the real issue/commit intent
+as the task text, the code diff hidden. 18 serious multi-file tasks
+(80–800 changed lines) plus 23 mechanical ones. The previous v1 bank
+(30 single-file two-line mutation reverts) is **retired**: its tasks contain
+no navigation or transaction surface, so it structurally cannot measure the
+edit thesis — its gate-v4 run (2026-07-21, gpu3) is archived as evidence of
+correctness parity (30/30/30) and the post-edit re-read rate (0.088), not of
+cost. Thresholds below are UNCHANGED from the original registration.
+
 Measured by `bench/agent_coding` on the paired task set, third arm
 `greppy-edit` (v3 prompt set):
 

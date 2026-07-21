@@ -73,7 +73,7 @@ jobs:
         run: |
           python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
           python3 bench/agent_coding/run_benchmark.py \
-            --tasks bench/agent_coding/tasks_v1.json \
+            --tasks bench/agent_coding/tasks_v2.json \
             --validate-only
 
       - name: Verify bundled inference assets
@@ -91,7 +91,7 @@ jobs:
         run: |
           test -n "$MINIMAX_API_KEY"
           python3 bench/agent_coding/run_benchmark.py \
-            --tasks bench/agent_coding/tasks_v1.json \
+            --tasks bench/agent_coding/tasks_v2.json \
             --greppy-bin "$GREPPY_BENCH_BIN" \
             --warm-greppy \
             --output-dir "$RUN_DIR" \

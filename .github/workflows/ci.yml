@@ -135,9 +135,16 @@ jobs:
       - name: paired coding benchmark harness
         run: |
           python3 -m unittest discover -s bench/agent_coding -p 'test_*.py' -v
-          python3 bench/agent_coding/run_benchmark.py \
-            --tasks bench/agent_coding/tasks_v1.json \
-            --validate-only
+          # v1 micro-revert bank retired (owner decision 2026-07-21); full
+          # validate-only returns once the v2 runner integration lands.
+          python3 - <<'PY'
+          import json
+          d = json.load(open("bench/agent_coding/tasks_v2.json"))
+          tasks = d["tasks"] if isinstance(d, dict) and "tasks" in d else d
+          assert len(tasks) >= 40, f"v2 bank too small: {len(tasks)}"
+          assert all(t.get("test_patch") and t["repository"]["commit"] for t in tasks)
+          print(f"tasks_v2 bank ok: {len(tasks)} real-commit tasks")
+          PY
 
       - name: runtime footprint evidence harness
         run: python3 -m unittest bench.test_runtime_footprint -v

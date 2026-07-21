@@ -352,12 +352,14 @@ every commit ([SECURITY.md](SECURITY.md) has the release scope):
   navigation tasks across six real repositories plus deterministic controls.
   It measures answer correctness together with search, source-reading, and
   context cost.
-- [`bench/agent_coding/`](bench/agent_coding/) contains 30 paired edit-and-test
-  tasks across Flask, Hugo, Gson, Zod, Serde, and Tokio. Each task starts from an
-  exact commit, proves that its independent test passes before mutation and
-  fails after mutation, then runs isolated Greppy and ordinary-exploration arms.
-  Setup is outside measured agent time; the post-agent test determines
-  correctness.
+- [`bench/agent_coding/`](bench/agent_coding/) contains 41 paired edit-and-test
+  tasks derived from real commits of Flask, Hugo, Gson, Zod, Serde, and Tokio —
+  18 of them serious multi-file changes (80–800 lines) taken from real issues.
+  Each task starts from the real commit's parent, applies the commit's test
+  diff as the failing specification (machine-proven: the tests fail on the
+  parent and pass with the real change), and hides the code diff. The agent
+  gets the real issue intent; the post-agent test determines correctness.
+  Setup is outside measured agent time.
 
 Both suites record per-task correctness, tool calls, source opens, input/output
 tokens, context or prompt volume, and wall time for the same agent and model.
