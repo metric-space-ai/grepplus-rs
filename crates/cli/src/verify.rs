@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
@@ -613,6 +611,501 @@ fn one_line(value: &str) -> String {
     } else {
         shortened
     }
+}
+
+pub(crate) const EXIT_NEWLY_FAILED: i32 = 21;
+pub(crate) const EXIT_INFRASTRUCTURE: i32 = 22;
+
+#[derive(clap::Args, Debug)]
+pub struct VerifyArgs {
+    /// Committed revision used for the isolated baseline run.
+    #[arg(long, default_value = "HEAD")]
+    pub(crate) baseline: String,
+    /// Emit the complete greppy.verify-report.v1 JSON document.
+    #[arg(long)]
+    pub(crate) json: bool,
+    /// Per-run timeout in seconds.
+    #[arg(long, default_value_t = 900, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) timeout: u64,
+    /// Ignore any cached baseline result.
+    #[arg(long)]
+    pub(crate) no_cache: bool,
+    /// Test command and arguments. A `--` separator is required.
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    pub(crate) test_command: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReportCase {
+    test_id: String,
+    evidence_line: String,
+}
+
+#[derive(Debug)]
+struct VerifyReport {
+    command: Vec<String>,
+    baseline_rev: String,
+    baseline_exit: Option<i32>,
+    after_exit: Option<i32>,
+    workspace_digest_before: String,
+    workspace_digest_after: String,
+    framework: String,
+    mirrored_paths: Vec<String>,
+    baseline_cache_hit: bool,
+    limitations: Vec<String>,
+    newly_failed: Vec<ReportCase>,
+    fixed: Vec<ReportCase>,
+    preexisting_failed: Vec<ReportCase>,
+    still_passing: Vec<ReportCase>,
+    not_run_in_after: Vec<ReportCase>,
+    infrastructure_error: Vec<ReportCase>,
+    exit_code: i32,
+}
+
+pub(crate) fn run(args: VerifyArgs, root_override: Option<&str>) -> i32 {
+    let start = match root_override {
+        Some(root) => PathBuf::from(root),
+        None => match std::env::current_dir() {
+            Ok(path) => path,
+            Err(error) => {
+                return emit_early_infrastructure(
+                    &args,
+                    "workspace",
+                    &format!("cannot resolve current directory: {error}"),
+                );
+            }
+        },
+    };
+    let root = match repository_root(&start) {
+        Ok(path) => path,
+        Err(error) => return emit_early_infrastructure(&args, "workspace", &error),
+    };
+    let command_cwd = if root_override.is_some() {
+        root.clone()
+    } else {
+        match start.canonicalize() {
+            Ok(path) => path,
+            Err(error) => {
+                return emit_early_infrastructure(
+                    &args,
+                    "workspace",
+                    &format!(
+                        "cannot resolve command directory {}: {error}",
+                        start.display()
+                    ),
+                );
+            }
+        }
+    };
+    let relative_cwd = match command_cwd.strip_prefix(&root) {
+        Ok(path) => path.to_path_buf(),
+        Err(_) => {
+            return emit_early_infrastructure(
+                &args,
+                "workspace",
+                "the command directory is outside the selected git worktree",
+            );
+        }
+    };
+    let digest_before = match workspace_digest(&root) {
+        Ok(digest) => digest,
+        Err(error) => return emit_early_infrastructure(&args, "workspace-digest-before", &error),
+    };
+
+    // Binding execution order: the user's current tree is tested first. Git
+    // worktree setup begins only after this child process has completed.
+    let after_run = run_command(
+        &args.test_command,
+        &command_cwd,
+        Duration::from_secs(args.timeout),
+    );
+    let after_parsed = parse_run(&after_run);
+    let mirrors = discover_mirrors(&root, &relative_cwd);
+    let mut limitations = Vec::new();
+    push_limitation(&mut limitations, after_parsed.limitation.clone());
+    let mut setup_infrastructure = Vec::new();
+    let mut baseline_cache_hit = false;
+    let mut baseline_revision = args.baseline.clone();
+    let mut baseline_run: Option<CommandRun> = None;
+
+    match resolve_revision(&root, &args.baseline) {
+        Ok(revision) => {
+            baseline_revision = revision.clone();
+            let key = cache_key(&revision, &args.test_command, &mirrors);
+            let cache_path = greppy_core::workspace::store_dir(&root)
+                .join("verify-cache")
+                .join(format!("{key}.bin"));
+            if !args.no_cache {
+                baseline_run = read_cache(&cache_path);
+                baseline_cache_hit = baseline_run.is_some();
+            }
+            if baseline_run.is_none() {
+                match TemporaryWorktree::add(&root, &revision) {
+                    Ok(worktree) => {
+                        let baseline_cwd = worktree.path().join(&relative_cwd);
+                        if let Err(error) = install_mirrors(worktree.path(), &mirrors) {
+                            setup_infrastructure.push(ReportCase {
+                                test_id: "baseline:environment-mirror".into(),
+                                evidence_line: one_line(&error),
+                            });
+                        } else if !baseline_cwd.is_dir() {
+                            setup_infrastructure.push(ReportCase {
+                                test_id: "baseline:command-directory".into(),
+                                evidence_line: format!(
+                                    "baseline revision does not contain command directory {}",
+                                    relative_cwd.display()
+                                ),
+                            });
+                        } else {
+                            let run = run_command(
+                                &args.test_command,
+                                &baseline_cwd,
+                                Duration::from_secs(args.timeout),
+                            );
+                            if let Err(error) = write_cache(&cache_path, &run) {
+                                limitations.push(format!("baseline cache write failed: {error}"));
+                            }
+                            baseline_run = Some(run);
+                        }
+                        if let Err(error) = worktree.cleanup() {
+                            setup_infrastructure.push(ReportCase {
+                                test_id: "baseline:worktree-cleanup".into(),
+                                evidence_line: one_line(&error),
+                            });
+                        }
+                    }
+                    Err(error) => setup_infrastructure.push(ReportCase {
+                        test_id: "baseline:worktree-setup".into(),
+                        evidence_line: one_line(&error),
+                    }),
+                }
+            }
+        }
+        Err(error) => setup_infrastructure.push(ReportCase {
+            test_id: "baseline:revision".into(),
+            evidence_line: one_line(&error),
+        }),
+    }
+
+    let baseline_parsed = baseline_run.as_ref().map(parse_run);
+    if let Some(parsed) = &baseline_parsed {
+        push_limitation(&mut limitations, parsed.limitation.clone());
+    }
+    let digest_after = match workspace_digest(&root) {
+        Ok(digest) => digest,
+        Err(error) => {
+            setup_infrastructure.push(ReportCase {
+                test_id: "workspace-digest-after".into(),
+                evidence_line: one_line(&error),
+            });
+            String::new()
+        }
+    };
+
+    let framework = combined_framework(&after_parsed, baseline_parsed.as_ref());
+    let mut report = VerifyReport {
+        command: args.test_command,
+        baseline_rev: baseline_revision,
+        baseline_exit: baseline_run.as_ref().and_then(|run| run.exit_code),
+        after_exit: after_run.exit_code,
+        workspace_digest_before: digest_before,
+        workspace_digest_after: digest_after,
+        framework,
+        mirrored_paths: mirrors
+            .iter()
+            .map(|mirror| mirror.relative.to_string_lossy().into_owned())
+            .collect(),
+        baseline_cache_hit,
+        limitations,
+        newly_failed: Vec::new(),
+        fixed: Vec::new(),
+        preexisting_failed: Vec::new(),
+        still_passing: Vec::new(),
+        not_run_in_after: Vec::new(),
+        infrastructure_error: setup_infrastructure,
+        exit_code: 0,
+    };
+
+    append_run_infrastructure("after", &after_parsed, &mut report.infrastructure_error);
+    if let Some(parsed) = &baseline_parsed {
+        append_run_infrastructure("baseline", parsed, &mut report.infrastructure_error);
+        classify_tests(
+            parsed,
+            &after_parsed,
+            baseline_run.as_ref(),
+            &after_run,
+            &mut report,
+        );
+    }
+    if !report.infrastructure_error.is_empty() {
+        report.exit_code = EXIT_INFRASTRUCTURE;
+    } else if !report.newly_failed.is_empty() {
+        report.exit_code = EXIT_NEWLY_FAILED;
+    }
+    emit_report(&report, args.json);
+    report.exit_code
+}
+
+fn classify_tests(
+    baseline: &ParsedRun,
+    after: &ParsedRun,
+    baseline_run: Option<&CommandRun>,
+    after_run: &CommandRun,
+    report: &mut VerifyReport,
+) {
+    let mut ids: BTreeSet<String> = baseline.tests.keys().cloned().collect();
+    ids.extend(after.tests.keys().cloned());
+    if ids.is_empty() && baseline.infrastructure.is_none() && after.infrastructure.is_none() {
+        let baseline_status = command_status(baseline_run.and_then(|run| run.exit_code));
+        let after_status = command_status(after_run.exit_code);
+        classify_pair(
+            "command",
+            baseline_status.map(|status| TestObservation {
+                status,
+                evidence_line: command_evidence(baseline_run),
+            }),
+            after_status.map(|status| TestObservation {
+                status,
+                evidence_line: command_evidence(Some(after_run)),
+            }),
+            report,
+        );
+        return;
+    }
+    for id in ids {
+        classify_pair(
+            &id,
+            baseline.tests.get(&id).cloned(),
+            after.tests.get(&id).cloned(),
+            report,
+        );
+    }
+}
+
+fn classify_pair(
+    test_id: &str,
+    baseline: Option<TestObservation>,
+    after: Option<TestObservation>,
+    report: &mut VerifyReport,
+) {
+    match (baseline, after) {
+        (Some(base), Some(current)) => match (base.status, current.status) {
+            (TestStatus::Passed, TestStatus::Failed) => report.newly_failed.push(ReportCase {
+                test_id: test_id.into(),
+                evidence_line: current.evidence_line,
+            }),
+            (TestStatus::Failed, TestStatus::Passed) => report.fixed.push(ReportCase {
+                test_id: test_id.into(),
+                evidence_line: current.evidence_line,
+            }),
+            (TestStatus::Failed, TestStatus::Failed) => {
+                report.preexisting_failed.push(ReportCase {
+                    test_id: test_id.into(),
+                    evidence_line: current.evidence_line,
+                });
+            }
+            (TestStatus::Passed, TestStatus::Passed) => report.still_passing.push(ReportCase {
+                test_id: test_id.into(),
+                evidence_line: current.evidence_line,
+            }),
+        },
+        (None, Some(current)) if current.status == TestStatus::Failed => {
+            report.newly_failed.push(ReportCase {
+                test_id: test_id.into(),
+                evidence_line: current.evidence_line,
+            });
+        }
+        (None, Some(current)) => report.still_passing.push(ReportCase {
+            test_id: test_id.into(),
+            evidence_line: current.evidence_line,
+        }),
+        (Some(base), None) => report.not_run_in_after.push(ReportCase {
+            test_id: test_id.into(),
+            evidence_line: base.evidence_line,
+        }),
+        (None, None) => {}
+    }
+}
+
+fn command_status(exit_code: Option<i32>) -> Option<TestStatus> {
+    exit_code.map(|code| {
+        if code == 0 {
+            TestStatus::Passed
+        } else {
+            TestStatus::Failed
+        }
+    })
+}
+
+fn command_evidence(run: Option<&CommandRun>) -> String {
+    let Some(run) = run else {
+        return "command did not run".into();
+    };
+    let output = strip_ansi(&run.combined_text());
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(one_line)
+        .unwrap_or_else(|| format!("command exited {}", run.exit_code.unwrap_or(-1)))
+}
+
+fn combined_framework(after: &ParsedRun, baseline: Option<&ParsedRun>) -> String {
+    match baseline.map(|run| run.framework) {
+        Some(value) if value == after.framework => value.as_str().into(),
+        Some(Framework::Unknown) | None => after.framework.as_str().into(),
+        Some(value) if after.framework == Framework::Unknown => value.as_str().into(),
+        Some(value) => format!("mixed:{}+{}", value.as_str(), after.framework.as_str()),
+    }
+}
+
+fn append_run_infrastructure(label: &str, parsed: &ParsedRun, target: &mut Vec<ReportCase>) {
+    if let Some(failure) = &parsed.infrastructure {
+        target.push(ReportCase {
+            test_id: format!("{label}:{}", failure.signature),
+            evidence_line: failure.evidence_line.clone(),
+        });
+    }
+}
+
+fn push_limitation(limitations: &mut Vec<String>, value: Option<String>) {
+    if let Some(value) = value {
+        if !limitations.contains(&value) {
+            limitations.push(value);
+        }
+    }
+}
+
+fn emit_early_infrastructure(args: &VerifyArgs, test_id: &str, evidence: &str) -> i32 {
+    let report = VerifyReport {
+        command: args.test_command.clone(),
+        baseline_rev: args.baseline.clone(),
+        baseline_exit: None,
+        after_exit: None,
+        workspace_digest_before: String::new(),
+        workspace_digest_after: String::new(),
+        framework: "unknown".into(),
+        mirrored_paths: Vec::new(),
+        baseline_cache_hit: false,
+        limitations: vec![
+            "verification could not start; no test framework output was produced".into(),
+        ],
+        newly_failed: Vec::new(),
+        fixed: Vec::new(),
+        preexisting_failed: Vec::new(),
+        still_passing: Vec::new(),
+        not_run_in_after: Vec::new(),
+        infrastructure_error: vec![ReportCase {
+            test_id: test_id.into(),
+            evidence_line: one_line(evidence),
+        }],
+        exit_code: EXIT_INFRASTRUCTURE,
+    };
+    emit_report(&report, args.json);
+    EXIT_INFRASTRUCTURE
+}
+
+fn emit_report(report: &VerifyReport, json: bool) {
+    if json {
+        println!("{}", report_json(report));
+        return;
+    }
+    println!(
+        "verify: newly_failed={} fixed={} preexisting_failed={} still_passing={} not_run_in_after={} infrastructure_error={}",
+        report.newly_failed.len(),
+        report.fixed.len(),
+        report.preexisting_failed.len(),
+        report.still_passing.len(),
+        report.not_run_in_after.len(),
+        report.infrastructure_error.len()
+    );
+    println!(
+        "framework: {} | baseline={} exit={}{} | after_exit={}",
+        report.framework,
+        report.baseline_rev,
+        display_exit(report.baseline_exit),
+        if report.baseline_cache_hit {
+            " (cache hit)"
+        } else {
+            ""
+        },
+        display_exit(report.after_exit)
+    );
+    println!(
+        "workspace: before={} after={} unchanged={}",
+        report.workspace_digest_before,
+        report.workspace_digest_after,
+        report.workspace_digest_before == report.workspace_digest_after
+            && !report.workspace_digest_before.is_empty()
+    );
+    if report.mirrored_paths.is_empty() {
+        println!("baseline mirrors: (none)");
+    } else {
+        println!("baseline mirrors: {}", report.mirrored_paths.join(", "));
+    }
+    for limitation in &report.limitations {
+        println!("limitation: {limitation}");
+    }
+    for case in &report.newly_failed {
+        println!("newly_failed: {} — {}", case.test_id, case.evidence_line);
+    }
+    for case in &report.infrastructure_error {
+        println!(
+            "infrastructure_error: {} — {}",
+            case.test_id, case.evidence_line
+        );
+    }
+    if !report.preexisting_failed.is_empty() {
+        println!(
+            "preexisting_failed: {}",
+            report
+                .preexisting_failed
+                .iter()
+                .map(|case| case.test_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+}
+
+fn report_json(report: &VerifyReport) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": "greppy.verify-report.v1",
+        "command": report.command,
+        "baseline_rev": report.baseline_rev,
+        "baseline_exit": report.baseline_exit,
+        "after_exit": report.after_exit,
+        "workspace_digest_before": report.workspace_digest_before,
+        "workspace_digest_after": report.workspace_digest_after,
+        "workspace_unchanged": report.workspace_digest_before == report.workspace_digest_after && !report.workspace_digest_before.is_empty(),
+        "framework": report.framework,
+        "mirrored_paths": report.mirrored_paths,
+        "baseline_cache_hit": report.baseline_cache_hit,
+        "limitations": report.limitations,
+        "newly_failed": cases_json(&report.newly_failed),
+        "fixed": cases_json(&report.fixed),
+        "preexisting_failed": cases_json(&report.preexisting_failed),
+        "still_passing": cases_json(&report.still_passing),
+        "not_run_in_after": cases_json(&report.not_run_in_after),
+        "infrastructure_error": cases_json(&report.infrastructure_error),
+        "exit_code": report.exit_code,
+    })
+}
+
+fn cases_json(cases: &[ReportCase]) -> Vec<serde_json::Value> {
+    cases
+        .iter()
+        .map(|case| {
+            serde_json::json!({
+                "test_id": case.test_id,
+                "evidence_line": case.evidence_line,
+            })
+        })
+        .collect()
+}
+
+fn display_exit(exit: Option<i32>) -> String {
+    exit.map_or_else(|| "not-run".into(), |code| code.to_string())
 }
 
 pub(crate) struct TemporaryWorktree {

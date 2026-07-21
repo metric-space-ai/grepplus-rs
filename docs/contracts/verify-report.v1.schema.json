@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greppy.dev/contracts/verify-report.v1.schema.json",
+  "title": "Greppy verify report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "command",
+    "baseline_rev",
+    "baseline_exit",
+    "after_exit",
+    "workspace_digest_before",
+    "workspace_digest_after",
+    "workspace_unchanged",
+    "framework",
+    "mirrored_paths",
+    "baseline_cache_hit",
+    "limitations",
+    "newly_failed",
+    "fixed",
+    "preexisting_failed",
+    "still_passing",
+    "not_run_in_after",
+    "infrastructure_error",
+    "exit_code"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "greppy.verify-report.v1"
+    },
+    "command": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string" }
+    },
+    "baseline_rev": { "type": "string" },
+    "baseline_exit": { "type": ["integer", "null"] },
+    "after_exit": { "type": ["integer", "null"] },
+    "workspace_digest_before": { "type": "string" },
+    "workspace_digest_after": { "type": "string" },
+    "workspace_unchanged": { "type": "boolean" },
+    "framework": {
+      "type": "string",
+      "description": "pytest, go-test, cargo-test, jest-vitest, unknown, or a mixed detector diagnostic"
+    },
+    "mirrored_paths": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Gitignored dependency/build directories symlinked into the baseline worktree"
+    },
+    "baseline_cache_hit": { "type": "boolean" },
+    "limitations": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "newly_failed": { "$ref": "#/$defs/cases" },
+    "fixed": { "$ref": "#/$defs/cases" },
+    "preexisting_failed": { "$ref": "#/$defs/cases" },
+    "still_passing": { "$ref": "#/$defs/cases" },
+    "not_run_in_after": { "$ref": "#/$defs/cases" },
+    "infrastructure_error": { "$ref": "#/$defs/cases" },
+    "exit_code": {
+      "type": "integer",
+      "enum": [0, 21, 22]
+    }
+  },
+  "$defs": {
+    "cases": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/case" }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test_id", "evidence_line"],
+      "properties": {
+        "test_id": { "type": "string", "minLength": 1 },
+        "evidence_line": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

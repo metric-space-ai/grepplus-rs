@@ -231,6 +231,11 @@ pub enum Command {
         #[command(flatten)]
         args: trial::TrialArgs,
     },
+    /// Compare current-tree tests with an isolated committed baseline.
+    Verify {
+        #[command(flatten)]
+        args: verify::VerifyArgs,
+    },
     /// Structured graph search.
     SearchGraph {
         #[arg(long)]
@@ -1047,6 +1052,7 @@ const SUBCOMMANDS: &[&str] = &[
     "index",
     "cache",
     "trial",
+    "verify",
     "stats",
     "diagnostics",
     "doctor",
@@ -1268,6 +1274,9 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
+        }
+        "verify" => {
+            "greppy verify [--baseline REV] [--timeout SECONDS] [--json] [--no-cache] -- <test-command...>"
         }
         "cache" => "greppy cache status|gc|clear [--json|--dry-run|--all --yes] [--root DIR]",
         _ => return None,
@@ -1786,6 +1795,7 @@ fn dispatch_subcommand(
         }
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Trial { args } => trial::run(args, root),
+        Command::Verify { args } => Ok(verify::run(args, root)),
         Command::SearchGraph { name, json } => {
             let mut q = greppy_search::GraphQuery::any().with_limit(50);
             let name_filter = name.as_deref();

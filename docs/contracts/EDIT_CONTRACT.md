@@ -154,3 +154,33 @@ part of the arm definition, recorded per arm in the manifest
 can still read and write files, so the arm loses no ability, only the
 contradiction. Explorer and greppy arms keep `bash,read,edit,write`.
 Thresholds are unchanged.
+
+## Verify (binding, v0.3.0)
+
+```
+greppy verify [--baseline REV] [--timeout SECONDS] [--json] [--no-cache] -- <test-command...>
+```
+
+`verify` runs the command in the current working tree first, then runs the same
+argv against the committed `REV` (default `HEAD`) in a detached temporary Git
+worktree. Greppy never stashes, checks out, writes the index, or otherwise
+mutates the user's worktree to create the baseline. The report attests a digest
+of index entries plus live bytes for every tracked path before and after both
+runs. Temporary baseline worktrees are force-removed even after command failure
+or timeout.
+
+A baseline worktree may symlink an existing, Git-ignored `.tox`, `.venv`,
+`venv`, `.nox`, `node_modules`, or `target` directory from the corresponding
+repository-root or command-directory location. The exact relative mirror list
+is printed and included in `greppy.verify-report.v1`. No dependency installer
+is run. Baseline results are cached under the workspace's Greppy store with a
+key derived from the resolved revision, exact command argv, and mirror list;
+`--no-cache` bypasses that result.
+
+Exit `0` means no newly failed test and no infrastructure error, `21` means at
+least one `newly_failed` test, and `22` means an after/baseline command,
+collection/build, timeout, environment, or worktree infrastructure error.
+Infrastructure takes precedence over test-failure exit `21`. Supported v1
+per-test parsers are pytest, `go test`, `cargo test`, and Jest/Vitest. Unknown
+frameworks are explicitly reported as `framework: "unknown"` and compared at
+command-exit level rather than being represented as an empty passing suite.
