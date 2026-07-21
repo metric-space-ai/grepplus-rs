@@ -37,7 +37,11 @@ class GitFixture(unittest.TestCase):
         git(self.source, "config", "user.name", "Benchmark Test")
         git(self.source, "config", "user.email", "benchmark@example.invalid")
         (self.source / "value.txt").write_text("old\n", encoding="utf-8")
-        git(self.source, "add", "value.txt")
+        (self.source / "test_guard.py").write_text(
+            "import pathlib\nassert pathlib.Path('value.txt').read_text() == 'old\\n'\n",
+            encoding="utf-8",
+        )
+        git(self.source, "add", "value.txt", "test_guard.py")
         git(self.source, "commit", "-qm", "fixture")
         self.commit = git(self.source, "rev-parse", "HEAD")
         self.backing = self.root / "repo.git"
@@ -276,6 +280,70 @@ class SetupLifecycleTests(GitFixture):
         self.assertGreaterEqual(row["setup"]["wall_seconds"], 0.15)
         self.assertEqual(row["agent"]["wall_seconds"], 0.01)
         self.assertTrue(row["valid"])
+
+    def test_v2_arm_restores_agent_modified_test_before_final_run(self) -> None:
+        test_patch = """diff --git a/test_guard.py b/test_guard.py
+--- a/test_guard.py
++++ b/test_guard.py
+@@ -1,2 +1,2 @@
+ import pathlib
+-assert pathlib.Path('value.txt').read_text() == 'old\\n'
++assert pathlib.Path('value.txt').read_text() == 'new\\n'
+"""
+        task = self.task()
+        task.update(
+            {
+                "task_bank": "v2",
+                "test_patch": test_patch,
+                "mutation_patch": test_patch,
+                "test_command": [sys.executable, "test_guard.py"],
+            }
+        )
+        with bench.temporary_worktree(
+            self.backing, self.commit, self.root / "reset-hash-worktree", 10
+        ) as hash_worktree:
+            bench.apply_mutation(hash_worktree, test_patch, 10)
+            expected_hash = bench.sha256_bytes(
+                bench.capture_binary_diff(hash_worktree, self.commit, 10)
+            )
+
+        def weaken_test(**kwargs):
+            worktree = kwargs["worktree"]
+            (worktree / "test_guard.py").write_text(
+                "import pathlib\nassert pathlib.Path('value.txt').read_text() == 'old\\n'\n",
+                encoding="utf-8",
+            )
+            metrics = {
+                "wall_seconds": 0.01,
+                "success": True,
+                "turns": 1,
+                "reported_error": False,
+                "tool_calls": 1,
+                "source_opens": 1,
+                "input_tokens": 1,
+                "output_tokens": 1,
+            }
+            return metrics, bench.ProcessResult(0, b"", b"", 0.01, False)
+
+        with mock.patch.object(bench, "run_pi_agent", side_effect=weaken_test):
+            row = bench.run_arm(
+                arm="explorer",
+                task=task,
+                backing=self.backing,
+                task_tmp=self.root / "reset-arm",
+                raw_dir=self.root / "raw-reset-arm",
+                pi_bin=pathlib.Path(sys.executable),
+                greppy_bin=pathlib.Path(sys.executable),
+                warm_greppy=False,
+                expected_mutation_hash=expected_hash,
+                secrets=[],
+            )
+        self.assertTrue(row["test_files_modified_by_agent"])
+        self.assertEqual(row["test_files_modified_by_agent_paths"], ["test_guard.py"])
+        self.assertFalse(row["correctness"])
+        self.assertNotEqual(row["test"]["return_code"], 0)
+        final_patch = (self.root / "raw-reset-arm" / "final.patch").read_text(encoding="utf-8")
+        self.assertIn("+assert pathlib.Path('value.txt').read_text() == 'new", final_patch)
 
 
 class V2PreflightClassificationTests(unittest.TestCase):

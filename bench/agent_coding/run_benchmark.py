@@ -564,6 +564,48 @@ def capture_binary_diff(worktree: pathlib.Path, base_commit: str, timeout_second
     ).stdout
 
 
+@dataclass(frozen=True)
+class TestFileState:
+    content: bytes | None
+    mode: int | None
+
+
+def snapshot_test_files(worktree: pathlib.Path, paths: Sequence[str]) -> dict[str, TestFileState]:
+    snapshots: dict[str, TestFileState] = {}
+    for relative in paths:
+        path = worktree / relative
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise HarnessError(f"test patch path is not a regular file: {relative}")
+        snapshots[relative] = (
+            TestFileState(path.read_bytes(), path.stat().st_mode & 0o777)
+            if path.is_file()
+            else TestFileState(None, None)
+        )
+    return snapshots
+
+
+def restore_test_files(worktree: pathlib.Path, snapshots: dict[str, TestFileState]) -> list[str]:
+    modified: list[str] = []
+    for relative, expected in snapshots.items():
+        path = worktree / relative
+        regular = path.is_file() and not path.is_symlink()
+        current_content = path.read_bytes() if regular else None
+        current_mode = path.stat().st_mode & 0o777 if regular else None
+        if current_content == expected.content and current_mode == expected.mode:
+            continue
+        modified.append(relative)
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
+        if expected.content is not None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            atomic_write_bytes(path, expected.content)
+            if expected.mode is not None:
+                path.chmod(expected.mode)
+    return modified
+
+
 def patch_touched_paths(patch: str) -> list[str]:
     """Return normalized repository paths named by a git-style patch."""
     paths: set[str] = set()
@@ -1105,6 +1147,11 @@ def run_arm(
         mutation_hash = sha256_bytes(mutation_diff)
         if mutation_hash != expected_mutation_hash:
             raise HarnessError("arm mutation differs from preflight mutation")
+        test_file_snapshots = (
+            snapshot_test_files(worktree, patch_touched_paths(task["test_patch"]))
+            if task.get("task_bank") == "v2"
+            else {}
+        )
 
         warmup: dict[str, Any] = {"enabled": bool(warm_greppy and arm == "greppy")}
         if warmup["enabled"]:
@@ -1138,6 +1185,7 @@ def run_arm(
         atomic_write_bytes(raw_dir / "pretest.patch", safe_pretest_diff)
         if safe_pretest_diff != pretest_diff:
             raise HarnessError("provider key appeared in agent diff")
+        modified_test_files = restore_test_files(worktree, test_file_snapshots)
 
         test_env = environment_without_provider_key()
         test_env["GREPPY_STORE_DIR"] = str(store_dir)
@@ -1172,6 +1220,8 @@ def run_arm(
             "test": process_summary(test_result, test_output),
             "warmup": warmup,
             "mutation_diff_sha256": mutation_hash,
+            "test_files_modified_by_agent": bool(modified_test_files),
+            "test_files_modified_by_agent_paths": modified_test_files,
             "pretest_diff_sha256": sha256_bytes(pretest_diff),
             "pretest_diff_bytes": len(pretest_diff),
             "final_diff_sha256": sha256_bytes(final_diff),
