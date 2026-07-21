@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{Read, Write};
@@ -234,6 +234,385 @@ fn read_pipe<R: Read>(pipe: Option<R>) -> Vec<u8> {
         let _ = pipe.read_to_end(&mut bytes);
     }
     bytes
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Framework {
+    Pytest,
+    GoTest,
+    CargoTest,
+    JestVitest,
+    Unknown,
+}
+
+impl Framework {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Pytest => "pytest",
+            Self::GoTest => "go-test",
+            Self::CargoTest => "cargo-test",
+            Self::JestVitest => "jest-vitest",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TestStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TestObservation {
+    pub(crate) status: TestStatus,
+    pub(crate) evidence_line: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InfrastructureFailure {
+    pub(crate) signature: String,
+    pub(crate) evidence_line: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParsedRun {
+    pub(crate) framework: Framework,
+    pub(crate) tests: BTreeMap<String, TestObservation>,
+    pub(crate) infrastructure: Option<InfrastructureFailure>,
+    pub(crate) limitation: Option<String>,
+}
+
+pub(crate) fn parse_run(run: &CommandRun) -> ParsedRun {
+    if let Some(error) = &run.spawn_error {
+        return ParsedRun {
+            framework: Framework::Unknown,
+            tests: BTreeMap::new(),
+            infrastructure: Some(InfrastructureFailure {
+                signature: "test_process_spawn_error".into(),
+                evidence_line: one_line(error),
+            }),
+            limitation: Some("no test framework output was produced".into()),
+        };
+    }
+    if run.timed_out {
+        return ParsedRun {
+            framework: Framework::Unknown,
+            tests: BTreeMap::new(),
+            infrastructure: Some(InfrastructureFailure {
+                signature: "timeout".into(),
+                evidence_line: "test command exceeded its timeout".into(),
+            }),
+            limitation: Some("the timed-out run may have emitted only partial test output".into()),
+        };
+    }
+
+    let text = strip_ansi(&run.combined_text());
+    let lines: Vec<String> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    let framework = detect_framework(&lines);
+    let tests = match framework {
+        Framework::Pytest => parse_pytest(&lines),
+        Framework::GoTest => parse_go_test(&lines),
+        Framework::CargoTest => parse_cargo_test(&lines),
+        Framework::JestVitest => parse_jest_vitest(&lines),
+        Framework::Unknown => BTreeMap::new(),
+    };
+    let infrastructure = classify_infrastructure(run.exit_code, framework, &tests, &lines);
+    let limitation = match framework {
+        Framework::Unknown => Some(
+            "unrecognized test framework: comparison is limited to command exit codes".into(),
+        ),
+        _ if tests.is_empty() => Some(format!(
+            "{} was recognized, but this output did not expose individual test IDs; command-level evidence is used where possible",
+            framework.as_str()
+        )),
+        _ => None,
+    };
+    ParsedRun {
+        framework,
+        tests,
+        infrastructure,
+        limitation,
+    }
+}
+
+fn detect_framework(lines: &[String]) -> Framework {
+    if lines.iter().any(|line| {
+        line.starts_with("test result:")
+            || (line.starts_with("running ") && line.ends_with(" tests"))
+    }) {
+        return Framework::CargoTest;
+    }
+    if lines.iter().any(|line| {
+        line.starts_with("=== RUN")
+            || line.starts_with("--- PASS:")
+            || line.starts_with("--- FAIL:")
+            || line.starts_with("ok\t")
+            || line.starts_with("FAIL\t")
+    }) {
+        return Framework::GoTest;
+    }
+    if lines.iter().any(|line| {
+        line.starts_with("Test Suites:")
+            || line.starts_with("Tests:")
+            || line.starts_with("PASS ")
+            || line.starts_with("FAIL ")
+            || line.contains(" Vitest ")
+    }) {
+        return Framework::JestVitest;
+    }
+    if lines.iter().any(|line| {
+        line.contains("short test summary info")
+            || line.contains("ERROR collecting")
+            || line.starts_with("collected ")
+            || ((line.contains(" passed") || line.contains(" failed"))
+                && (line.contains(" in ") || line.contains("pytest")))
+            || (line.contains("::")
+                && (line.contains(" PASSED")
+                    || line.contains(" FAILED")
+                    || line.starts_with("FAILED ")
+                    || line.starts_with("PASSED ")))
+    }) {
+        return Framework::Pytest;
+    }
+    Framework::Unknown
+}
+
+fn parse_cargo_test(lines: &[String]) -> BTreeMap<String, TestObservation> {
+    let mut tests = BTreeMap::new();
+    for line in lines {
+        let Some(rest) = line.strip_prefix("test ") else {
+            continue;
+        };
+        let Some((test_id, status)) = rest.rsplit_once(" ... ") else {
+            continue;
+        };
+        let status = match status.split_whitespace().next() {
+            Some("ok") => TestStatus::Passed,
+            Some("FAILED") => TestStatus::Failed,
+            _ => continue,
+        };
+        tests.insert(
+            test_id.to_owned(),
+            TestObservation {
+                status,
+                evidence_line: one_line(line),
+            },
+        );
+    }
+    tests
+}
+
+fn parse_pytest(lines: &[String]) -> BTreeMap<String, TestObservation> {
+    let mut tests = BTreeMap::new();
+    for line in lines {
+        let status = if line.starts_with("FAILED ") || line.contains(" FAILED") {
+            Some(TestStatus::Failed)
+        } else if line.starts_with("PASSED ") || line.contains(" PASSED") {
+            Some(TestStatus::Passed)
+        } else {
+            None
+        };
+        let Some(status) = status else { continue };
+        let Some(test_id) = line
+            .split_whitespace()
+            .find(|token| token.contains("::"))
+            .map(|token| token.trim_end_matches([':', ',']).to_owned())
+        else {
+            continue;
+        };
+        tests.insert(
+            test_id,
+            TestObservation {
+                status,
+                evidence_line: one_line(line),
+            },
+        );
+    }
+    tests
+}
+
+fn parse_go_test(lines: &[String]) -> BTreeMap<String, TestObservation> {
+    let mut tests = BTreeMap::new();
+    for line in lines {
+        let (status, rest) = if let Some(rest) = line.strip_prefix("--- PASS: ") {
+            (TestStatus::Passed, rest)
+        } else if let Some(rest) = line.strip_prefix("--- FAIL: ") {
+            (TestStatus::Failed, rest)
+        } else {
+            continue;
+        };
+        let test_id = rest.split_whitespace().next().unwrap_or(rest);
+        tests.insert(
+            test_id.to_owned(),
+            TestObservation {
+                status,
+                evidence_line: one_line(line),
+            },
+        );
+    }
+    tests
+}
+
+fn parse_jest_vitest(lines: &[String]) -> BTreeMap<String, TestObservation> {
+    let mut tests = BTreeMap::new();
+    for line in lines {
+        let (status, rest) = if let Some(rest) = line.strip_prefix("PASS ") {
+            (TestStatus::Passed, rest)
+        } else if let Some(rest) = line.strip_prefix("FAIL ") {
+            (TestStatus::Failed, rest)
+        } else if let Some(rest) = strip_test_glyph(line, &["✓", "✔"]) {
+            (TestStatus::Passed, rest)
+        } else if let Some(rest) = strip_test_glyph(line, &["✕", "×", "✗"]) {
+            (TestStatus::Failed, rest)
+        } else {
+            continue;
+        };
+        let test_id = strip_javascript_duration(rest);
+        if test_id.is_empty() {
+            continue;
+        }
+        tests.insert(
+            test_id.to_owned(),
+            TestObservation {
+                status,
+                evidence_line: one_line(line),
+            },
+        );
+    }
+    tests
+}
+
+fn strip_test_glyph<'a>(line: &'a str, glyphs: &[&str]) -> Option<&'a str> {
+    let trimmed = line.trim_start();
+    glyphs
+        .iter()
+        .find_map(|glyph| trimmed.strip_prefix(glyph).map(str::trim))
+}
+
+fn strip_javascript_duration(value: &str) -> &str {
+    let value = value.trim();
+    if let Some(open) = value.rfind(" (") {
+        let suffix = &value[open + 2..];
+        if suffix.ends_with("ms)") && suffix[..suffix.len() - 3].trim().parse::<u64>().is_ok() {
+            return value[..open].trim();
+        }
+    }
+    value
+}
+
+fn classify_infrastructure(
+    exit_code: Option<i32>,
+    framework: Framework,
+    tests: &BTreeMap<String, TestObservation>,
+    lines: &[String],
+) -> Option<InfrastructureFailure> {
+    if exit_code == Some(0) {
+        return None;
+    }
+    const HARD_SIGNATURES: &[(&str, &[&str])] = &[
+        (
+            "command_not_found",
+            &[
+                "command not found",
+                "not recognized as an internal or external command",
+            ],
+        ),
+        (
+            "missing_file_or_interpreter",
+            &["no such file or directory", "bad interpreter"],
+        ),
+        (
+            "missing_test_runner",
+            &[
+                "no module named pytest",
+                "no module named 'pytest'",
+                "no module named unittest",
+                "no module named nose",
+            ],
+        ),
+        (
+            "cannot_execute",
+            &[
+                "cannot execute binary file",
+                "cannot execute: required file not found",
+            ],
+        ),
+        (
+            "compile_failure",
+            &["error: could not compile", "[build failed]"],
+        ),
+        (
+            "collection_failure",
+            &[
+                "error collecting",
+                "importerror while importing test module",
+                "modulenotfounderror",
+                "test suite failed to run",
+            ],
+        ),
+    ];
+    for (signature, needles) in HARD_SIGNATURES {
+        if let Some(line) = lines.iter().find(|line| {
+            let lower = line.to_ascii_lowercase();
+            needles.iter().any(|needle| lower.contains(needle))
+        }) {
+            return Some(InfrastructureFailure {
+                signature: (*signature).into(),
+                evidence_line: one_line(line),
+            });
+        }
+    }
+    if framework != Framework::Unknown
+        && !tests.values().any(|test| test.status == TestStatus::Failed)
+    {
+        return Some(InfrastructureFailure {
+            signature: "nonzero_without_assertion_failure".into(),
+            evidence_line: lines
+                .first()
+                .map(|line| one_line(line))
+                .unwrap_or_else(|| "nonzero exit without test-framework output".into()),
+        });
+    }
+    None
+}
+
+fn strip_ansi(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == 0x1b && bytes.get(index + 1) == Some(&b'[') {
+            index += 2;
+            while index < bytes.len() {
+                let byte = bytes[index];
+                index += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+        } else {
+            output.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&output).into_owned()
+}
+
+fn one_line(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let shortened: String = chars.by_ref().take(500).collect();
+    if chars.next().is_some() {
+        format!("{shortened}…")
+    } else {
+        shortened
+    }
 }
 
 pub(crate) struct TemporaryWorktree {
@@ -533,6 +912,87 @@ mod tests {
         fs::write(root.join("tracked.txt"), "two").unwrap();
         assert_ne!(workspace_digest(&root).unwrap(), first);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_pytest_quiet_failure_ids() {
+        let run = CommandRun {
+            exit_code: Some(1),
+            stdout: b"FAILED tests/test_math.py::test_add - assert 3 == 4\n1 failed, 1 passed in 0.02s\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+            spawn_error: None,
+        };
+        let parsed = parse_run(&run);
+        assert_eq!(parsed.framework, Framework::Pytest);
+        assert_eq!(
+            parsed.tests["tests/test_math.py::test_add"].status,
+            TestStatus::Failed
+        );
+        assert!(parsed.infrastructure.is_none());
+    }
+
+    #[test]
+    fn parses_cargo_go_and_javascript_results() {
+        let cargo = CommandRun {
+            exit_code: Some(1),
+            stdout: b"running 2 tests\ntest math::adds ... ok\ntest math::breaks ... FAILED\ntest result: FAILED. 1 passed; 1 failed\n".to_vec(),
+            stderr: Vec::new(), timed_out: false, spawn_error: None,
+        };
+        let parsed = parse_run(&cargo);
+        assert_eq!(parsed.framework, Framework::CargoTest);
+        assert_eq!(parsed.tests["math::breaks"].status, TestStatus::Failed);
+
+        let go = CommandRun {
+            exit_code: Some(1),
+            stdout: b"=== RUN   TestAdd\n--- FAIL: TestAdd (0.00s)\nFAIL\texample/pkg\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+            spawn_error: None,
+        };
+        let parsed = parse_run(&go);
+        assert_eq!(parsed.framework, Framework::GoTest);
+        assert_eq!(parsed.tests["TestAdd"].status, TestStatus::Failed);
+
+        let js = CommandRun {
+            exit_code: Some(1),
+            stdout: "FAIL src/math.test.ts\n  ✕ adds numbers (3 ms)\nTest Suites: 1 failed\n"
+                .as_bytes()
+                .to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+            spawn_error: None,
+        };
+        let parsed = parse_run(&js);
+        assert_eq!(parsed.framework, Framework::JestVitest);
+        assert_eq!(parsed.tests["adds numbers"].status, TestStatus::Failed);
+    }
+
+    #[test]
+    fn compile_and_collection_errors_are_infrastructure() {
+        let cargo = CommandRun {
+            exit_code: Some(101),
+            stdout: Vec::new(),
+            stderr: b"error: could not compile `fixture` due to 1 previous error\n".to_vec(),
+            timed_out: false,
+            spawn_error: None,
+        };
+        let parsed = parse_run(&cargo);
+        assert_eq!(parsed.infrastructure.unwrap().signature, "compile_failure");
+
+        let pytest = CommandRun {
+            exit_code: Some(2),
+            stdout: b"collected 0 items / 1 error\nERROR collecting tests/test_bad.py\n".to_vec(),
+            stderr: Vec::new(),
+            timed_out: false,
+            spawn_error: None,
+        };
+        let parsed = parse_run(&pytest);
+        assert_eq!(parsed.framework, Framework::Pytest);
+        assert_eq!(
+            parsed.infrastructure.unwrap().signature,
+            "collection_failure"
+        );
     }
 
     #[test]
