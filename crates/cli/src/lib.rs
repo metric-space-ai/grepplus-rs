@@ -381,6 +381,9 @@ pub enum Command {
         /// Same disambiguation as the positional path, in flag form.
         #[arg(long = "path", value_name = "FILE")]
         path_opt: Option<String>,
+        /// For file reads, print only the inclusive 1-based range A:B.
+        #[arg(long, value_name = "A:B")]
+        lines: Option<String>,
         /// Also return an edit handle for the definition span.
         #[arg(long)]
         handle: bool,
@@ -2024,10 +2027,23 @@ fn dispatch_subcommand(
             symbol_opt,
             path,
             path_opt,
+            lines,
             handle,
             code: _,
             json,
         } => {
+            if symbol_opt.is_none() && path.is_none() && path_opt.is_none() {
+                if let Some(subject) = symbol.as_deref() {
+                    if read_subject_is_path(subject, root)? {
+                        return dispatch_read_file(subject, lines.as_deref(), json, root);
+                    }
+                }
+            }
+            if lines.is_some() {
+                return Err(Error::Invalid(
+                    "read --lines A:B requires a file path (for symbols, omit --lines)".into(),
+                ));
+            }
             let symbol = symbol_opt.as_deref().or(symbol.as_deref());
             let folded = qualify_symbol_with_path(symbol, path.as_deref().or(path_opt.as_deref()));
             dispatch_read(folded.as_deref().or(symbol), handle, json, root)
@@ -6474,6 +6490,200 @@ fn summarize_definition_span(file_path: &str, source_span: &str) -> Option<Vec<S
 /// SINGLE call instead of three, which is exactly where the benchmark showed
 /// research-task iteration eating the token/time savings.
 const BRIEF_JSON_SCHEMA_VERSION: &str = "greppy.brief.v1";
+
+fn read_file_candidate(root_path: &std::path::Path, subject: &str) -> std::path::PathBuf {
+    let supplied = std::path::Path::new(subject);
+    if supplied.is_absolute() {
+        return supplied.to_path_buf();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let from_cwd = cwd.join(supplied);
+        if from_cwd.exists() {
+            return from_cwd;
+        }
+    }
+    root_path.join(supplied)
+}
+
+fn read_subject_is_path(subject: &str, root: Option<&str>) -> Result<bool> {
+    let root_path = resolve_root(root)?;
+    if read_file_candidate(&root_path, subject).exists() {
+        return Ok(true);
+    }
+    let supplied = std::path::Path::new(subject);
+    if supplied.is_absolute()
+        || subject.starts_with('.')
+        || subject.contains('/')
+        || subject.contains('\\')
+    {
+        return Ok(true);
+    }
+    let path_extension = supplied.extension().and_then(|extension| extension.to_str());
+    Ok(matches!(
+        path_extension,
+        Some(
+            "rs" | "py" | "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "go"
+                | "rb" | "java" | "c" | "h" | "cpp" | "cc" | "cxx" | "hpp" | "hh"
+                | "cs" | "php" | "sh" | "bash" | "lua" | "kt" | "kts" | "scala"
+                | "sc" | "swift" | "zig" | "r" | "json" | "toml" | "yaml" | "yml"
+                | "md" | "txt"
+        )
+    ))
+}
+
+fn parse_read_line_range(raw: Option<&str>, line_count: usize) -> Result<(usize, usize)> {
+    let Some(raw) = raw else {
+        return Ok((1, line_count));
+    };
+    let Some((start, end)) = raw.split_once(':') else {
+        return Err(Error::Invalid(format!(
+            "read --lines expects an inclusive range A:B, got `{raw}`"
+        )));
+    };
+    let start = start.parse::<usize>().map_err(|_| {
+        Error::Invalid(format!(
+            "read --lines expects positive line numbers A:B, got `{raw}`"
+        ))
+    })?;
+    let end = end.parse::<usize>().map_err(|_| {
+        Error::Invalid(format!(
+            "read --lines expects positive line numbers A:B, got `{raw}`"
+        ))
+    })?;
+    if start == 0 || end < start {
+        return Err(Error::Invalid(format!(
+            "read --lines expects 1 <= A <= B, got `{raw}`"
+        )));
+    }
+    if start > line_count && line_count > 0 {
+        return Err(Error::Invalid(format!(
+            "read --lines starts at {start}, but the file has {line_count} line(s)"
+        )));
+    }
+    Ok((start, end.min(line_count)))
+}
+
+fn closest_read_paths(root_path: &std::path::Path, subject: &str) -> Result<Vec<String>> {
+    let overrides = discover_overrides_from_env()?;
+    let entries = greppy_discover::walk_with_policy_and_overrides(
+        root_path,
+        &greppy_discover::SkipPolicy::walk_default(),
+        &overrides,
+    )?;
+    let requested_name = std::path::Path::new(subject)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(subject);
+    let mut ranked = entries
+        .into_iter()
+        .map(|entry| {
+            let candidate_name = std::path::Path::new(&entry.rel_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&entry.rel_path);
+            let score = levenshtein(subject, &entry.rel_path)
+                .min(levenshtein(requested_name, candidate_name));
+            (score, entry.rel_path)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort();
+    ranked.dedup_by(|left, right| left.1 == right.1);
+    Ok(ranked
+        .into_iter()
+        .take(5)
+        .map(|(_, path)| path)
+        .collect())
+}
+
+fn dispatch_read_file(
+    subject: &str,
+    lines: Option<&str>,
+    json: bool,
+    root: Option<&str>,
+) -> Result<i32> {
+    const READ_FILE_JSON_SCHEMA_VERSION: &str = "greppy.read-file.v1";
+    let root_path = resolve_root(root)?;
+    let canonical_root = root_path.canonicalize().map_err(|source| Error::Io {
+        context: format!("canonicalize {}", root_path.display()),
+        source,
+    })?;
+    let candidate = read_file_candidate(&root_path, subject);
+    let canonical = candidate.canonicalize().ok();
+    let regular_file = canonical
+        .as_deref()
+        .is_some_and(|path| path.starts_with(&canonical_root) && path.is_file());
+    if !regular_file {
+        let suggestions = closest_read_paths(&canonical_root, subject)?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "schema_version": READ_FILE_JSON_SCHEMA_VERSION,
+                    "command": "read",
+                    "status": "not-found",
+                    "path": subject,
+                    "path_candidates": suggestions,
+                }))
+                .map_err(|error| Error::Invalid(format!("serialize read file JSON: {error}")))?
+            );
+        } else if suggestions.is_empty() {
+            println!("read: file `{subject}` not found");
+        } else {
+            println!("read: file `{subject}` not found; closest paths:");
+            for suggestion in &suggestions {
+                println!("  {suggestion}");
+            }
+            println!("try: greppy read {}", shell_example_arg(&suggestions[0]));
+        }
+        return Ok(10);
+    }
+    let canonical = canonical.expect("regular file check requires a canonical path");
+    let relative = canonical.strip_prefix(&canonical_root).map_err(|_| {
+        Error::Invalid(format!(
+            "read path `{subject}` resolves outside workspace {}",
+            canonical_root.display()
+        ))
+    })?;
+    let shown_path = relative.to_string_lossy().replace('\\', "/");
+    let content = std::fs::read_to_string(&canonical).map_err(|source| Error::Io {
+        context: format!("read {}", canonical.display()),
+        source,
+    })?;
+    let file_lines = content.lines().collect::<Vec<_>>();
+    let (start, end) = parse_read_line_range(lines, file_lines.len())?;
+    let selected = if end < start {
+        &file_lines[0..0]
+    } else {
+        &file_lines[start.saturating_sub(1)..end]
+    };
+    if json {
+        let rows = selected
+            .iter()
+            .enumerate()
+            .map(|(offset, text)| serde_json::json!({"line": start + offset, "text": text}))
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": READ_FILE_JSON_SCHEMA_VERSION,
+                "command": "read",
+                "status": "ok",
+                "path": shown_path,
+                "start_line": start,
+                "end_line": end,
+                "lines": rows,
+            }))
+            .map_err(|error| Error::Invalid(format!("serialize read file JSON: {error}")))?
+        );
+    } else {
+        println!("{shown_path}:{start}-{end}");
+        let width = end.max(start).to_string().len();
+        for (offset, text) in selected.iter().enumerate() {
+            println!("{:>width$} | {text}", start + offset);
+        }
+    }
+    Ok(0)
+}
 
 /// `greppy read`: a symbol's exact definition span, optionally with an edit
 /// handle. Resolution mirrors `brief`; the returned bytes come from the LIVE
