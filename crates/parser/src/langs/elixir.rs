@@ -21,8 +21,9 @@ static ELIXIR_SPEC: LangSpec = LangSpec {
     defs: &[DefRule::func("call")],
     owner_kinds: &[],
     calls: CallSpec { skip_callees: &[] },
-    // Elixir imports (`import`/`alias`/`require`/`use`) are not extracted yet
-    // (import_query is empty); any variant is inert without a query.
+    // The bespoke Elixir extractor consumes IMPORTS below directly. The
+    // strategy remains inert on this path, but keeping the query registered
+    // makes the provider's declared capabilities match its extraction output.
     imports: ImportStrategy::Bash,
     docs: DocStyle::LineHashComment,
 };
@@ -46,6 +47,16 @@ const CALLS: &str = r#"
         "import" "alias" "require" "use"))
 "#;
 
+/// Module dependencies declared through Elixir's alias-bearing macros. The
+/// bespoke extractor consumes the `@imported` alias and emits one IMPORTS edge
+/// keyed by its final dotted segment.
+pub(crate) const IMPORTS: &str = r#"
+    (call
+      (identifier) @_kw
+      (arguments (alias) @imported)
+      (#any-of? @_kw "alias" "import" "require")) @import
+"#;
+
 inventory::submit! {
     LangDef {
         name: "elixir",
@@ -55,6 +66,6 @@ inventory::submit! {
         spec: &ELIXIR_SPEC,
         def_query: DEFINITIONS,
         call_query: CALLS,
-        import_query: "",
+        import_query: IMPORTS,
     }
 }

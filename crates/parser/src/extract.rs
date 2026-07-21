@@ -11629,22 +11629,15 @@ fn is_swift_usage_keyword(name: &str) -> bool {
 //     extracted; def bodies are not re-walked, so nested defs are not reached.
 //
 // Edges, on top of the structural DEFINES (auto, one File→def per def node):
-//   * **CALLS** — the calls walk visits every `call`/`dot`/`binary_operator`
-//     node and takes a callee (a `call`'s first
-//     child: a bare `identifier`, or a `dot` whose trailing `identifier` is the
-//     method). The enclosing-func lookup never matches an Elixir def (they are
-//     `call` nodes, not a func kind), so the source is always the file Module.
-//     The resolver keeps only callees whose (last-dotted-segment) name matches a
-//     project Function; unresolved builtin/macro callees (`Enum.map`, `def`, …)
-//     drop out. The CALLS edge is emitted with `callee_name` = that last segment,
-//     sourced from `<file>::__file__`, and the indexer's name resolver
-//     reproduces the kept set.
-//
-// Elixir `alias`/`import`/`require`/`use`/`defstruct` are `call` nodes too; the
-// import pass only scans file-root children (so it never sees the in-module
-// `alias` calls) and the variable pass keys on top-level `binary_operator`s (none
-// at module scope), so idiomatic Elixir emits no IMPORTS/Variable — matched
-// here by simply not emitting them.
+//   * **CALLS** — the calls walk visits every `call` node and takes a callee
+//     (a bare `identifier`, or a `dot` whose trailing `identifier` is the
+//     method). The source is the nearest enclosing `def` / `defp` / `defmacro`
+//     qname, falling back to the file Module only for module-scope calls.
+//   * **IMPORTS** — the provider query captures aliases from `alias` / `import`
+//     / `require`; each becomes a file-sourced edge keyed by the alias's final
+//     dotted segment (`Types.Widget` -> `Widget`).
+//   * **TYPE_REF** — `%Widget{}` parses as a `struct` containing an `alias`;
+//     that alias is attributed to the nearest enclosing definition.
 
 /// The Elixir macro keywords whose `call` nodes are definitions.
 /// `defmacrop` is deliberately absent (the set is
@@ -11680,6 +11673,50 @@ fn elixir_func_def_name<'a>(source: &'a [u8], call: Node<'_>) -> Option<&'a str>
         "identifier" => Some(node_text(source, first_arg)),
         _ => None,
     }
+}
+
+/// Resolve the nearest enclosing Elixir definition to the same free-Function
+/// qname emitted by `elixir_defs_pass`. Elixir represents definitions as
+/// ordinary `call` nodes, so the shared callable-kind walk cannot see them.
+fn elixir_enclosing_callable_qname(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+) -> Option<String> {
+    let mut parent = node.parent();
+    while let Some(candidate) = parent {
+        if candidate.kind() == "call" {
+            if let Some(head) = elixir_call_head(candidate) {
+                if head.kind() == "identifier" && elixir_is_func_macro(node_text(source, head)) {
+                    if let Some(name) = elixir_func_def_name(source, candidate) {
+                        if !name.is_empty() {
+                            return Some(format!("{file_path}::Function::{name}"));
+                        }
+                    }
+                }
+            }
+        }
+        parent = candidate.parent();
+    }
+    None
+}
+
+/// True when `node` is the function-head `call` nested inside a `def name(...)`
+/// macro. It is syntax for the definition, not a runtime self-call.
+fn elixir_is_definition_head_call(source: &[u8], node: Node<'_>) -> bool {
+    let Some(args) = node.parent().filter(|parent| parent.kind() == "arguments") else {
+        return false;
+    };
+    if args.child(0).map(|first| first.id()) != Some(node.id()) {
+        return false;
+    }
+    let Some(def_call) = args.parent().filter(|parent| parent.kind() == "call") else {
+        return false;
+    };
+    elixir_call_head(def_call)
+        .filter(|head| head.kind() == "identifier")
+        .map(|head| elixir_is_func_macro(node_text(source, head)))
+        .unwrap_or(false)
 }
 
 /// The trailing bare name of an Elixir call's callee node: for a `dot`
@@ -11773,10 +11810,10 @@ fn elixir_defs_pass(source: &[u8], root: Node<'_>, file_path: &str, result: &mut
     }
 }
 
-/// The Elixir calls walk: visit every node, and for each
-/// `call` whose callee resolves to a bare name that is not a keyword, emit a
-/// CALLS edge from the file Module. The indexer's name resolver drops callees
-/// with no matching project Function.
+/// The Elixir calls walk: visit every node, and for each runtime `call` whose
+/// callee resolves to a bare name that is not a keyword, emit a CALLS edge from
+/// the nearest enclosing Elixir definition (or the file Module at module scope).
+/// The indexer's name resolver drops callees with no matching project Function.
 fn elixir_calls_pass(
     source: &[u8],
     root: Node<'_>,
@@ -11786,13 +11823,15 @@ fn elixir_calls_pass(
 ) {
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "call" {
+        if node.kind() == "call" && !elixir_is_definition_head_call(source, node) {
             if let Some(head) = elixir_call_head(node) {
                 if let Some(name) = elixir_callee_name(source, head) {
                     if !name.is_empty() && !is_elixir_call_keyword(name) {
+                        let source_qname = elixir_enclosing_callable_qname(source, node, file_path)
+                            .unwrap_or_else(|| file_module_qname.to_string());
                         result.edges.push(ExtractedEdge {
                             edge_type: "CALLS".into(),
-                            source_qualified_name: file_module_qname.to_string(),
+                            source_qualified_name: source_qname,
                             target_qualified_name: format!("{file_path}::Function::{name}"),
                             file_path: file_path.to_string(),
                             line: node.start_position().row as u32 + 1,
@@ -11879,6 +11918,85 @@ fn is_elixir_call_keyword(name: &str) -> bool {
     )
 }
 
+/// Emit one file-sourced IMPORTS edge for every provider-query capture from an
+/// `alias`, `import`, or `require` call. Resolution keys on the final dotted
+/// segment so `alias Types.Widget` links to the graph symbol named `Widget`.
+fn elixir_imports_pass(
+    source: &[u8],
+    root: Node<'_>,
+    file_path: &str,
+    file_module_qname: &str,
+    result: &mut ExtractionResult,
+) -> greppy_core::Result<()> {
+    let language = tree_sitter_elixir::LANGUAGE.into();
+    let query = tree_sitter::Query::new(&language, crate::langs::elixir::IMPORTS)
+        .map_err(|e| greppy_core::Error::Parse(format!("compile elixir imports query: {e}")))?;
+    let imported_capture = query
+        .capture_index_for_name("imported")
+        .ok_or_else(|| greppy_core::Error::Parse("elixir imports query lacks @imported".into()))?;
+    let mut cursor = QueryCursor::new();
+    let mut captures = cursor.captures(&query, root, source);
+    while let Some((query_match, capture_index)) = captures.next() {
+        let capture = query_match.captures[*capture_index];
+        if capture.index != imported_capture {
+            continue;
+        }
+        let path = node_text(source, capture.node);
+        let imported_name = path.rsplit('.').next().unwrap_or(path);
+        if path.is_empty() || imported_name.is_empty() {
+            continue;
+        }
+        result.edges.push(ExtractedEdge {
+            edge_type: "IMPORTS".into(),
+            source_qualified_name: file_module_qname.to_string(),
+            target_qualified_name: format!("{file_path}::__import__::{path}"),
+            file_path: file_path.to_string(),
+            line: capture.node.start_position().row as u32 + 1,
+            properties: serde_json::json!({
+                "path": path,
+                "imported_name": imported_name,
+                "original_name": imported_name,
+                "glob": false,
+            }),
+        });
+    }
+    Ok(())
+}
+
+/// Emit TYPE_REF for `%Alias{}` struct literals. The grammar places the alias
+/// directly under a `struct` node, making this a narrow pass that does not
+/// confuse ordinary module aliases or remote calls with type references.
+fn elixir_struct_refs_pass(
+    source: &[u8],
+    node: Node<'_>,
+    file_path: &str,
+    file_module_qname: &str,
+    result: &mut ExtractionResult,
+) {
+    if node.kind() == "struct" {
+        if let Some(alias) = node.named_child(0).filter(|child| child.kind() == "alias") {
+            let path = node_text(source, alias);
+            let ref_name = path.rsplit('.').next().unwrap_or(path);
+            if !ref_name.is_empty() {
+                let source_qname = elixir_enclosing_callable_qname(source, node, file_path)
+                    .unwrap_or_else(|| file_module_qname.to_string());
+                result.edges.push(ExtractedEdge {
+                    edge_type: "TYPE_REF".into(),
+                    source_qualified_name: source_qname,
+                    target_qualified_name: format!("{file_path}::__type__::{ref_name}"),
+                    file_path: file_path.to_string(),
+                    line: alias.start_position().row as u32 + 1,
+                    properties: serde_json::json!({ "type_name": ref_name }),
+                });
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        elixir_struct_refs_pass(source, child, file_path, file_module_qname, result);
+    }
+}
+
 /// Bespoke Elixir extraction. See the module-level
 /// comment above `elixir_defs_pass` for the full node/edge mapping.
 fn extract_elixir(source: &[u8], file_path: &str) -> greppy_core::Result<ExtractionResult> {
@@ -11896,6 +12014,8 @@ fn extract_elixir(source: &[u8], file_path: &str) -> greppy_core::Result<Extract
 
     let file_module_qname = format!("{file_path}::__file__");
     elixir_calls_pass(source, root, file_path, &file_module_qname, &mut result);
+    elixir_imports_pass(source, root, file_path, &file_module_qname, &mut result)?;
+    elixir_struct_refs_pass(source, root, file_path, &file_module_qname, &mut result);
 
     Ok(result)
 }
