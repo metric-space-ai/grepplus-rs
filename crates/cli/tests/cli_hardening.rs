@@ -19,21 +19,29 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_greppy")
 }
 
-/// Create a unique, fresh scratch directory under the system temp dir.
-fn fresh_dir(tag: &str) -> PathBuf {
+struct ScratchDir(PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Create a unique scratch directory that is removed even when a test panics.
+fn fresh_dir(tag: &str) -> (PathBuf, ScratchDir) {
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let pid = std::process::id();
     let dir = std::env::temp_dir().join(format!("greppy-cli-it-{tag}-{pid}-{n}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    dir
+    (dir.clone(), ScratchDir(dir))
 }
 
 /// Build a minimal git-rooted repo with one Rust file containing
 /// `marker`, plus an empty `sub/` directory. Returns (repo_root,
-/// store_dir).
-fn make_repo(tag: &str, marker: &str) -> (PathBuf, PathBuf) {
-    let root = fresh_dir(tag);
+/// store_dir, cleanup guard).
+fn make_repo(tag: &str, marker: &str) -> (PathBuf, PathBuf, ScratchDir) {
+    let (root, scratch) = fresh_dir(tag);
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join("sub")).unwrap();
     // `.git` is the repo-root marker that resolve_root walks up to find.
@@ -44,7 +52,7 @@ fn make_repo(tag: &str, marker: &str) -> (PathBuf, PathBuf) {
     )
     .unwrap();
     let store = root.join("store");
-    (repo, store)
+    (repo, store, scratch)
 }
 
 /// Run the binary with the given args, cwd, and store dir. Returns
@@ -97,6 +105,51 @@ fn run_with_env_and_inference(
     )
 }
 
+struct HeldIndex {
+    child: std::process::Child,
+}
+
+impl Drop for HeldIndex {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Hold the workspace writer lock after a complete temp snapshot is built but
+/// before it can replace the active graph. Stale-read tests use this to keep the
+/// active fixture unchanged while the query process exercises its refusal path.
+fn hold_index_before_publish(repo: &Path, store: &Path, label: &str) -> HeldIndex {
+    let ready = store.join(format!("{label}-writer-ready"));
+    let mut child = Command::new(bin())
+        .args(["index", "."])
+        .current_dir(repo)
+        .env("GREPPY_STORE_DIR", store)
+        .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+        .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+        .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "120000")
+        .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+        .env_remove("GREPPY_DISCOVER_INCLUDE")
+        .env_remove("GREPPY_DISCOVER_EXCLUDE")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn held fixture index");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !ready.exists() {
+        if let Some(status) = child.try_wait().expect("poll held fixture index") {
+            panic!("held fixture index exited before ready marker: {status}");
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("timeout waiting for held fixture index");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    HeldIndex { child }
+}
+
 fn git(repo: &Path, args: &[&str]) {
     let out = Command::new("git")
         .args(args)
@@ -111,8 +164,8 @@ fn git(repo: &Path, args: &[&str]) {
     );
 }
 
-fn make_real_git_repo(tag: &str) -> (PathBuf, PathBuf) {
-    let root = fresh_dir(tag);
+fn make_real_git_repo(tag: &str) -> (PathBuf, PathBuf, ScratchDir) {
+    let (root, scratch) = fresh_dir(tag);
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::write(
@@ -126,7 +179,7 @@ fn make_real_git_repo(tag: &str) -> (PathBuf, PathBuf) {
     git(&repo, &["add", "."]);
     git(&repo, &["commit", "-m", "baseline"]);
     let store = root.join("store");
-    (repo, store)
+    (repo, store, scratch)
 }
 
 /// Locate the single `graph.db` created beneath `store_dir`.
@@ -234,7 +287,7 @@ fn hold_exclusive_lock(path: &Path) -> TestFileLock {
 
 #[test]
 fn index_dot_then_search_from_root_and_subdir() {
-    let (repo, store) = make_repo("casedot", "alpha_unique_marker");
+    let (repo, store, _scratch) = make_repo("casedot", "alpha_unique_marker");
 
     // `greppy index .` from the repo root.
     let (code, out, err) = run(&["index", "."], &repo, &store);
@@ -275,7 +328,7 @@ fn index_dot_then_search_from_root_and_subdir() {
 
 #[test]
 fn search_code_json_reports_exact_counts_and_truncation_metadata() {
-    let root = fresh_dir("search-json");
+    let (root, _scratch) = fresh_dir("search-json");
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -336,7 +389,7 @@ fn search_code_json_reports_exact_counts_and_truncation_metadata() {
 /// uses the live filesystem rather than the already-open old snapshot.
 #[test]
 fn search_code_json_auto_reindexes_and_reports_current_state() {
-    let (repo, store) = make_repo("search-json-stale", "old_json_stale_marker");
+    let (repo, store, _scratch) = make_repo("search-json-stale", "old_json_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -387,7 +440,7 @@ fn search_code_json_auto_reindexes_and_reports_current_state() {
 /// filesystem and never exposes old FTS rows.
 #[test]
 fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
-    let (repo, store) = make_repo("search-json-stale-label", "old_labeled_stale_marker");
+    let (repo, store, _scratch) = make_repo("search-json-stale-label", "old_labeled_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -421,7 +474,8 @@ fn search_code_json_serves_labeled_stale_hits_when_auto_reindex_disabled() {
 
 #[test]
 fn provider_policy_require_complete_does_not_block_search_code_json() {
-    let (repo, store) = make_repo("provider-policy-search-code", "provider_policy_code_marker");
+    let (repo, store, _scratch) =
+        make_repo("provider-policy-search-code", "provider_policy_code_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -453,7 +507,7 @@ fn provider_policy_require_complete_does_not_block_search_code_json() {
 
 #[test]
 fn provider_policy_require_complete_blocks_search_symbols_json() {
-    let (repo, store) = make_repo(
+    let (repo, store, _scratch) = make_repo(
         "provider-policy-search-symbols",
         "provider_policy_symbol_marker",
     );
@@ -493,7 +547,8 @@ fn provider_policy_require_complete_blocks_search_symbols_json() {
 
 #[test]
 fn provider_policy_require_complete_blocks_context_json() {
-    let (repo, store) = make_repo("provider-policy-context", "provider_policy_context_marker");
+    let (repo, store, _scratch) =
+        make_repo("provider-policy-context", "provider_policy_context_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -525,7 +580,7 @@ fn provider_policy_require_complete_blocks_context_json() {
 
 #[test]
 fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config() {
-    let (repo, store) = make_repo(
+    let (repo, store, _scratch) = make_repo(
         "provider-policy-semantic-vector",
         "provider_policy_semantic_vector_marker",
     );
@@ -565,7 +620,7 @@ fn provider_policy_require_complete_blocks_semantic_vectors_before_model_config(
 
 #[test]
 fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() {
-    let (repo, store) = make_repo("semantic-index-progress", "semantic_progress_marker");
+    let (repo, store, _scratch) = make_repo("semantic-index-progress", "semantic_progress_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index failed; stdout={out} stderr={err}");
 
@@ -655,7 +710,8 @@ fn semantic_search_reports_retryable_embedding_progress_instead_of_empty_hits() 
 
 #[test]
 fn provider_policy_require_complete_blocks_plus_vectors_before_model_config() {
-    let (repo, store) = make_repo("provider-policy-plus-vector", "provider_policy_plus_marker");
+    let (repo, store, _scratch) =
+        make_repo("provider-policy-plus-vector", "provider_policy_plus_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -689,7 +745,7 @@ fn provider_policy_require_complete_blocks_plus_vectors_before_model_config() {
 
 #[test]
 fn search_code_stale_text_falls_back_to_live_grep() {
-    let (repo, store) = make_repo("search-text-stale", "old_text_stale_marker");
+    let (repo, store, _scratch) = make_repo("search-text-stale", "old_text_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -730,7 +786,7 @@ fn search_code_stale_text_falls_back_to_live_grep() {
 
 #[test]
 fn search_code_changed_text_live_greps_only_git_changes_without_index() {
-    let (repo, store) = make_real_git_repo("search-code-changed-text");
+    let (repo, store, _scratch) = make_real_git_repo("search-code-changed-text");
     std::fs::write(
         repo.join("src/lib.rs"),
         "pub fn changed_text_marker() -> i32 { 2 }\n",
@@ -771,7 +827,7 @@ fn search_code_changed_text_live_greps_only_git_changes_without_index() {
 
 #[test]
 fn search_code_changed_json_reports_live_scope_and_exact_counts() {
-    let (repo, store) = make_real_git_repo("search-code-changed-json");
+    let (repo, store, _scratch) = make_real_git_repo("search-code-changed-json");
     std::fs::write(
         repo.join("src/lib.rs"),
         "pub fn changed_json_marker() -> i32 { 2 }\n",
@@ -814,7 +870,7 @@ fn search_code_changed_json_reports_live_scope_and_exact_counts() {
 
 #[test]
 fn search_code_staged_text_greps_git_index_blob_not_worktree() {
-    let (repo, store) = make_real_git_repo("search-code-staged-text");
+    let (repo, store, _scratch) = make_real_git_repo("search-code-staged-text");
     std::fs::write(
         repo.join("src/lib.rs"),
         "pub fn staged_text_marker() -> i32 { 2 }\n",
@@ -866,7 +922,7 @@ fn search_code_staged_text_greps_git_index_blob_not_worktree() {
 
 #[test]
 fn search_code_staged_json_reports_git_blob_scope_and_exact_counts() {
-    let (repo, store) = make_real_git_repo("search-code-staged-json");
+    let (repo, store, _scratch) = make_real_git_repo("search-code-staged-json");
     std::fs::write(
         repo.join("src/lib.rs"),
         "pub fn staged_json_marker() -> i32 { 2 }\n",
@@ -937,7 +993,7 @@ fn search_code_staged_json_reports_git_blob_scope_and_exact_counts() {
 
 #[test]
 fn search_code_since_text_and_json_live_grep_rev_diff_without_index() {
-    let (repo, store) = make_real_git_repo("search-code-since");
+    let (repo, store, _scratch) = make_real_git_repo("search-code-since");
     std::fs::write(
         repo.join("src/lib.rs"),
         "pub fn since_diff_marker() -> i32 { 4 }\n",
@@ -1007,7 +1063,7 @@ fn search_code_since_text_and_json_live_grep_rev_diff_without_index() {
 
 #[test]
 fn search_code_base_text_and_json_live_grep_merge_base_diff_without_index() {
-    let (repo, store) = make_real_git_repo("search-code-base");
+    let (repo, store, _scratch) = make_real_git_repo("search-code-base");
     git(&repo, &["branch", "basepoint"]);
     std::fs::write(
         repo.join("src/lib.rs"),
@@ -1118,7 +1174,7 @@ fn insert_default_model_vectors(store_dir: &Path, count: usize) {
 #[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
-    let (repo, store_dir) = make_repo("semantic-vector-guard", "vector_guard_marker");
+    let (repo, store_dir, _scratch) = make_repo("semantic-vector-guard", "vector_guard_marker");
     let (code, out, err) = run_with_inference(&["index", "."], &repo, &store_dir);
     assert_eq!(
         code, 0,
@@ -1168,7 +1224,7 @@ fn semantic_vectors_guard_skips_before_model_load_when_over_budget() {
 #[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn semantic_vectors_stale_index_skips_before_model_load() {
-    let (repo, store_dir) = make_repo("semantic-vector-stale", "vector_stale_marker");
+    let (repo, store_dir, _scratch) = make_repo("semantic-vector-stale", "vector_stale_marker");
     let (code, out, err) = run_with_inference(&["index", "."], &repo, &store_dir);
     assert_eq!(
         code, 0,
@@ -1180,6 +1236,12 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
         "pub fn vector_stale_marker_changed() -> i32 { 8 }\n",
     )
     .unwrap();
+    // Keep this fixture on the stale-read path. The generic query opener also
+    // attempts a best-effort inline refresh before semantic search applies its
+    // own GREPPY_AUTO_REINDEX=0 stale-vector guard. A paused writer makes that
+    // unrelated refresh lose deterministically without replacing the active
+    // graph snapshot under test.
+    let _writer = hold_index_before_publish(&repo, &store_dir, "semantic-vector-stale");
 
     let (code, out, err) = run_with_env(
         &["semantic-search", "--json", "find vector stale marker"],
@@ -1208,7 +1270,7 @@ fn semantic_vectors_stale_index_skips_before_model_load() {
 /// Algorithmic semantic search also refuses stale indexed rows.
 #[test]
 fn semantic_stale_index_refuses_vector_hits() {
-    let (repo, store_dir) = make_repo("semantic-stale", "semantic_stale_marker");
+    let (repo, store_dir, _scratch) = make_repo("semantic-stale", "semantic_stale_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store_dir);
     assert_eq!(
         code, 0,
@@ -1219,6 +1281,10 @@ fn semantic_stale_index_refuses_vector_hits() {
         "pub fn semantic_stale_marker_changed() -> i32 { 9 }\n",
     )
     .unwrap();
+    // Prevent the generic query opener's best-effort inline refresh from
+    // replacing the deliberately stale fixture before the semantic stale gate
+    // observes it. GREPPY_AUTO_REINDEX=0 below then controls the gate itself.
+    let _writer = hold_index_before_publish(&repo, &store_dir, "semantic-stale");
 
     let (code, out, err) = run_with_env(
         &["semantic-search", "--json", "semantic_stale_marker"],
@@ -1242,7 +1308,7 @@ fn semantic_stale_index_refuses_vector_hits() {
 
 #[test]
 fn diagnostics_json_exposes_provider_incompleteness() {
-    let (repo, store) = make_repo("diag", "diagnostics_unique_marker");
+    let (repo, store, _scratch) = make_repo("diag", "diagnostics_unique_marker");
     std::fs::write(repo.join("notes.txt"), "not indexed as code\n").unwrap();
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
@@ -1296,7 +1362,7 @@ fn diagnostics_json_exposes_provider_incompleteness() {
 
 #[test]
 fn doctor_json_reports_missing_index_as_structured_status() {
-    let root = fresh_dir("doctor-no-index");
+    let (root, _scratch) = fresh_dir("doctor-no-index");
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     let store = root.join("store");
@@ -1338,7 +1404,7 @@ fn doctor_json_reports_missing_index_as_structured_status() {
 
 #[test]
 fn index_status_json_reports_freshness_stats_and_provider_health() {
-    let (repo, store) = make_repo("index-status", "status_unique_marker");
+    let (repo, store, _scratch) = make_repo("index-status", "status_unique_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(
         code, 0,
@@ -1375,7 +1441,8 @@ fn index_status_json_reports_freshness_stats_and_provider_health() {
 
 #[test]
 fn index_status_is_unhealthy_for_real_provider_file_failures() {
-    let (repo, store) = make_repo("index-status-provider-failure", "provider_failure_marker");
+    let (repo, store, _scratch) =
+        make_repo("index-status-provider-failure", "provider_failure_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index should succeed; stderr={err}\nstdout={out}");
 
@@ -1403,7 +1470,7 @@ fn index_status_is_unhealthy_for_real_provider_file_failures() {
 
 #[test]
 fn index_status_json_exposes_dirty_overlay_breakdown() {
-    let (repo, store) = make_real_git_repo("dirty-overlay-status");
+    let (repo, store, _scratch) = make_real_git_repo("dirty-overlay-status");
     std::fs::write(repo.join(".gitignore"), "ignored.log\n").unwrap();
     std::fs::write(
         repo.join("src/delete_me.rs"),
@@ -1518,7 +1585,7 @@ fn index_status_json_exposes_dirty_overlay_breakdown() {
 
 #[test]
 fn r3_large_repo_file_limit_does_not_publish_partial_snapshot() {
-    let root = fresh_dir("r3-large-limit");
+    let (root, _scratch) = fresh_dir("r3-large-limit");
     let repo = root.join("repo");
     std::fs::create_dir_all(repo.join(".git")).unwrap();
     std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -1550,7 +1617,7 @@ fn r3_large_repo_file_limit_does_not_publish_partial_snapshot() {
 
 #[test]
 fn discover_scope_env_controls_index_and_query_freshness() {
-    let (repo, store) = make_real_git_repo("discover-scope-env");
+    let (repo, store, _scratch) = make_real_git_repo("discover-scope-env");
     std::fs::create_dir_all(repo.join("tests")).unwrap();
     std::fs::write(
         repo.join("tests/integration.rs"),
@@ -1622,7 +1689,7 @@ fn discover_scope_env_controls_index_and_query_freshness() {
 
 #[test]
 fn pure_head_drift_refreshes_metadata_without_reindexing() {
-    let (repo, store_dir) = make_real_git_repo("pure-head-drift");
+    let (repo, store_dir, _scratch) = make_real_git_repo("pure-head-drift");
     let (code, out, err) = run(&["index", "."], &repo, &store_dir);
     assert_eq!(
         code, 0,
@@ -1676,10 +1743,10 @@ fn pure_head_drift_refreshes_metadata_without_reindexing() {
 
 #[test]
 fn global_root_flag_resolves_same_store_from_outside() {
-    let (repo, store) = make_repo("caseroot", "beta_unique_marker");
+    let (repo, store, _scratch) = make_repo("caseroot", "beta_unique_marker");
 
     // Index using an explicit --root, run from an unrelated cwd.
-    let outside = fresh_dir("caseroot-outside");
+    let (outside, _outside_scratch) = fresh_dir("caseroot-outside");
     let repo_s = repo.to_str().unwrap();
     let (code, out, err) = run(&["--root", repo_s, "index", repo_s], &outside, &store);
     assert_eq!(code, 0, "index --root should succeed; stderr={err}\n{out}");
@@ -1714,7 +1781,7 @@ fn global_root_flag_resolves_same_store_from_outside() {
 #[cfg(unix)]
 #[test]
 fn store_dir_700_and_db_600() {
-    let (repo, store) = make_repo("caseperm", "gamma_unique_marker");
+    let (repo, store, _scratch) = make_repo("caseperm", "gamma_unique_marker");
     let (code, _out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "index should succeed; stderr={err}");
 
@@ -1736,7 +1803,7 @@ fn store_dir_700_and_db_600() {
 
 #[test]
 fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
-    let (repo, store) = make_repo("r3backup", "old_atomic_marker");
+    let (repo, store, _scratch) = make_repo("r3backup", "old_atomic_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
 
@@ -1771,7 +1838,7 @@ fn r3_atomic_snapshot_second_success_does_not_retain_full_backup() {
 
 #[test]
 fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
-    let (repo, store) = make_repo("r3-incremental-cli", "old_incremental_marker");
+    let (repo, store, _scratch) = make_repo("r3-incremental-cli", "old_incremental_marker");
     std::fs::write(
         repo.join("helper.rs"),
         "pub fn untouched_incremental_helper() -> i32 { 1 }\n",
@@ -1832,7 +1899,7 @@ fn r3_cli_atomic_snapshot_uses_incremental_seed_from_active_index() {
 
 #[test]
 fn r3_failed_snapshot_does_not_replace_active_index() {
-    let (repo, store) = make_repo("r3fail", "old_failure_marker");
+    let (repo, store, _scratch) = make_repo("r3fail", "old_failure_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
     let db = find_graph_db(&store).expect("graph.db must exist after first index");
@@ -1893,7 +1960,7 @@ fn r3_failed_snapshot_does_not_replace_active_index() {
 
 #[test]
 fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
-    let (repo, store) = make_repo("r3corrupt", "old_corrupt_marker");
+    let (repo, store, _scratch) = make_repo("r3corrupt", "old_corrupt_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
 
@@ -1942,7 +2009,7 @@ fn r3_corrupt_active_snapshot_is_quarantined_and_replaced() {
 #[cfg(unix)]
 #[test]
 fn r3_killed_index_before_publish_preserves_active_and_recovers() {
-    let (repo, store) = make_repo("r3-kill-before-publish", "old_kill_marker");
+    let (repo, store, _scratch) = make_repo("r3-kill-before-publish", "old_kill_marker");
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
 
@@ -2069,7 +2136,7 @@ fn r3_killed_index_before_publish_preserves_active_and_recovers() {
 #[cfg(not(feature = "ci-test-assets"))]
 #[test]
 fn index_publishes_graph_when_embedding_backend_is_unavailable() {
-    let (repo, store) = make_repo("embed-degraded", "embed_degraded_marker");
+    let (repo, store, _scratch) = make_repo("embed-degraded", "embed_degraded_marker");
     let (code, out, err) = run_with_env_and_inference(
         &["index", "."],
         &repo,
@@ -2111,7 +2178,7 @@ fn index_publishes_graph_when_embedding_backend_is_unavailable() {
 #[cfg(unix)]
 #[test]
 fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
-    let (repo, store) = make_repo("large-drift-job", "old_large_drift_marker");
+    let (repo, store, _scratch) = make_repo("large-drift-job", "old_large_drift_marker");
     for index in 0..11 {
         std::fs::write(
             repo.join(format!("extra-{index}.rs")),
@@ -2206,7 +2273,7 @@ fn large_drift_starts_exactly_one_background_job_and_refuses_stale_graph() {
 #[cfg(unix)]
 #[test]
 fn held_lock_makes_second_index_exit_75_without_writing() {
-    let (repo, store) = make_repo("caselock", "delta_unique_marker");
+    let (repo, store, _scratch) = make_repo("caselock", "delta_unique_marker");
 
     // First index establishes the store and its directory.
     let (code, _out, err) = run(&["index", "."], &repo, &store);
@@ -2265,7 +2332,7 @@ fn held_lock_makes_second_index_exit_75_without_writing() {
 
 #[test]
 fn r3_old_lock_contents_without_os_lock_are_harmless() {
-    let (repo, store) = make_repo("r3-stale-lock", "stale_lock_marker");
+    let (repo, store, _scratch) = make_repo("r3-stale-lock", "stale_lock_marker");
 
     let (code, out, err) = run(&["index", "."], &repo, &store);
     assert_eq!(code, 0, "first index should succeed; stderr={err}\n{out}");
