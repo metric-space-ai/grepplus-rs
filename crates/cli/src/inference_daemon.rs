@@ -16,6 +16,7 @@ const LOOP_INTERVAL: Duration = Duration::from_millis(100);
 const CRASH_COOLDOWN: Duration = Duration::from_secs(2);
 const CAPACITY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(10);
 const CAPACITY_RETRY_MAX_DELAY: Duration = Duration::from_millis(100);
+const ENV_RUNTIME_DIR: &str = "GREPPY_RUNTIME_DIR";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum RequestOutcome<T> {
@@ -85,27 +86,102 @@ impl Default for RuntimeStatus {
     }
 }
 
+struct RuntimeScope {
+    identity: Option<Vec<u8>>,
+    state_dir: std::path::PathBuf,
+    #[cfg(unix)]
+    socket_dir: std::path::PathBuf,
+}
+
+impl RuntimeScope {
+    fn from_env() -> Self {
+        let explicit_runtime = env_absolute_path(ENV_RUNTIME_DIR);
+        let explicit_store = std::env::var("GREPPY_STORE_DIR")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .map(absolute_path);
+        let identity = explicit_runtime
+            .as_ref()
+            .map(|path| runtime_identity(b"runtime-dir\0", path))
+            .or_else(|| {
+                explicit_store
+                    .as_ref()
+                    .map(|path| runtime_identity(b"store-dir\0", path))
+            });
+        let state_dir = explicit_runtime
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| greppy_core::cache::data_root().join("runtime"))
+            .join("daemon-state");
+        #[cfg(unix)]
+        let socket_dir = explicit_runtime
+            .as_ref()
+            .filter(|path| path.as_os_str().len() <= 32)
+            .cloned()
+            .unwrap_or_else(unix_runtime_dir);
+        Self {
+            identity,
+            state_dir,
+            #[cfg(unix)]
+            socket_dir,
+        }
+    }
+}
+
+fn env_absolute_path(name: &str) -> Option<std::path::PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .map(absolute_path)
+}
+
+fn absolute_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path
+    } else {
+        std::path::absolute(&path).unwrap_or(path)
+    }
+}
+
+fn runtime_identity(prefix: &[u8], path: &std::path::Path) -> Vec<u8> {
+    let mut identity = Vec::with_capacity(prefix.len() + path.as_os_str().len());
+    identity.extend_from_slice(prefix);
+    identity.extend_from_slice(path.to_string_lossy().as_bytes());
+    identity
+}
+
+fn endpoint_digest(kind: &str, identity: &str, runtime_identity: Option<&[u8]>) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"greppy-inference-daemon\0");
+    hash.update(PROTOCOL_VERSION.to_le_bytes());
+    hash.update(kind.as_bytes());
+    hash.update(b"\0");
+    hash.update(identity.as_bytes());
+    if let Some(runtime_identity) = runtime_identity {
+        hash.update(b"\0runtime-scope\0");
+        hash.update(runtime_identity);
+    }
+    hex_encode(&hash.finalize())[..32].to_string()
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Endpoint {
     kind: &'static str,
     digest: String,
     address: String,
+    state_dir: std::path::PathBuf,
 }
 
 impl Endpoint {
     pub(super) fn for_identity(kind: &'static str, identity: &str) -> Option<Self> {
-        let mut hash = Sha256::new();
-        hash.update(b"greppy-inference-daemon\0");
-        hash.update(PROTOCOL_VERSION.to_le_bytes());
-        hash.update(kind.as_bytes());
-        hash.update(b"\0");
-        hash.update(identity.as_bytes());
-        let digest = hex_encode(&hash.finalize())[..32].to_string();
+        let runtime = RuntimeScope::from_env();
+        let digest = endpoint_digest(kind, identity, runtime.identity.as_deref());
         #[cfg(unix)]
         let address = {
-            let dir = unix_runtime_dir();
-            ensure_private_dir(&dir).ok()?;
-            dir.join(format!("{kind}-{digest}.sock"))
+            ensure_private_dir(&runtime.socket_dir).ok()?;
+            runtime
+                .socket_dir
+                .join(format!("{kind}-{digest}.sock"))
                 .to_string_lossy()
                 .into_owned()
         };
@@ -117,6 +193,7 @@ impl Endpoint {
             kind,
             digest,
             address,
+            state_dir: runtime.state_dir,
         })
     }
 
@@ -133,9 +210,7 @@ impl Endpoint {
     }
 
     fn cooldown_path(&self) -> std::path::PathBuf {
-        greppy_core::cache::data_root()
-            .join("runtime")
-            .join("daemon-state")
+        self.state_dir
             .join(format!("{}-{}.cooldown", self.kind, self.digest))
     }
 }
@@ -1612,6 +1687,34 @@ mod tests {
         assert_eq!(a.address(), b.address());
         assert_ne!(a.address(), c.address());
         assert!(a.address().contains("summary-"));
+    }
+
+    #[test]
+    fn endpoint_identity_is_scoped_only_for_explicit_runtime_or_store_roots() {
+        let legacy = endpoint_digest("summary", "model|prompt|cpu", None);
+        let store_a = endpoint_digest(
+            "summary",
+            "model|prompt|cpu",
+            Some(b"store-dir\0/tmp/store-a"),
+        );
+        let store_b = endpoint_digest(
+            "summary",
+            "model|prompt|cpu",
+            Some(b"store-dir\0/tmp/store-b"),
+        );
+        let runtime_a = endpoint_digest(
+            "summary",
+            "model|prompt|cpu",
+            Some(b"runtime-dir\0/tmp/store-a"),
+        );
+        assert_ne!(legacy, store_a);
+        assert_ne!(store_a, store_b);
+        assert_ne!(store_a, runtime_a);
+        assert_eq!(
+            legacy,
+            endpoint_digest("summary", "model|prompt|cpu", None),
+            "the no-override production endpoint must retain its legacy identity"
+        );
     }
 
     #[test]

@@ -16796,13 +16796,14 @@ mod tests {
         dir
     }
 
+    const EDIT_SYMBOL_HELPER_STORE: &str = "GREPPY_TEST_EDIT_SYMBOL_HELPER_STORE";
+
     #[test]
-    fn edit_symbol_replaces_indexed_typescript_and_kotlin_bodies() {
-        let _env = ENV_LOCK.lock().unwrap();
-        let restore = EnvRestore::capture(&["GREPPY_STORE_DIR"]);
-        let store_root = test_tempdir("edit-symbol-ts-kt-store");
-        // SAFETY: env-mutating tests hold ENV_LOCK until `restore` is dropped.
-        unsafe { std::env::set_var("GREPPY_STORE_DIR", &store_root) };
+    fn edit_symbol_subprocess_helper() {
+        let Some(store_root) = std::env::var_os(EDIT_SYMBOL_HELPER_STORE) else {
+            return;
+        };
+        assert_eq!(std::env::var_os("GREPPY_STORE_DIR"), Some(store_root));
 
         for (label, extension, source, replacement) in [
             (
@@ -16847,7 +16848,25 @@ mod tests {
 
             std::fs::remove_dir_all(root).unwrap();
         }
-        drop(restore);
+    }
+
+    #[test]
+    fn edit_symbol_replaces_indexed_typescript_and_kotlin_bodies() {
+        let store_root = test_tempdir("edit-symbol-ts-kt-store");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::edit_symbol_subprocess_helper")
+            .arg("--nocapture")
+            .env(EDIT_SYMBOL_HELPER_STORE, &store_root)
+            .env("GREPPY_STORE_DIR", &store_root)
+            .output()
+            .expect("spawn isolated edit-symbol helper");
+        assert!(
+            output.status.success(),
+            "isolated edit-symbol helper failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
         std::fs::remove_dir_all(store_root).unwrap();
     }
 
