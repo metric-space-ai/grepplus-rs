@@ -564,6 +564,159 @@ def capture_binary_diff(worktree: pathlib.Path, base_commit: str, timeout_second
     ).stdout
 
 
+def patch_touched_paths(patch: str) -> list[str]:
+    """Return normalized repository paths named by a git-style patch."""
+    paths: set[str] = set()
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        try:
+            fields = shlex.split(line)
+        except ValueError as error:
+            raise HarnessError("test patch has an invalid diff header") from error
+        if len(fields) != 4:
+            raise HarnessError("test patch has an invalid diff header")
+        for field, prefix in ((fields[2], "a/"), (fields[3], "b/")):
+            if field == "/dev/null":
+                continue
+            path = field[len(prefix):] if field.startswith(prefix) else field
+            candidate = pathlib.PurePosixPath(path)
+            if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
+                raise HarnessError("test patch contains an unsafe path")
+            paths.add(candidate.as_posix())
+    if not paths:
+        raise HarnessError("test patch contains no diff paths")
+    return sorted(paths)
+
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _clean_output_lines(output: bytes) -> list[str]:
+    text = _ANSI_ESCAPE_RE.sub("", output.decode("utf-8", "replace"))
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _first_matching_line(lines: Sequence[str], pattern: str, flags: int = 0) -> str | None:
+    expression = re.compile(pattern, flags)
+    return next((line for line in lines if expression.search(line)), None)
+
+
+def classify_v2_patched_failure(
+    test_command: Sequence[str],
+    output: bytes,
+    patched_paths: Sequence[str],
+    *,
+    spawn_error: bool = False,
+) -> dict[str, Any]:
+    """Accept only framework-proven v2 test failures, never bare nonzero exits."""
+    lines = _clean_output_lines(output)
+    command = " ".join(test_command).lower()
+    collected_line = _first_matching_line(lines, r"\bcollected\s+[1-9]\d*\s+items?\b", re.IGNORECASE)
+
+    if spawn_error:
+        return {
+            "verdict": "preflight_infra_failure",
+            "framework": None,
+            "signature": "test_process_spawn_error",
+            "proof_line": lines[0] if lines else "test process could not start",
+        }
+
+    hard_infra_signatures = (
+        ("command_not_found", r"\bcommand not found\b"),
+        ("missing_file_or_interpreter", r"\bno such file or directory\b"),
+        ("missing_python_module", r"\bno module named\s+(?:['\"])?(?:pytest|unittest|nose)\b"),
+        ("bad_interpreter", r"\bbad interpreter\b"),
+        ("cannot_execute", r"\bcannot execute(?: binary file|: required file not found)?\b"),
+        ("windows_command_not_found", r"\bis not recognized as an internal or external command\b"),
+    )
+    for signature, pattern in hard_infra_signatures:
+        proof = _first_matching_line(lines, pattern, re.IGNORECASE)
+        if proof is not None:
+            return {
+                "verdict": "preflight_infra_failure",
+                "framework": None,
+                "signature": signature,
+                "proof_line": proof,
+            }
+
+    framework: str | None = None
+    proof_line: str | None = None
+    supporting_line: str | None = None
+    signature: str | None = None
+    if "pytest" in command:
+        framework = "pytest"
+        failed_line = _first_matching_line(lines, r"\b(?:FAILED|failed)\b")
+        if collected_line and failed_line:
+            proof_line = failed_line
+            supporting_line = collected_line
+            signature = "pytest_failed_with_collected_tests"
+    elif re.search(r"(?:^|\s)go\s+test(?:\s|$)", command):
+        framework = "go-test"
+        proof_line = _first_matching_line(lines, r"^(?:--- FAIL:|FAIL\t)")
+        if proof_line:
+            signature = "go_test_fail_marker"
+    elif re.search(r"(?:^|\s)cargo\s+test(?:\s|$)", command):
+        framework = "cargo-test"
+        proof_line = _first_matching_line(lines, r"\btest result: FAILED\b")
+        if proof_line:
+            signature = "cargo_test_failed_result"
+        else:
+            compile_line = _first_matching_line(lines, r"^error: could not compile\b", re.IGNORECASE)
+            path_line = next(
+                (line for line in lines if any(path in line.replace("\\", "/") for path in patched_paths)),
+                None,
+            )
+            if compile_line and path_line:
+                proof_line = path_line
+                supporting_line = compile_line
+                signature = "cargo_patched_test_compile_failure"
+    elif "vitest" in command or re.search(r"(?:^|\s)jest(?:\s|$)", command):
+        framework = "vitest-jest"
+        proof_line = _first_matching_line(lines, r"(?:✕|×|\bfailed\b)", re.IGNORECASE)
+        if proof_line:
+            signature = "vitest_jest_failure_marker"
+    elif re.search(r"(?:^|\s)(?:mvn|mvnw)(?:\s|$)", command) or "surefire" in command:
+        framework = "maven-surefire"
+        proof_line = _first_matching_line(lines, r"Tests run:.*Failures:\s*[1-9]\d*", re.IGNORECASE)
+        if proof_line:
+            signature = "surefire_nonzero_failures"
+
+    if proof_line is not None:
+        classification = {
+            "verdict": "test_failure",
+            "framework": framework,
+            "signature": signature,
+            "proof_line": proof_line,
+        }
+        if supporting_line is not None:
+            classification["supporting_line"] = supporting_line
+        return classification
+
+    import_line = _first_matching_line(lines, r"\b(?:ImportError|ModuleNotFoundError)\b")
+    if import_line is not None and collected_line is None:
+        return {
+            "verdict": "preflight_infra_failure",
+            "framework": framework,
+            "signature": "import_error_without_collected_tests",
+            "proof_line": import_line,
+        }
+    compile_line = _first_matching_line(lines, r"^error: could not compile\b", re.IGNORECASE)
+    if compile_line is not None:
+        return {
+            "verdict": "preflight_infra_failure",
+            "framework": framework,
+            "signature": "compile_failure_outside_patched_tests",
+            "proof_line": compile_line,
+        }
+    return {
+        "verdict": "preflight_infra_failure",
+        "framework": framework,
+        "signature": "no_framework_failure_evidence",
+        "proof_line": lines[0] if lines else "nonzero exit without test-framework output",
+    }
+
+
 def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
     input_tokens = uncached_input_tokens = output_tokens = tool_calls = source_opens = turns = 0
     cache_read = cache_write = 0
@@ -872,22 +1025,48 @@ def run_mutation_preflight(
 
         apply_mutation(worktree, task["mutation_patch"], task["timeout_seconds"])
         mutation_diff = capture_binary_diff(worktree, task["repository"]["commit"], task["timeout_seconds"])
-        mutated_result = run_process(
-            task["test_command"],
-            cwd=worktree,
-            timeout_seconds=task["timeout_seconds"],
-            env=test_env,
-        )
+        mutated_spawn_error = False
+        try:
+            mutated_result = run_process(
+                task["test_command"],
+                cwd=worktree,
+                timeout_seconds=task["timeout_seconds"],
+                env=test_env,
+            )
+        except OSError as error:
+            mutated_spawn_error = True
+            mutated_result = ProcessResult(
+                returncode=None,
+                stdout=b"",
+                stderr=f"test process could not start: {error.__class__.__name__}\n".encode("utf-8"),
+                wall_seconds=0.0,
+                timed_out=False,
+            )
         mutated_output = redact(mutated_result.stdout + mutated_result.stderr, secrets)
         atomic_write_bytes(raw_dir / "preflight-mutated-test.log", mutated_output)
     mutated_summary = process_summary(mutated_result, mutated_output)
-    valid = not mutated_result.timed_out and mutated_result.returncode not in (None, 0)
+    classification = None
+    if task.get("task_bank") == "v2" and not mutated_result.timed_out and mutated_result.returncode != 0:
+        classification = classify_v2_patched_failure(
+            task["test_command"],
+            mutated_output,
+            patch_touched_paths(task["mutation_patch"]),
+            spawn_error=mutated_spawn_error,
+        )
+        valid = classification["verdict"] == "test_failure"
+        failure_kind = None if valid else "preflight_infra_failure"
+    else:
+        valid = not mutated_result.timed_out and mutated_result.returncode not in (None, 0)
+        failure_kind = None if valid else (
+            "patched_test_did_not_fail" if task.get("task_bank") == "v2" else "mutation_test_did_not_fail"
+        )
     return {
         "valid": valid,
-        "failure_kind": None if valid else ("patched_test_did_not_fail" if task.get("task_bank") == "v2" else "mutation_test_did_not_fail"),
+        "failure_kind": failure_kind,
         "setup": setup,
         "clean_test": clean_summary,
         "mutated_test": mutated_summary,
+        "patched_failure_classification": classification,
         "mutation_diff_sha256": sha256_bytes(mutation_diff),
     }
 
@@ -1433,6 +1612,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 preflight = run_mutation_preflight(task, backing, task_tmp, raw_run_dir / task["id"], secrets)
                 base_manifest.setdefault("mutation_preflight", {})[task["id"]] = preflight
                 if not preflight["valid"]:
+                    if task.get("task_bank") == "v2":
+                        detail = preflight.get("patched_failure_classification") or {}
+                        raise HarnessError(
+                            "v2 preflight requires setup success and a patched-test failure "
+                            "with test-framework evidence; "
+                            f"verdict={preflight.get('failure_kind')} "
+                            f"proof={detail.get('proof_line')!r}"
+                        )
                     raise HarnessError(
                         "mutation preflight requires setup success, a clean-source test pass, "
                         "and a mutated-source test failure without timeout"

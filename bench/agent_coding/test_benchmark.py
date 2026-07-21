@@ -211,6 +211,27 @@ class SetupLifecycleTests(GitFixture):
         self.assertIsNone(preflight["mutated_test"])
         self.assertNotIn("mutation_diff_sha256", preflight)
 
+    def test_v2_preflight_records_infrastructure_classification_and_proof(self) -> None:
+        task = self.task()
+        task["task_bank"] = "v2"
+        task["test_command"] = [
+            sys.executable,
+            "-c",
+            "print(\"ModuleNotFoundError: No module named 'app'\"); raise SystemExit(1)",
+        ]
+        preflight = bench.run_mutation_preflight(
+            task,
+            self.backing,
+            self.root / "v2-infra-preflight",
+            self.root / "raw-v2-infra-preflight",
+            [],
+        )
+        self.assertFalse(preflight["valid"])
+        self.assertEqual(preflight["failure_kind"], "preflight_infra_failure")
+        classification = preflight["patched_failure_classification"]
+        self.assertEqual(classification["signature"], "import_error_without_collected_tests")
+        self.assertIn("ModuleNotFoundError", classification["proof_line"])
+
     def test_arm_setup_precedes_mutation_and_is_excluded_from_agent_wall(self) -> None:
         setup = [
             sys.executable,
@@ -255,6 +276,86 @@ class SetupLifecycleTests(GitFixture):
         self.assertGreaterEqual(row["setup"]["wall_seconds"], 0.15)
         self.assertEqual(row["agent"]["wall_seconds"], 0.01)
         self.assertTrue(row["valid"])
+
+
+class V2PreflightClassificationTests(unittest.TestCase):
+    def classify(self, command: list[str], output: str, paths: list[str] | None = None):
+        return bench.classify_v2_patched_failure(command, output.encode(), paths or ["tests/test_feature.py"])
+
+    def test_accepts_each_supported_framework_failure_signature(self) -> None:
+        cases = [
+            (["python3", "-m", "pytest", "-q"], "collected 2 items\ntest_case FAILED\n1 failed\n", "pytest_failed_with_collected_tests"),
+            (["go", "test", "./..."], "--- FAIL: TestFeature (0.00s)\n", "go_test_fail_marker"),
+            (["go", "test", "./..."], "FAIL\texample.test/pkg\t0.01s\n", "go_test_fail_marker"),
+            (["cargo", "test"], "test result: FAILED. 0 passed; 1 failed\n", "cargo_test_failed_result"),
+            (["pnpm", "exec", "vitest", "run"], "✕ rejects invalid input\n", "vitest_jest_failure_marker"),
+            (["npx", "jest"], "Tests: 1 failed, 2 passed\n", "vitest_jest_failure_marker"),
+            (["mvn", "test"], "Tests run: 4, Failures: 1, Errors: 0\n", "surefire_nonzero_failures"),
+        ]
+        for command, output, signature in cases:
+            with self.subTest(signature=signature, output=output):
+                classification = self.classify(command, output)
+                self.assertEqual(classification["verdict"], "test_failure")
+                self.assertEqual(classification["signature"], signature)
+                self.assertTrue(classification["proof_line"])
+
+    def test_pytest_requires_a_positive_collected_tests_line(self) -> None:
+        classification = self.classify(
+            ["python3", "-m", "pytest", "-q"],
+            "FAILED tests/test_feature.py::test_case - assertion failed\n",
+        )
+        self.assertEqual(classification["verdict"], "preflight_infra_failure")
+        self.assertEqual(classification["signature"], "no_framework_failure_evidence")
+
+    def test_import_failure_without_collected_tests_is_infrastructure(self) -> None:
+        classification = self.classify(
+            ["python3", "-m", "pytest", "-q"],
+            "ImportError while importing test module\nModuleNotFoundError: No module named 'app'\n",
+        )
+        self.assertEqual(classification["signature"], "import_error_without_collected_tests")
+        self.assertIn("ImportError", classification["proof_line"])
+
+    def test_patched_test_compile_error_is_a_legitimate_cargo_failure(self) -> None:
+        classification = self.classify(
+            ["cargo", "test"],
+            "error[E0425]: missing value\n --> tests/test_feature.rs:8:5\nerror: could not compile `demo` (test)\n",
+            ["tests/test_feature.rs"],
+        )
+        self.assertEqual(classification["verdict"], "test_failure")
+        self.assertEqual(classification["signature"], "cargo_patched_test_compile_failure")
+        self.assertIn("tests/test_feature.rs", classification["proof_line"])
+
+    def test_production_compile_error_is_infrastructure(self) -> None:
+        classification = self.classify(
+            ["cargo", "test"],
+            "error[E0425]: missing value\n --> src/lib.rs:8:5\nerror: could not compile `demo`\n",
+            ["tests/test_feature.rs"],
+        )
+        self.assertEqual(classification["verdict"], "preflight_infra_failure")
+        self.assertEqual(classification["signature"], "compile_failure_outside_patched_tests")
+
+    def test_pure_infrastructure_signatures_are_rejected(self) -> None:
+        cases = [
+            ("pytest: command not found\n", "command_not_found"),
+            (".venv/bin/python: No such file or directory\n", "missing_file_or_interpreter"),
+            ("python: No module named pytest\n", "missing_python_module"),
+            ("/usr/bin/python: bad interpreter\n", "bad_interpreter"),
+            ("tool cannot execute: required file not found\n", "cannot_execute"),
+            ("'pytest' is not recognized as an internal or external command\n", "windows_command_not_found"),
+        ]
+        for output, signature in cases:
+            with self.subTest(signature=signature):
+                classification = self.classify(["python3", "-m", "pytest"], output)
+                self.assertEqual(classification["verdict"], "preflight_infra_failure")
+                self.assertEqual(classification["signature"], signature)
+
+    def test_spawn_error_is_rejected_with_proof(self) -> None:
+        classification = bench.classify_v2_patched_failure(
+            ["missing-pytest"], b"test process could not start: FileNotFoundError\n",
+            ["tests/test_feature.py"], spawn_error=True,
+        )
+        self.assertEqual(classification["signature"], "test_process_spawn_error")
+        self.assertIn("FileNotFoundError", classification["proof_line"])
 
 
 def result_row(
