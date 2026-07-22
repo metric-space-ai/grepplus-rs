@@ -237,9 +237,15 @@ fn recover_reports_clean_workspace_and_writes_report_file() {
 }
 
 #[test]
-fn replace_body_rejects_nonempty_ignored_stdin() {
+fn replace_body_ignores_stdin_when_content_file_given() {
+    // A real --content-file path is used verbatim; stdin is never read, so an
+    // open or non-empty stdin can neither block (the earlier hang regression)
+    // nor spuriously reject. The content file wins; the stdin bytes are ignored.
     let (repo, store) = fresh_workspace("ignored-stdin");
-    std::fs::write(repo.join("body.rs"), "{ 2 }\n").unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn target() -> i32 { 1 }\n").unwrap();
+    index_repo(&repo, &store);
+    std::fs::write(repo.join("body.rs"), "2\n").unwrap();
 
     let (code, stdout, stderr) = run_with_stdin(
         &repo,
@@ -255,11 +261,11 @@ fn replace_body_rejects_nonempty_ignored_stdin() {
         b"{ 3 }\n",
     );
 
-    assert_eq!(code, 20, "stdout={stdout}\nstderr={stderr}");
-    let output = format!("{stdout}\n{stderr}");
-    assert!(output.contains("status: invalid-request"), "{output}");
-    assert!(output.contains("received non-empty stdin"), "{output}");
-    assert!(output.contains("--content-file -"), "{output}");
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    let src = std::fs::read_to_string(repo.join("src/lib.rs")).unwrap();
+    // content file "2" became the body; the stdin body "{ 3 }" was never applied.
+    assert!(src.contains("{2") || src.contains("{ 2"), "content file must be used: {src}");
+    assert!(!src.contains("{ 3 }") && !src.contains("{3"), "stdin must be ignored: {src}");
 }
 
 #[test]
