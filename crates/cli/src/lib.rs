@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand};
 use greppy_core::error::{Error, Result};
 use greppy_core::workspace as workspace_locator;
 
+mod changes;
 #[cfg(any(unix, windows))]
 mod embed_daemon;
 #[cfg(any(unix, windows))]
@@ -312,6 +313,15 @@ pub enum Command {
     Map {
         /// Directory to orient within (default: workspace root).
         path: Option<String>,
+        /// Emit the complete stable JSON shape.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Group working-tree changes by definitions and graph impact.
+    Changes {
+        /// Compare the working tree with this commit (default: HEAD).
+        #[arg(long, value_name = "REV")]
+        base: Option<String>,
         /// Emit the complete stable JSON shape.
         #[arg(long)]
         json: bool,
@@ -1166,6 +1176,7 @@ const SUBCOMMANDS: &[&str] = &[
     "grep",
     "index",
     "map",
+    "changes",
     "cache",
     "trial",
     "verify",
@@ -1420,6 +1431,7 @@ fn closest_valid_invocation(
             vec!["--path"]
         }
         "search-code" => vec!["--path", "--changed", "--staged", "--since", "--base"],
+        "changes" => vec!["--base"],
         "search-symbols" => vec!["--path", "--kind"],
         "impact" => vec!["--direction", "--edge", "--depth", "--since", "--base"],
         "trace" => vec!["--symbol", "--direction", "--edge", "--depth"],
@@ -1521,6 +1533,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
         "map" => "greppy map [PATH] [--json] [--root DIR]",
+        "changes" => "greppy changes [--base REV] [--json] [--root DIR]",
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
@@ -2063,6 +2076,7 @@ fn dispatch_subcommand(
             }
         }
         Command::Map { path, json } => map::run(path.as_deref(), json, root),
+        Command::Changes { base, json } => changes::run(base.as_deref(), json, root),
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Trial { args } => trial::run(args, root),
         Command::Verify { args } => Ok(verify::run(args, root)),
