@@ -7120,27 +7120,6 @@ fn read_source_arg(source_file: &str) -> Result<Vec<u8>> {
     })
 }
 
-fn reject_ignored_edit_stdin(content_file: &str, verb: &str) -> Result<()> {
-    use std::io::{IsTerminal, Read};
-
-    if content_file == "-" || std::io::stdin().is_terminal() {
-        return Ok(());
-    }
-    let mut piped = Vec::new();
-    std::io::stdin()
-        .read_to_end(&mut piped)
-        .map_err(|source| Error::Io {
-            context: "inspect piped edit content".into(),
-            source,
-        })?;
-    if piped.is_empty() {
-        return Ok(());
-    }
-    Err(Error::Invalid(format!(
-        "status: invalid-request\n{verb} received non-empty stdin but --content-file {content_file} would ignore it; retry with: greppy edit {verb} --content-file - < content.txt"
-    )))
-}
-
 fn reject_target_as_content_file(
     content_file: &str,
     target_file: &std::path::Path,
@@ -7254,7 +7233,6 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             dry_run,
             report,
         } => {
-            reject_ignored_edit_stdin(&content_file, "replace-body")?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
@@ -7306,7 +7284,6 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             } else {
                 (greppy_edit::verbs::InsertPosition::After, "insert-after")
             };
-            reject_ignored_edit_stdin(&content_file, verb)?;
             match resolve_edit_target(symbol.as_deref(), target.as_deref(), root, &root_path)? {
                 EditTarget::Refusal(cert) => (*cert, report),
                 EditTarget::Resolved {
