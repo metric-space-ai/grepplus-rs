@@ -28,12 +28,35 @@ EXPAND — get the full source in one call instead of opening files by hand:
       pack — the full source of the top matches, bundled — in a single call,
       instead of reading each file:line yourself.
 
-READ — a definition's exact source, plus a handle for editing it:
+READ — exact source plus a handle for editing it:
   greppy read SYMBOL [FILE]
       SYMBOL's definition span, byte-precise. With --handle it also returns an
       edit handle pinning the file, byte range, and content hashes — pass it to
       the edit commands below. FILE (or --path FILE) disambiguates when SYMBOL
       resolves in several files. Prefer this over opening whole files.
+  greppy read PATH [--lines A:B]
+      An existing file path reads the FILE (numbered lines; --lines for a
+      range). With --handle the range becomes an edit handle too — so
+      replace-span / patch-span work on file regions, not only on symbols.
+
+ORIENT — the project at a glance, the working tree by meaning:
+  greppy map [PATH]
+      One screen of orientation: languages with index coverage, top-level
+      modules, test roots, build/test commands, vendored/generated dirs,
+      largest subtrees. Use this instead of ls/find exploration.
+  greppy changes [--base REV]
+      The current diff grouped by SYMBOLS: changed/new/deleted definitions,
+      signature changes, their direct callers, and affected tests — split
+      strictly into known_impacted and unknown_or_unindexed.
+
+VERIFY — baseline-vs-after test comparison without touching your worktree:
+  greppy verify [--baseline REV] -- COMMAND
+      Runs COMMAND in the current tree AND against REV (default HEAD) in an
+      isolated temporary worktree — never stash, never checkout. Classifies
+      test cases: newly_failed / fixed / preexisting_failed /
+      infrastructure_error. Exit 0 = nothing newly broken; 21 = newly_failed;
+      22 = infrastructure error. Use this instead of stashing to check
+      whether a failure is yours or preexisting.
 
 EDIT COMMANDS — transactional, hash-guarded, all-or-nothing. Every command
 verifies its own result and emits a certificate; on failure nothing is written
@@ -70,6 +93,10 @@ FLAGS (append to any command above):
   --direction incoming|outgoing, --depth N   (impact) which way and how far to walk
   --from A --to B   (path) the two endpoint symbols
   --report FILE     (edit) write the full certificate to FILE; stdout stays compact
+  --limit N         cap the number of results (alias --max)
+  --max-bytes N, --offset K   budget the output; truncation prints total,
+                    shown, and the exact continuation command — never pipe
+                    greppy through head/tail, budgeting keeps JSON valid
 
 Prefer these over grepping a symbol name and reading every hit: who-calls /
 callees / impact answer relationship questions directly, and semantic-search
