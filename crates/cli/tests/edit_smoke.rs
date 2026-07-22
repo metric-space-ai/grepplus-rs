@@ -98,6 +98,28 @@ fn assert_success(action: &str, output: &Output) {
 }
 
 #[test]
+fn replace_body_accepts_natural_inner_body() {
+    let fixture = Fixture::new("replace-body-inner");
+    let body = fixture.scratch("body.rs", r#"format!("hey {}", name)"#);
+
+    let output = fixture.run(&[
+        "edit",
+        "replace-body",
+        "--symbol",
+        "greet",
+        "--content-file",
+        body.to_str().unwrap(),
+    ]);
+
+    assert_success("replace-body with inner body", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(
+        changed.contains(r#"{format!("hey {}", name)}"#),
+        "{changed}"
+    );
+}
+
+#[test]
 fn replace_body_with_content_file_does_not_wait_for_open_stdin_pipe() {
     let fixture = Fixture::new("replace-body-open-stdin");
     let body = fixture.scratch("body.rs", r#"{ format!("hey {}", name) }"#);

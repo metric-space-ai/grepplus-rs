@@ -569,10 +569,32 @@ pub enum InsertPosition {
     After,
 }
 
+fn outer_brace_offsets(content: &[u8]) -> Option<(usize, usize)> {
+    let open = content.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let close = content.iter().rposition(|byte| !byte.is_ascii_whitespace())?;
+    (content[open] == b'{' && content[close] == b'}').then_some((open, close))
+}
+
+fn replacement_body_preserving_delimiters(current_body: &[u8], requested: &[u8]) -> Vec<u8> {
+    if outer_brace_offsets(requested).is_some() {
+        return requested.to_vec();
+    }
+    let Some((open, close)) = outer_brace_offsets(current_body) else {
+        return requested.to_vec();
+    };
+    let mut replacement = Vec::with_capacity(open + 1 + requested.len() + current_body.len() - close);
+    replacement.extend_from_slice(&current_body[..=open]);
+    replacement.extend_from_slice(requested);
+    replacement.extend_from_slice(&current_body[close..]);
+    replacement
+}
+
 /// `greppy edit replace-body --symbol SYM`: replace only the BODY of the
 /// definition at `def_range`, located via tree-sitter (`body` field of the
 /// smallest definition node covering the span). The signature stays
-/// byte-identical.
+/// byte-identical. For brace-delimited bodies, callers may provide either the
+/// full block or only its natural inner content; the existing delimiters are
+/// retained for inner content.
 pub fn replace_body(
     workspace_root: &Path,
     file: &Path,
@@ -600,7 +622,9 @@ pub fn replace_body(
             PublishMode::Atomic,
         ));
     };
-    if &snapshot.content[body_range.0..body_range.1] == new_body {
+    let current_body = &snapshot.content[body_range.0..body_range.1];
+    let replacement = replacement_body_preserving_delimiters(current_body, new_body);
+    if current_body == replacement {
         return Ok(single_op_certificate(
             workspace_root,
             &snapshot,
@@ -618,7 +642,7 @@ pub fn replace_body(
     let ops = vec![PlannedOp {
         id: "replace-body".into(),
         range: body_range,
-        replacement: new_body.to_vec(),
+        replacement,
     }];
     run_pipeline(
         workspace_root,
@@ -2965,6 +2989,28 @@ timeout = 30
         let out = std::fs::read_to_string(&f).unwrap();
         assert!(out.starts_with("def add(a, b):"), "{out}");
         assert!(out.contains("return b + a"), "{out}");
+    }
+
+    #[test]
+    fn replace_body_accepts_inner_rust_body_and_preserves_braces() {
+        let dir = ws();
+        let f = dir.path().join("m.rs");
+        let content = b"pub fn greet(name: &str) -> String {\n    format!(\"hello {}\", name)\n}\n";
+        std::fs::write(&f, content).unwrap();
+        let cert = replace_body(
+            dir.path(),
+            &f,
+            (0, content.len() - 1),
+            b"format!(\"hey {}\", name)",
+            Language::Rust,
+            &VerbOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(cert.status, Status::Applied, "{cert:?}");
+        assert_eq!(
+            std::fs::read_to_string(&f).unwrap(),
+            "pub fn greet(name: &str) -> String {format!(\"hey {}\", name)}\n"
+        );
     }
 
     #[test]
