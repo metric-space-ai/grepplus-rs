@@ -376,7 +376,9 @@ pub enum Command {
     },
     /// Read a symbol's exact definition span (byte-precise source). With
     /// --handle, also returns an edit handle that pins the file, byte range,
-    /// and content hashes — pass it to `greppy edit` commands. Prefer this
+    /// and content hashes — pass it to `greppy edit` commands. File paths and
+    /// `--lines A:B` ranges produce the same directly consumable handle form.
+    /// Prefer this
     /// over opening whole files: it returns exactly the code that matters.
     Read {
         symbol: Option<String>,
@@ -393,7 +395,7 @@ pub enum Command {
         /// For file reads, print only the inclusive 1-based range A:B.
         #[arg(long, value_name = "A:B")]
         lines: Option<String>,
-        /// Also return an edit handle for the definition span.
+        /// Also return an edit handle for the symbol, file, or selected line range.
         #[arg(long)]
         handle: bool,
         /// Accepted for agent ergonomics: read already prints the definition's
@@ -2047,7 +2049,7 @@ fn dispatch_subcommand(
             if symbol_opt.is_none() && path.is_none() && path_opt.is_none() {
                 if let Some(subject) = symbol.as_deref() {
                     if read_subject_is_path(subject, root)? {
-                        return dispatch_read_file(subject, lines.as_deref(), json, root);
+                        return dispatch_read_file(subject, lines.as_deref(), handle, json, root);
                     }
                 }
             }
@@ -6610,6 +6612,7 @@ fn closest_read_paths(root_path: &std::path::Path, subject: &str) -> Result<Vec<
 fn dispatch_read_file(
     subject: &str,
     lines: Option<&str>,
+    with_handle: bool,
     json: bool,
     root: Option<&str>,
 ) -> Result<i32> {
@@ -6668,6 +6671,25 @@ fn dispatch_read_file(
     } else {
         &file_lines[start.saturating_sub(1)..end]
     };
+    let (byte_start, byte_end) = if end < start {
+        (0, 0)
+    } else {
+        line_range_to_bytes(content.as_bytes(), start, end)
+    };
+    let handle_token = if with_handle {
+        Some(
+            greppy_edit::EditHandle::for_range(
+                &canonical_root,
+                std::path::Path::new(&shown_path),
+                content.as_bytes(),
+                byte_start,
+                byte_end,
+            )?
+            .encode(),
+        )
+    } else {
+        None
+    };
     if json {
         let rows = selected
             .iter()
@@ -6683,7 +6705,10 @@ fn dispatch_read_file(
                 "path": shown_path,
                 "start_line": start,
                 "end_line": end,
+                "byte_start": byte_start,
+                "byte_end": byte_end,
                 "lines": rows,
+                "handle": handle_token,
             }))
             .map_err(|error| Error::Invalid(format!("serialize read file JSON: {error}")))?
         );
@@ -6692,6 +6717,9 @@ fn dispatch_read_file(
         let width = end.max(start).to_string().len();
         for (offset, text) in selected.iter().enumerate() {
             println!("{:>width$} | {text}", start + offset);
+        }
+        if let Some(token) = &handle_token {
+            println!("handle: {token}");
         }
     }
     Ok(0)

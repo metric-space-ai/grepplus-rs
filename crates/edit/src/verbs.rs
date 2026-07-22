@@ -307,6 +307,10 @@ pub fn replace_span(
         range: (start, end),
         replacement: new_content.to_vec(),
     }];
+    // Symbol handles carry grammar identity and retain the structural-context
+    // guard. File/range handles intentionally omit it: they may span several
+    // declarations, so whole-file syntax and byte isolation are the proof.
+    let enforce_structure = handle.grammar_id.is_some();
     run_pipeline(
         workspace_root,
         snapshot,
@@ -315,7 +319,7 @@ pub fn replace_span(
         SelectorClass::Resolved,
         language,
         options,
-        true,
+        enforce_structure,
     )
 }
 
@@ -375,6 +379,7 @@ pub fn patch_span(
         range: (start, end),
         replacement: new_target,
     }];
+    let enforce_structure = handle.grammar_id.is_some();
     run_pipeline(
         workspace_root,
         snapshot,
@@ -383,7 +388,7 @@ pub fn patch_span(
         SelectorClass::Resolved,
         language,
         options,
-        true,
+        enforce_structure,
     )
 }
 

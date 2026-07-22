@@ -85,3 +85,134 @@ fn misspelled_read_path_suggests_paths_not_symbols() {
     assert!(stdout.contains("try: greppy read src/lib.rs"), "{stdout}");
     assert!(!stdout.contains("closest definitions"), "{stdout}");
 }
+
+fn handle_from(stdout: &str) -> &str {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("handle: "))
+        .expect("read output contains a handle")
+}
+
+#[test]
+fn read_path_range_handle_drives_replace_span_and_certificate() {
+    let (repo, store) = fresh_workspace("range-handle-replace");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let original = "fn one() {}\nfn two() {}\nfn three() {}\n";
+    std::fs::write(repo.join("src/lib.rs"), original).unwrap();
+
+    let (read_code, read_stdout, read_stderr) = run(
+        &repo,
+        &store,
+        &["read", "src/lib.rs", "--lines", "2:2", "--handle"],
+    );
+    assert_eq!(read_code, 0, "stdout={read_stdout}\nstderr={read_stderr}");
+    let handle = handle_from(&read_stdout).to_string();
+    let replacement = repo.join("replacement.rs");
+    std::fs::write(&replacement, "fn changed() {}\n").unwrap();
+
+    let (edit_code, edit_stdout, edit_stderr) = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-span",
+            "--target",
+            &handle,
+            "--source-file",
+            replacement.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(edit_code, 0, "stdout={edit_stdout}\nstderr={edit_stderr}");
+    let certificate: serde_json::Value = serde_json::from_str(&edit_stdout).unwrap();
+    assert_eq!(certificate["status"], "applied");
+    assert_eq!(certificate["exit_code"], 0);
+    assert_eq!(certificate["published"], true);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "fn one() {}\nfn changed() {}\nfn three() {}\n"
+    );
+}
+
+#[test]
+fn read_path_handle_is_stale_after_any_file_change() {
+    let (repo, store) = fresh_workspace("range-handle-stale");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let original = "fn one() {}\nfn two() {}\nfn three() {}\n";
+    let changed = "// changed elsewhere\nfn one() {}\nfn two() {}\nfn three() {}\n";
+    std::fs::write(repo.join("src/lib.rs"), original).unwrap();
+
+    let (read_code, read_stdout, read_stderr) = run(
+        &repo,
+        &store,
+        &["read", "src/lib.rs", "--lines", "2:2", "--handle"],
+    );
+    assert_eq!(read_code, 0, "stdout={read_stdout}\nstderr={read_stderr}");
+    let handle = handle_from(&read_stdout).to_string();
+    std::fs::write(repo.join("src/lib.rs"), changed).unwrap();
+    let replacement = repo.join("replacement.rs");
+    std::fs::write(&replacement, "fn changed() {}\n").unwrap();
+
+    let (edit_code, edit_stdout, edit_stderr) = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-span",
+            "--target",
+            &handle,
+            "--source-file",
+            replacement.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(edit_code, 12, "stdout={edit_stdout}\nstderr={edit_stderr}");
+    let certificate: serde_json::Value = serde_json::from_str(&edit_stdout).unwrap();
+    assert_eq!(certificate["status"], "stale");
+    assert_eq!(certificate["exit_code"], 12);
+    assert_eq!(certificate["published"], false);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        changed
+    );
+}
+
+#[test]
+fn read_whole_file_handle_covers_and_replaces_every_byte() {
+    let (repo, store) = fresh_workspace("whole-file-handle");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let original = "fn one() {}\nfn two() {}\n";
+    std::fs::write(repo.join("src/lib.rs"), original).unwrap();
+
+    let (read_code, read_stdout, read_stderr) =
+        run(&repo, &store, &["read", "src/lib.rs", "--handle", "--json"]);
+    assert_eq!(read_code, 0, "stdout={read_stdout}\nstderr={read_stderr}");
+    let read_json: serde_json::Value = serde_json::from_str(&read_stdout).unwrap();
+    assert_eq!(read_json["byte_start"], 0);
+    assert_eq!(read_json["byte_end"], original.len());
+    let handle = read_json["handle"].as_str().expect("JSON handle");
+    let replacement = repo.join("replacement.rs");
+    let replacement_text = "fn replacement() {}\n";
+    std::fs::write(&replacement, replacement_text).unwrap();
+
+    let (edit_code, edit_stdout, edit_stderr) = run(
+        &repo,
+        &store,
+        &[
+            "edit",
+            "replace-span",
+            "--target",
+            handle,
+            "--source-file",
+            replacement.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(edit_code, 0, "stdout={edit_stdout}\nstderr={edit_stderr}");
+    let certificate: serde_json::Value = serde_json::from_str(&edit_stdout).unwrap();
+    assert_eq!(certificate["status"], "applied");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        replacement_text
+    );
+}
