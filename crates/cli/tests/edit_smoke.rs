@@ -120,6 +120,26 @@ fn replace_body_accepts_natural_inner_body() {
 }
 
 #[test]
+fn change_signature_accepts_inline_json_spec() {
+    let fixture = Fixture::new("change-signature-inline");
+    let spec = r#"{"old_parameters":"(a: i32, b: i32)","new_parameters":"(b: i32, a: i32)","expect_call_sites":1}"#;
+
+    let output = fixture.run(&[
+        "edit",
+        "change-signature",
+        "--symbol",
+        "combine",
+        "--spec",
+        spec,
+    ]);
+
+    assert_success("change-signature with inline JSON", &output);
+    let changed = std::fs::read_to_string(fixture.repo.join("src/lib.rs")).unwrap();
+    assert!(changed.contains("combine(b: i32, a: i32)"), "{changed}");
+    assert!(changed.contains("combine(2, 1)"), "{changed}");
+}
+
+#[test]
 fn replace_body_with_content_file_does_not_wait_for_open_stdin_pipe() {
     let fixture = Fixture::new("replace-body-open-stdin");
     let body = fixture.scratch("body.rs", r#"{ format!("hey {}", name) }"#);

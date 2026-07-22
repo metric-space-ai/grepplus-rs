@@ -1011,8 +1011,8 @@ pub enum EditCommand {
     ChangeSignature {
         #[arg(long)]
         symbol: String,
-        /// JSON file containing old_parameters, new_parameters,
-        /// added_arguments, and expect_call_sites.
+        /// Inline JSON, or a JSON file containing old_parameters,
+        /// new_parameters, added_arguments, and expect_call_sites.
         #[arg(long)]
         spec: String,
         /// graph (default) uses the resolved store; lsp is unavailable in this build.
@@ -7382,10 +7382,14 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             report,
         } => {
             greppy_edit::verbs::require_semantic_backend(&backend)?;
-            let spec_bytes = std::fs::read(&spec).map_err(|source| Error::Io {
-                context: format!("read change-signature spec {spec}"),
-                source,
-            })?;
+            let spec_bytes = if spec.trim_start().starts_with('{') {
+                spec.as_bytes().to_vec()
+            } else {
+                std::fs::read(&spec).map_err(|source| Error::Io {
+                    context: format!("read change-signature spec {spec}"),
+                    source,
+                })?
+            };
             let spec: greppy_edit::verbs::ChangeSignatureSpec = serde_json::from_slice(&spec_bytes)
                 .map_err(|error| {
                     Error::Invalid(format!(
