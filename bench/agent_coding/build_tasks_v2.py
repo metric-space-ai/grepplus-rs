@@ -59,6 +59,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
+        "--only-ids",
+        type=Path,
+        help="Build only task ids listed in a JSON selection file or one-per-line text file",
+    )
+    parser.add_argument(
+        "--include-nonvalid",
+        action="store_true",
+        help="Include explicitly selected non-valid rows for a fresh preflight validation",
+    )
+    parser.add_argument(
         "--harvest-root",
         type=Path,
         help="Directory containing one local clone per repository",
@@ -79,6 +89,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--limit must be at least 1")
     if args.min_tasks < 1:
         parser.error("--min-tasks must be at least 1")
+    if args.include_nonvalid and args.only_ids is None:
+        parser.error("--include-nonvalid requires --only-ids")
     return args
 
 
@@ -106,6 +118,30 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     except OSError as exc:
         raise SystemExit(f"cannot read {path}: {exc}") from exc
     return rows
+
+
+def read_selected_ids(path: Path) -> set[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise SystemExit(f"cannot read selected ids from {path}: {exc}") from exc
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError:
+        ids = {line.strip() for line in text.splitlines() if line.strip()}
+    else:
+        if isinstance(document, dict) and isinstance(document.get("selected"), list):
+            values = [row.get("id") if isinstance(row, dict) else None for row in document["selected"]]
+        elif isinstance(document, list):
+            values = document
+        else:
+            raise SystemExit(f"{path}: expected a JSON array or an object with a selected array")
+        if not all(isinstance(value, str) and value for value in values):
+            raise SystemExit(f"{path}: selected ids must be non-empty strings")
+        ids = set(values)
+    if not ids:
+        raise SystemExit(f"{path}: no selected ids")
+    return ids
 
 
 def json_type_matches(instance: Any, expected: str) -> bool:
@@ -454,7 +490,17 @@ def main() -> int:
         raise SystemExit(f"{args.schema}: schema root must be an object")
     task_schema = resolve_local_ref(root_schema, "#/$defs/task")
 
-    validated_rows = [row for row in read_jsonl(args.validated) if row.get("verdict") == "valid"]
+    all_rows = read_jsonl(args.validated)
+    selected_ids = read_selected_ids(args.only_ids) if args.only_ids else None
+    if selected_ids is not None:
+        known_ids = {expected_task_id(row) for row in all_rows}
+        missing_ids = sorted(selected_ids - known_ids)
+        if missing_ids:
+            raise SystemExit(f"unknown selected task ids: {missing_ids!r}")
+        all_rows = [row for row in all_rows if expected_task_id(row) in selected_ids]
+    validated_rows = [
+        row for row in all_rows if args.include_nonvalid or row.get("verdict") == "valid"
+    ]
     serious_index = index_candidates(read_jsonl(args.serious), "S")
     medium_index = index_candidates(read_jsonl(args.medium), "M")
     source_indexes = {"S": serious_index, "M": medium_index}
