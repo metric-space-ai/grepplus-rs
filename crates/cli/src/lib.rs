@@ -27,6 +27,7 @@ use greppy_core::workspace as workspace_locator;
 mod embed_daemon;
 #[cfg(any(unix, windows))]
 mod inference_daemon;
+mod map;
 #[cfg(any(unix, windows))]
 mod summarize_daemon;
 mod trial;
@@ -242,6 +243,14 @@ pub enum Command {
         /// Path to the repository root (default: cwd).
         path: Option<String>,
         /// With path `status`, emit machine-readable status JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show a one-screen project map from VCS, index, and build metadata.
+    Map {
+        /// Directory to orient within (default: workspace root).
+        path: Option<String>,
+        /// Emit the complete stable JSON shape.
         #[arg(long)]
         json: bool,
     },
@@ -1092,6 +1101,7 @@ impl Cli {
 const SUBCOMMANDS: &[&str] = &[
     "grep",
     "index",
+    "map",
     "cache",
     "trial",
     "verify",
@@ -1429,6 +1439,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "path" => "greppy path --from SYMBOL --to SYMBOL [--root DIR]",
         "index" => "greppy index PATH [--device auto|cpu|metal|cuda]",
+        "map" => "greppy map [PATH] [--json] [--root DIR]",
         "trial" => {
             "greppy trial --root DIR --question QUESTION --check who-calls --symbol SYMBOL \
              --expect TEXT [--forbid TEXT] --runner pi --provider NAME --model ID"
@@ -1960,6 +1971,7 @@ fn dispatch_subcommand(
                 dispatch_index(path.as_deref(), root, EmbeddingCliArgs { device, no_gpu })
             }
         }
+        Command::Map { path, json } => map::run(path.as_deref(), json, root),
         Command::Cache { command } => dispatch_cache(command, root),
         Command::Trial { args } => trial::run(args, root),
         Command::Verify { args } => Ok(verify::run(args, root)),
