@@ -350,6 +350,56 @@ fn ensure_import_inserts_go_module_inside_existing_group() {
 }
 
 #[test]
+fn ensure_import_inserts_names_inside_grouped_imports() {
+    let ws = workspace();
+    let cases: &[(&str, &[u8], &str, &str, &str)] = &[
+        (
+            "m.py",
+            b"from auth import (\n    check,\n)\n\ndef run():\n    pass\n",
+            "auth",
+            "validate",
+            "from auth import (\n    check,\n    validate,\n)",
+        ),
+        (
+            "m.rs",
+            b"use crate::auth::{\n    check,\n};\n\nfn main() {}\n",
+            "crate::auth",
+            "validate",
+            "use crate::auth::{\n    check,\n    validate,\n};",
+        ),
+        (
+            "m.ts",
+            b"import {\n  check,\n} from \"auth\";\n\ncheck();\n",
+            "auth",
+            "validate",
+            "import {\n  check,\n  validate,\n} from \"auth\";",
+        ),
+    ];
+
+    for &(path, original, module, name, expected) in cases {
+        let file = write(ws.path(), path, original);
+        let certificate = ensure_import(
+            ws.path(),
+            &file,
+            module,
+            Some(name),
+            &VerbOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(certificate.status, Status::Applied, "{path}");
+        assert_eq!(certificate.exit_code(), 0, "{path}");
+        assert_eq!(certificate.operations[0].syntax.new_errors, 0, "{path}");
+        assert_eq!(
+            certificate.operations[0].syntax.new_missing_nodes, 0,
+            "{path}"
+        );
+        let changed = std::fs::read_to_string(file).unwrap();
+        assert!(changed.contains(expected), "{path}: {changed}");
+    }
+}
+
+#[test]
 fn ensure_import_rejects_syntax_breaking_projection() {
     let ws = workspace();
     let original =

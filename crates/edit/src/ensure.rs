@@ -47,8 +47,7 @@ fn import_kinds(language: Language) -> &'static [&'static str] {
 
 struct GroupedImportInsertion {
     insert_at: usize,
-    indent: Vec<u8>,
-    needs_leading_newline: bool,
+    replacement: Vec<u8>,
 }
 
 struct ImportScan {
@@ -79,6 +78,86 @@ fn leading_indent(content: &[u8], at: usize) -> Vec<u8> {
         .collect()
 }
 
+fn comma_group_insertion(
+    content: &[u8],
+    open: usize,
+    close: usize,
+    entry: &str,
+    default_indent: &[u8],
+) -> Option<GroupedImportInsertion> {
+    if open >= close || close > content.len() {
+        return None;
+    }
+    let inside = &content[open + 1..close];
+    let first_offset = inside.iter().position(|byte| !byte.is_ascii_whitespace());
+    let Some(first_offset) = first_offset else {
+        if inside.contains(&b'\n') {
+            let close_line_start = line_start(content, close);
+            let mut indent = content[close_line_start..close].to_vec();
+            indent.extend_from_slice(default_indent);
+            let mut replacement = indent;
+            replacement.extend_from_slice(entry.as_bytes());
+            replacement.extend_from_slice(b",\n");
+            return Some(GroupedImportInsertion {
+                insert_at: close_line_start,
+                replacement,
+            });
+        }
+        return Some(GroupedImportInsertion {
+            insert_at: open + 1,
+            replacement: entry.as_bytes().to_vec(),
+        });
+    };
+    let first = open + 1 + first_offset;
+    let last = open
+        + 1
+        + inside
+            .iter()
+            .rposition(|byte| !byte.is_ascii_whitespace())?;
+    let multiline = content[open + 1..close].contains(&b'\n');
+    if !multiline {
+        let mut replacement = if content[last] == b',' {
+            b" ".to_vec()
+        } else {
+            b", ".to_vec()
+        };
+        replacement.extend_from_slice(entry.as_bytes());
+        if content[last] == b',' {
+            replacement.push(b',');
+        }
+        return Some(GroupedImportInsertion {
+            insert_at: last + 1,
+            replacement,
+        });
+    }
+
+    let close_line_start = line_start(content, close);
+    let close_on_own_line = content[close_line_start..close]
+        .iter()
+        .all(u8::is_ascii_whitespace);
+    let mut indent = leading_indent(content, first);
+    if indent.is_empty() {
+        indent = if close_on_own_line {
+            content[close_line_start..close].to_vec()
+        } else {
+            leading_indent(content, open)
+        };
+        indent.extend_from_slice(default_indent);
+    }
+    let mut replacement = Vec::new();
+    if content[last] != b',' {
+        replacement.push(b',');
+    }
+    replacement.push(b'\n');
+    replacement.extend_from_slice(&indent);
+    replacement.extend_from_slice(entry.as_bytes());
+    replacement.push(b',');
+    Some(GroupedImportInsertion {
+        insert_at: last + 1,
+        replacement,
+    })
+}
+
 fn scan_imports(
     language: Language,
     content: &[u8],
@@ -103,6 +182,7 @@ fn scan_imports(
             end += 1;
         }
         insert_at = end;
+        let mentions_module = text.contains(module);
         if language == Language::Go {
             let list = {
                 let mut declaration_cursor = node.walk();
@@ -136,18 +216,48 @@ fn scan_imports(
                         indent.push(b'\t');
                         indent
                     });
+                let mut replacement = Vec::new();
+                if !close_on_own_line {
+                    replacement.push(b'\n');
+                }
+                replacement.extend_from_slice(&indent);
+                replacement.push(b'"');
+                replacement.extend_from_slice(module.as_bytes());
+                replacement.extend_from_slice(b"\"\n");
                 grouped = Some(GroupedImportInsertion {
                     insert_at: if close_on_own_line {
                         close_line_start
                     } else {
                         close
                     },
-                    indent,
-                    needs_leading_newline: !close_on_own_line,
+                    replacement,
                 });
             }
+        } else if mentions_module {
+            if let Some(name) = name {
+                let node_start = node.start_byte();
+                let node_end = node.end_byte();
+                let delimiters = match language {
+                    Language::Python => (b'(', b')', b"    ".as_slice()),
+                    Language::Rust => (b'{', b'}', b"    ".as_slice()),
+                    Language::TypeScript { .. } | Language::JavaScript => {
+                        (b'{', b'}', b"  ".as_slice())
+                    }
+                    _ => continue,
+                };
+                let open = content[node_start..node_end]
+                    .iter()
+                    .position(|byte| *byte == delimiters.0)
+                    .map(|offset| node_start + offset);
+                let close = content[node_start..node_end]
+                    .iter()
+                    .rposition(|byte| *byte == delimiters.1)
+                    .map(|offset| node_start + offset);
+                if let (Some(open), Some(close)) = (open, close) {
+                    grouped = comma_group_insertion(content, open, close, name, delimiters.2);
+                }
+            }
         }
-        let mentions_module = text.contains(module);
         match name {
             Some(n) => {
                 let mentions_name = text
@@ -235,15 +345,7 @@ pub fn ensure_import(
         ));
     }
     let (insert_at, block) = if let Some(grouped) = scan.grouped {
-        let mut block = Vec::new();
-        if grouped.needs_leading_newline {
-            block.push(b'\n');
-        }
-        block.extend_from_slice(&grouped.indent);
-        block.push(b'"');
-        block.extend_from_slice(module.as_bytes());
-        block.extend_from_slice(b"\"\n");
-        (grouped.insert_at, block)
+        (grouped.insert_at, grouped.replacement)
     } else {
         let mut block = line.into_bytes();
         block.push(b'\n');
