@@ -891,10 +891,11 @@ fn search_symbols_json_reports_exact_counts_and_metadata() {
     );
 }
 
-/// Renaming a symbol starts refresh, but the triggering search must not mix
-/// current names with the old graph generation.
+/// A one-file edit heals on the triggering symbol search, and a read issued
+/// while greppy-edit's own refresh holds the writer lock waits for that fresh
+/// snapshot instead of returning an empty `refreshing` payload.
 #[test]
-fn search_symbols_json_refuses_while_small_stale_drift_refreshes() {
+fn symbol_queries_heal_single_file_edits_and_wait_for_edit_refresh() {
     let (repo, store) = index_fixture("symbols-json-stale");
     std::fs::write(
         repo.join("src/types.rs"),
@@ -908,21 +909,81 @@ fn search_symbols_json_refuses_while_small_stale_drift_refreshes() {
         &store,
     );
     assert_eq!(
-        code, 75,
-        "refreshing search-symbols must return EX_TEMPFAIL; stderr={err}\nstdout={out}"
+        code, 0,
+        "search-symbols must heal one-file drift in-band; stderr={err}\nstdout={out}"
     );
     let v: serde_json::Value =
         serde_json::from_str(&out).unwrap_or_else(|e| panic!("invalid json: {e}; stdout={out:?}"));
     assert_eq!(v["command"], "search-symbols");
-    assert_eq!(v["status"], "skipped_stale_index");
-    assert_eq!(
-        v["fresh"], false,
-        "the triggering search must not claim freshness: {v:?}"
-    );
-    assert_eq!(v["freshness"]["state"], "refreshing");
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["fresh"], true);
     assert!(
-        v["hits"].as_array().is_some_and(Vec::is_empty),
-        "stale symbol rows must not escape: {v:?}"
+        v["hits"].as_array().is_some_and(|hits| hits.iter().any(|hit| {
+            hit["qualified_name"]
+                .as_str()
+                .is_some_and(|name| name.contains("WidgetRenamed"))
+        })),
+        "healed symbol search must contain the edited definition: {v:?}"
+    );
+
+    let (repo, store) = index_fixture("read-waits-for-edit-refresh");
+    let ready = repo.parent().unwrap().join("edit-index-ready");
+    let mut edit = Command::new(bin());
+    edit.args([
+        "edit",
+        "text-cas",
+        "--file",
+        "src/helper.rs",
+        "--old",
+        "answer = 42",
+        "--new",
+        "answer = 84",
+    ])
+    .current_dir(&repo)
+    .env("GREPPY_STORE_DIR", &store)
+    .env("GREPPY_TEST_SKIP_INFERENCE", "1")
+    .env("GREPPY_TEST_INDEX_FAILPOINT", "after-temp-before-publish")
+    .env("GREPPY_TEST_INDEX_FAILPOINT_READY", &ready)
+    .env("GREPPY_TEST_INDEX_FAILPOINT_HOLD_MS", "1000")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped());
+    let child = edit.spawn().expect("spawn greppy-edit with held refresh");
+    for _ in 0..500 {
+        if ready.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        ready.exists(),
+        "edit-owned indexer did not reach the publication failpoint"
+    );
+
+    let (code, out, err) = run(&["read", "do_it", "--json"], &repo, &store);
+    assert_eq!(
+        code, 0,
+        "read must wait for the edit-owned refresh; stderr={err}\nstdout={out}"
+    );
+    assert!(
+        err.contains("graph refresh already running") && err.contains("ETA unavailable"),
+        "lock wait must be explicit to the caller; stderr={err:?}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("invalid read json: {e}; stdout={out:?}"));
+    assert_eq!(v["status"], "ok");
+    assert!(
+        v["source"]
+            .as_str()
+            .is_some_and(|source| source.contains("answer = 84")),
+        "read must return the post-edit definition: {v:?}"
+    );
+
+    let edit_out = child.wait_with_output().expect("wait for greppy-edit");
+    assert!(
+        edit_out.status.success(),
+        "greppy-edit failed\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&edit_out.stdout),
+        String::from_utf8_lossy(&edit_out.stderr)
     );
 }
 

@@ -4876,12 +4876,32 @@ fn freshness_serve_decision(
 fn maybe_reindex_stale(store: &mut greppy_store::Store, root: Option<&str>) -> Result<()> {
     let project = project_for(root)?;
     if freshness_is_reindexable_stale(store, root, &project) {
-        try_auto_reindex_inline(root);
+        let rebuilt = try_auto_reindex_inline(root);
+        if !rebuilt && workspace_writer_active(root) {
+            wait_for_active_index_refresh(root);
+        }
         if let Ok(fresh) = open_default_store_query_writer(root) {
             *store = fresh;
         }
     }
     Ok(())
+}
+
+/// An edit-owned or background indexer may already be building the exact fresh
+/// snapshot this query needs. Wait for that writer to publish instead of
+/// immediately returning an empty `refreshing` result. The OS lock has no stale
+/// owner: process exit releases it, so this cannot wait on an abandoned PID.
+fn wait_for_active_index_refresh(root: Option<&str>) {
+    let Ok(effective_root) = resolve_root(root) else {
+        return;
+    };
+    let store_path = workspace_locator::store_path(&effective_root);
+    eprintln!(
+        "greppy: graph refresh already running; waiting for fresh snapshot (ETA unavailable)"
+    );
+    if let Ok(lock) = greppy_freshness::acquire(&store_path) {
+        drop(lock);
+    }
 }
 
 /// The index is stale AND the drift is one an inline reindex can heal
@@ -11062,7 +11082,8 @@ fn dispatch_search_symbols(
         return Err(Error::Invalid("search-symbols requires a query".into()));
     }
     let path_filters = prepare_query_path_filters(root, "search-symbols", q, paths)?;
-    let store = open_default_store(root)?;
+    let mut store = open_default_store(root)?;
+    maybe_reindex_stale(&mut store, root)?;
     let project = project_for(root)?;
     // Symbol rows are visible only from a freshness-proven snapshot.
     let decision = freshness_serve_decision(&store, root, &project);
