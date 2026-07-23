@@ -1137,6 +1137,12 @@ pub enum EditCommand {
         #[arg(long)]
         diff: Option<String>,
     },
+    /// Print a valid, copyable minimal plan to stdout; write nothing.
+    #[command(name = "plan-template")]
+    PlanTemplate {
+        #[arg(long, default_value = "text-cas", value_parser = ["text-cas", "replace-body"])]
+        op: String,
+    },
     /// Restore pre-images from a crashed journal transaction.
     #[command(name = "recover")]
     Recover {
@@ -1532,7 +1538,7 @@ fn subcommand_usage(sub: &str) -> Option<&'static str> {
         }
         "edit" => {
             "greppy edit <replace-body|replace-span|patch-span|insert-after|insert-before|\
-             delete|rename-call|ensure-import|text-cas|regex-cas|apply> --help"
+             delete|rename-call|ensure-import|text-cas|regex-cas|apply|plan-template> --help"
         }
         "expand" => "greppy expand ID [--json] [--root DIR]",
         "semantic-search" | "semantic" => {
@@ -7175,6 +7181,27 @@ fn dispatch_edit(command: EditCommand, root: Option<&str>) -> Result<i32> {
 
 fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> {
     let root_path = resolve_root(root)?;
+    let command = match command {
+        EditCommand::PlanTemplate { op } => {
+            let template = if op == "replace-body" {
+                r#"{
+  "_comment": "Replace only a symbol body. workspace, schema_version, id, and publish are optional in this shorthand.",
+  "operations": [
+    {
+      "file": "src/lib.rs",
+      "symbol": "target",
+      "new_body": "{\n    42\n}"
+    }
+  ]
+}"#
+            } else {
+                greppy_edit::plan::MINIMAL_PLAN_EXAMPLE.trim()
+            };
+            println!("{template}");
+            return Ok(0);
+        }
+        command => command,
+    };
     #[derive(PartialEq)]
     enum EditCommandKind {
         InsertBefore,
@@ -7807,6 +7834,7 @@ fn dispatch_edit_inner(command: EditCommand, root: Option<&str>) -> Result<i32> 
             })?;
             (greppy_edit::plan::apply_plan(&parsed, dry_run)?, report)
         }
+        EditCommand::PlanTemplate { .. } => unreachable!("plan-template returned before edit dispatch"),
         EditCommand::Recover { report } => {
             let outcome = greppy_edit::journal::recover_with_report(&root_path)?;
             let msg = match outcome.action {

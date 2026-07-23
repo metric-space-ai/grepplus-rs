@@ -1,27 +1,12 @@
 {
-  "schema_version": "greppy.edit-plan.v1",
-  "workspace": {
-    "root": "."
-  },
+  "_comment": "Minimal shorthand: schema_version, workspace, operation id, and publish are optional. Canonical selector/action plans still require schema_version and publish.",
   "operations": [
     {
-      "id": "replace-once",
+      "_comment": "Replace exactly one occurrence of OLD in this workspace-relative file.",
       "file": "path/to/file.txt",
-      "selector": {
-        "engine": "text",
-        "old_text": "OLD",
-        "expect": 1
-      },
-      "action": {
-        "type": "replace",
-        "content": "NEW"
-      },
-      "preconditions": {
-        "file_sha256": "<sha256-of-current-file>"
-      }
+      "old": "OLD",
+      "new": "NEW",
+      "expect": 1
     }
-  ],
-  "publish": {
-    "mode": "journal"
-  }
+  ]
 }

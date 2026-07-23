@@ -89,6 +89,32 @@ fn top_level_ops_alias_is_accepted() {
 }
 
 #[test]
+fn text_cas_plan_template_round_trips_without_edits() {
+    let (repo, store) = fresh_workspace("template");
+    let (code, template, stderr) = run(
+        &repo,
+        &store,
+        &["edit", "plan-template", "--op", "text-cas"],
+    );
+    assert_eq!(code, 0, "template stderr={stderr}");
+
+    let parsed: serde_json::Value = serde_json::from_str(&template).unwrap();
+    let operation = &parsed["operations"][0];
+    let file = operation["file"].as_str().unwrap();
+    let old = operation["old"].as_str().unwrap();
+    let target = repo.join(file);
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::write(&target, format!("{old}\n")).unwrap();
+
+    let (code, stdout, stderr) = apply_plan(&repo, &store, &template);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert_eq!(
+        std::fs::read_to_string(target).unwrap(),
+        format!("{}\n", operation["new"].as_str().unwrap())
+    );
+}
+
+#[test]
 fn canonical_long_form_remains_valid() {
     let (repo, store) = fresh_workspace("canonical");
     let original = b"alpha one\n";
