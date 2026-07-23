@@ -810,6 +810,14 @@ def parse_pi_jsonl(raw: bytes) -> dict[str, Any]:
         if message.get("errorMessage"):
             error = str(message["errorMessage"])
             last_error_text = error[:300]
+        else:
+            # A clean turn after an error means the agent recovered — e.g. a
+            # transient provider 429 that pi retried through and then continued
+            # to completion. `reported_error` must reflect whether the run ENDED
+            # in an error, not whether any turn ever errored; otherwise a
+            # recovered, successful run is wrongly invalidated and the whole task
+            # is retried, multiplying API load and discarding correct results.
+            error = None
     return {
         "input_tokens": input_tokens,
         "uncached_input_tokens": uncached_input_tokens,
