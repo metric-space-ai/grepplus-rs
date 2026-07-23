@@ -488,6 +488,7 @@ pub enum Command {
     /// Transactional, hash-guarded, all-or-nothing edits. Every command
     /// verifies its own result and emits a certificate; on failure nothing
     /// is written and the error names the next step.
+    #[command(after_help = "Run `greppy edit VERB --help` for a working example.")]
     Edit {
         #[command(subcommand)]
         command: EditCommand,
@@ -853,7 +854,11 @@ pub enum EditCommand {
     /// --expect times (default 1); the file must be unchanged since
     /// planning. No regex, no fuzz. Re-running after success reports
     /// already-satisfied.
-    #[command(name = "text-cas")]
+    #[command(
+        name = "text-cas",
+        about = "Replace exact text with a declared occurrence count.",
+        after_help = "Example:\n  greppy edit text-cas --file notes.txt --old 'before' --new 'after' --expect 1"
+    )]
     TextCas {
         /// File to edit (workspace-relative or absolute).
         #[arg(long)]
@@ -888,7 +893,11 @@ pub enum EditCommand {
     /// Replace only the BODY of a definition; the signature stays
     /// byte-identical. Address by --symbol (resolved like `read`) or by
     /// --target HANDLE from a previous read.
-    #[command(name = "replace-body")]
+    #[command(
+        name = "replace-body",
+        about = "Replace a definition body without changing its signature.",
+        after_help = "Example:\n  greppy edit replace-body --symbol greet --content-file body.rs"
+    )]
     ReplaceBody {
         #[arg(long)]
         symbol: Option<String>,
@@ -903,7 +912,11 @@ pub enum EditCommand {
         report: Option<String>,
     },
     /// Insert a new top-level block after a definition.
-    #[command(name = "insert-after")]
+    #[command(
+        name = "insert-after",
+        about = "Insert a top-level block after a definition.",
+        after_help = "Example:\n  greppy edit insert-after --symbol greet --content-file inserted.rs"
+    )]
     InsertAfter {
         #[arg(long)]
         symbol: Option<String>,
@@ -918,7 +931,11 @@ pub enum EditCommand {
         report: Option<String>,
     },
     /// Insert a new top-level block before a definition.
-    #[command(name = "insert-before")]
+    #[command(
+        name = "insert-before",
+        about = "Insert a top-level block before a definition.",
+        after_help = "Example:\n  greppy edit insert-before --symbol greet --content-file inserted.rs"
+    )]
     InsertBefore {
         #[arg(long)]
         symbol: Option<String>,
@@ -935,7 +952,11 @@ pub enum EditCommand {
     /// Retarget identifier occurrences inside one definition (AST-based:
     /// strings and comments are never touched). Without --expect, all
     /// occurrences are renamed; with --expect N, exactly N or refusal.
-    #[command(name = "rename-call")]
+    #[command(
+        name = "rename-call",
+        about = "Rename calls inside one definition with AST verification.",
+        after_help = "Example:\n  greppy edit rename-call --in caller --from old_name --to new_name --expect 1"
+    )]
     RenameCall {
         /// The definition to edit (resolved like `read`).
         #[arg(long = "in")]
@@ -953,7 +974,11 @@ pub enum EditCommand {
     },
     /// Delete a definition (including its trailing newline; a doubled blank
     /// line is collapsed).
-    #[command(name = "delete")]
+    #[command(
+        name = "delete",
+        about = "Delete one resolved definition.",
+        after_help = "Example:\n  greppy edit delete --symbol obsolete"
+    )]
     Delete {
         #[arg(long)]
         symbol: Option<String>,
@@ -966,7 +991,11 @@ pub enum EditCommand {
     },
     /// Apply a unified diff to exactly the span of a previous read
     /// (fuzz 0: every hunk must match byte-for-byte, else refusal).
-    #[command(name = "patch-span")]
+    #[command(
+        name = "patch-span",
+        about = "Apply an exact unified diff within a read handle's span.",
+        after_help = "Example:\n  greppy edit patch-span --target \"$(greppy read greet --handle --json | jq -r .handle)\" --patch-file greet.patch"
+    )]
     PatchSpan {
         #[arg(long)]
         target: String,
@@ -979,7 +1008,11 @@ pub enum EditCommand {
     },
     /// Regex replacement with exact expected match count (the weakest
     /// selector class - prefer symbol or text-cas addressing).
-    #[command(name = "regex-cas")]
+    #[command(
+        name = "regex-cas",
+        about = "Replace regex matches with a declared match count.",
+        after_help = "Example:\n  greppy edit regex-cas --file src/lib.rs --old 'ANSWER: i32 = [0-9]+' --new 'ANSWER: i32 = 43' --expect 1"
+    )]
     RegexCas {
         #[arg(long)]
         file: String,
@@ -999,7 +1032,11 @@ pub enum EditCommand {
     /// Idempotent import: absent -> inserted at the canonical position;
     /// present -> already-satisfied (exit 0, nothing written); the same
     /// name bound from a different module -> refusal, nothing written.
-    #[command(name = "ensure-import")]
+    #[command(
+        name = "ensure-import",
+        about = "Insert an import once at the canonical position.",
+        after_help = "Example:\n  greppy edit ensure-import --file src/lib.rs --module std::collections --name HashMap"
+    )]
     EnsureImport {
         #[arg(long)]
         file: String,
@@ -1015,7 +1052,12 @@ pub enum EditCommand {
     /// Change a definition signature and every graph-resolved call site in one
     /// transaction, using the old/new parameter lists and call cardinality in
     /// a JSON specification.
-    #[command(name = "change-signature")]
+    #[command(
+        name = "change-signature",
+        about = "Change a signature and all graph-resolved call sites.",
+        after_help = r#"Example:
+  greppy edit change-signature --symbol combine --spec '{"old_parameters":"(a: i32, b: i32)","new_parameters":"(b: i32, a: i32)","expect_call_sites":1}'"#
+    )]
     ChangeSignature {
         #[arg(long)]
         symbol: String,
@@ -1035,7 +1077,11 @@ pub enum EditCommand {
     },
     /// Within one definition, append an argument to every call of NAME
     /// that does not already carry it (idempotent).
-    #[command(name = "ensure-argument")]
+    #[command(
+        name = "ensure-argument",
+        about = "Append a missing argument to matching calls in one definition.",
+        after_help = "Example:\n  greppy edit ensure-argument --symbol caller --call combine --arg 3"
+    )]
     EnsureArgument {
         #[arg(long)]
         symbol: String,
@@ -1052,7 +1098,11 @@ pub enum EditCommand {
     },
     /// Append a method to a class body when absent; present reports
     /// already-satisfied.
-    #[command(name = "ensure-method")]
+    #[command(
+        name = "ensure-method",
+        about = "Append a method to a class when it is absent.",
+        after_help = "Example:\n  greppy edit ensure-method --symbol Greeter --name greet --source-file greet_method.py"
+    )]
     EnsureMethod {
         /// The class (resolved like read).
         #[arg(long)]
@@ -1069,7 +1119,11 @@ pub enum EditCommand {
         report: Option<String>,
     },
     /// Idempotent decorator/attribute line directly above a definition.
-    #[command(name = "ensure-annotation")]
+    #[command(
+        name = "ensure-annotation",
+        about = "Add a decorator or attribute above a definition once.",
+        after_help = "Example:\n  greppy edit ensure-annotation --symbol greet --annotation '#[inline]'"
+    )]
     EnsureAnnotation {
         #[arg(long)]
         symbol: String,
@@ -1081,7 +1135,11 @@ pub enum EditCommand {
         report: Option<String>,
     },
     /// Delete a definition when present; absent reports already-satisfied.
-    #[command(name = "remove-if-present")]
+    #[command(
+        name = "remove-if-present",
+        about = "Delete a definition if present; otherwise do nothing.",
+        after_help = "Example:\n  greppy edit remove-if-present --symbol obsolete"
+    )]
     RemoveIfPresent {
         #[arg(long)]
         symbol: String,
@@ -1093,7 +1151,11 @@ pub enum EditCommand {
     /// Rename a symbol across the workspace using the resolved graph:
     /// the definition, every referencing definition's span, and import
     /// lines are AST-verified and renamed in one journal transaction.
-    #[command(name = "rename-symbol")]
+    #[command(
+        name = "rename-symbol",
+        about = "Rename a symbol and its graph-resolved references.",
+        after_help = "Example:\n  greppy edit rename-symbol --symbol combine --new-name merge_numbers --expect-residual 0"
+    )]
     RenameSymbol {
         #[arg(long)]
         symbol: String,
@@ -1112,7 +1174,11 @@ pub enum EditCommand {
     /// Set a value in a structured file (JSON/TOML/YAML) by path,
     /// format-preserving. `ensure` reports already-satisfied when the value
     /// already holds.
-    #[command(name = "data")]
+    #[command(
+        name = "data",
+        about = "Set or ensure a value in JSON, TOML, or YAML.",
+        after_help = "Example:\n  greppy edit data set --file config.json --path '$.server.port' --value-json 8080"
+    )]
     Data {
         /// set (always write) or ensure (idempotent)
         #[arg(value_parser = ["set", "ensure"])]
@@ -1133,7 +1199,12 @@ pub enum EditCommand {
     /// Execute a multi-operation plan file (schema greppy.edit-plan.v1).
     /// Journal mode publishes all files or none; patch mode emits a
     /// unified diff without touching the workspace.
-    #[command(name = "apply")]
+    #[command(
+        name = "apply",
+        about = "Execute a multi-operation edit plan transactionally.",
+        after_help = r#"Example:
+  greppy edit apply --plan <(printf '%s\n' '{"operations":[{"file":"notes.txt","old":"before","new":"after","expect":1}]}')"#
+    )]
     Apply {
         #[arg(long)]
         plan: String,
@@ -1146,19 +1217,32 @@ pub enum EditCommand {
         diff: Option<String>,
     },
     /// Print a valid, copyable minimal plan to stdout; write nothing.
-    #[command(name = "plan-template")]
+    #[command(
+        name = "plan-template",
+        about = "Print a minimal valid edit plan.",
+        after_help = "Example:\n  greppy edit plan-template --op text-cas"
+    )]
     PlanTemplate {
         #[arg(long, default_value = "text-cas", value_parser = ["text-cas", "replace-body"])]
         op: String,
     },
     /// Restore pre-images from a crashed journal transaction.
-    #[command(name = "recover")]
+    #[command(
+        name = "recover",
+        about = "Restore pre-images from an interrupted journal transaction.",
+        after_help = "Example:\n  greppy edit recover --report recovery.json"
+    )]
     Recover {
         /// Write the full recovery report as JSON to FILE.
         #[arg(long)]
         report: Option<String>,
     },
-    #[command(name = "replace-span")]
+    /// Replace the exact definition span pinned by a previous read handle.
+    #[command(
+        name = "replace-span",
+        about = "Replace the exact span pinned by a read handle.",
+        after_help = "Example:\n  greppy edit replace-span --target \"$(greppy read greet --handle --json | jq -r .handle)\" --source-file replacement.rs"
+    )]
     ReplaceSpan {
         /// Edit handle from `greppy read SYMBOL --handle`.
         #[arg(long)]
