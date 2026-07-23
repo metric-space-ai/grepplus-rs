@@ -890,7 +890,7 @@ pub enum EditCommand {
         #[arg(long)]
         target: Option<String>,
         /// File containing the new content, or `-` to read it from stdin.
-        #[arg(long = "content-file", alias = "source-file")]
+        #[arg(long = "content-file", aliases = ["source-file", "source"])]
         content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
@@ -905,7 +905,7 @@ pub enum EditCommand {
         #[arg(long)]
         target: Option<String>,
         /// File containing the new content, or `-` to read it from stdin.
-        #[arg(long = "content-file", alias = "source-file")]
+        #[arg(long = "content-file", aliases = ["source-file", "source"])]
         content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
@@ -920,7 +920,7 @@ pub enum EditCommand {
         #[arg(long)]
         target: Option<String>,
         /// File containing the new content, or `-` to read it from stdin.
-        #[arg(long = "content-file", alias = "source-file")]
+        #[arg(long = "content-file", aliases = ["source-file", "source"])]
         content_file: String,
         #[arg(long = "dry-run")]
         dry_run: bool,
@@ -978,9 +978,11 @@ pub enum EditCommand {
     RegexCas {
         #[arg(long)]
         file: String,
-        #[arg(long, allow_hyphen_values = true)]
+        /// Regex selector inline; `--old` mirrors text-cas terminology.
+        #[arg(long, alias = "old", allow_hyphen_values = true)]
         pattern: String,
-        #[arg(long, allow_hyphen_values = true)]
+        /// Replacement inline; `--new` mirrors text-cas terminology.
+        #[arg(long, alias = "new", allow_hyphen_values = true)]
         replacement: String,
         #[arg(long, default_value_t = 1)]
         expect: usize,
@@ -1157,7 +1159,7 @@ pub enum EditCommand {
         #[arg(long)]
         target: String,
         /// File containing the replacement source.
-        #[arg(long = "source-file")]
+        #[arg(long = "source-file", alias = "source")]
         source_file: String,
         /// Plan and verify everything, write nothing.
         #[arg(long = "dry-run")]
